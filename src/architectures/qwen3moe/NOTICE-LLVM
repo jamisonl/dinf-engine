@@ -1,0 +1,19 @@
+LLVM libc++ sort adaptation
+
+Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+The full license is in LICENSE-LLVM. See https://llvm.org/LICENSE.txt.
+
+The native_argsort.rs and heap.rs files adapt the libc++ headers listed in
+SOURCE.json and heap-provenance.json from the Apple MacOSX27.2 SDK. The exact
+header hashes identify the source; this notice does not claim an LLVM commit.
+
+Changes for dinf: safe Rust with checked slices, finite F32 scores, integer
+indices, the descending comparator scores[a] > scores[b], and a limit of
+128 entries. Guarded stable insertion replaces the small sorts and the
+partition-sentinel insertion form. The larger ninther and branchless paths
+are excluded. The heap port keeps the arithmetic-index branch and move order.
+
+These files keep their LLVM license terms. dinf's own code keeps its MIT
+terms; other component notices remain in force. The scope is this pinned
+native ordering, not a platform-independent rule for equal scores.

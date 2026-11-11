@@ -1,0 +1,9 @@
+{
+  "source": "libcxx/include/__algorithm/sort.h (libc++ as shipped in the Apple macOS 27.2 SDK; sha256 is of that shipped file)",
+  "upstream_url": "https://github.com/llvm/llvm-project/blob/main/libcxx/include/__algorithm/sort.h",
+  "sha256": "b644503828e13c3c90b5d343684eb993add9330762c5a7957001876be653e014",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "license_url": "https://llvm.org/LICENSE.txt",
+  "license_sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee",
+  "scope": "Custom-comparator descending std::sort path for 1..128 finite F32 scores, without the bitset/ninther paths. Safe Rust adaptation; a guarded insertion replaces the unguarded-sentinel form with equal move order."
+}

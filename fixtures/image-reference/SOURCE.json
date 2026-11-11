@@ -1,0 +1,360 @@
+{
+  "schema_version": 1,
+  "status": "F32 component, cache and text checks pass. Metal BF16 text and the BF16 denoiser (one-step, and four-step with cache) match native PyTorch MPS byte for byte on the fixed synthetic 512x512 fixture.",
+  "upstream": {
+    "diffusers_tag": "v0.42.0",
+    "diffusers_revision": "95f9b8925c34469ccac829866d7ad4e3fca1bd89",
+    "files": [
+      {
+        "url": "https://raw.githubusercontent.com/huggingface/diffusers/95f9b8925c34469ccac829866d7ad4e3fca1bd89/src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py",
+        "sha256": "e75e4ce38d38e194edaac818bba99b2115b4bb2bfdbd15ce03a2813b0fe8856c"
+      },
+      {
+        "url": "https://raw.githubusercontent.com/huggingface/diffusers/95f9b8925c34469ccac829866d7ad4e3fca1bd89/src/diffusers/models/transformers/transformer_qwenimage21.py",
+        "sha256": "7a3393f89b1eb71d79c8669a719a21a616e6c8b188b2c1f5a2faca2cc701f171"
+      },
+      {
+        "url": "https://raw.githubusercontent.com/huggingface/diffusers/95f9b8925c34469ccac829866d7ad4e3fca1bd89/src/diffusers/models/autoencoders/autoencoder_kl_qwenimage21.py",
+        "sha256": "1e29f252dbddd044b84c8b794589001ce94bb125a8f13eb5b226ef30c1e2ea11"
+      },
+      {
+        "url": "https://raw.githubusercontent.com/huggingface/diffusers/95f9b8925c34469ccac829866d7ad4e3fca1bd89/setup.py",
+        "sha256": "6df86938a8e6392ea7f31769a827fceb7254884aca15940cb01fd801a2b4dfcf"
+      }
+    ]
+  },
+  "runtime": {
+    "python": "3.15.1",
+    "torch": "2.15.0",
+    "diffusers": "0.42.0",
+    "transformers": "5.22.1",
+    "tested_setup_platform": "macOS arm64",
+    "installed_component_sources": [
+      {
+        "module": "diffusers/models/transformers/transformer_qwenimage21.py",
+        "sha256": "7a3393f89b1eb71d79c8669a719a21a616e6c8b188b2c1f5a2faca2cc701f171"
+      },
+      {
+        "module": "diffusers/models/autoencoders/autoencoder_kl_qwenimage21.py",
+        "sha256": "1e29f252dbddd044b84c8b794589001ce94bb125a8f13eb5b226ef30c1e2ea11"
+      },
+      {
+        "module": "diffusers/schedulers/scheduling_flow_match_euler_discrete.py",
+        "sha256": "5448bbfe15324ea8034470e742c7782b1de3864c0836d98ef3dade65e30df6a7"
+      }
+    ]
+  },
+  "model": {
+    "repository": "Qwen/Qwen-Image-2.1",
+    "revision": "790c92633540aa0cb11d9abf19eb46d861714758",
+    "files": [
+      {
+        "path": "model_index.json",
+        "sha256": "cf1ecd104ea090855d60d8cec0895c1e9d6ee41b2f87e231b678beecd1cf7809",
+        "size_bytes": 447
+      },
+      {
+        "path": "processor/chat_template.jinja",
+        "sha256": "3636d0f0bd6bef02654cdffdc447b79cb2cef8ab02cc75267345946291a489e4",
+        "size_bytes": 5292
+      },
+      {
+        "path": "processor/tokenizer.json",
+        "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+        "size_bytes": 11422654
+      },
+      {
+        "path": "processor/tokenizer_config.json",
+        "sha256": "81ec7bb9530159b326c0bef1d0b6c33d392090524014ea3f0123a3c1eb9c2af5",
+        "size_bytes": 5445
+      },
+      {
+        "path": "scheduler/scheduler_config.json",
+        "sha256": "5895f3a167c14a967fe9ac70c64924ae5acc79799e0679fd12907e594a713cd1",
+        "size_bytes": 485
+      },
+      {
+        "path": "text_encoder/config.json",
+        "sha256": "6001331949f7f86ab6d791a80b12246d4f8da5159fa08c3e62368a39f36d63a9",
+        "size_bytes": 1517
+      },
+      {
+        "path": "text_encoder/model-00001-of-00004.safetensors",
+        "sha256": "dde00291b5f7fb92013895310a3da0ddba78674df9f10d505d375243dc01fc6f",
+        "size_bytes": 4998056552
+      },
+      {
+        "path": "text_encoder/model-00002-of-00004.safetensors",
+        "sha256": "9047faccc0a6d98496a52d55f27be1c94a9c259d1e283fbea0128d054a948d42",
+        "size_bytes": 4915962464
+      },
+      {
+        "path": "text_encoder/model-00003-of-00004.safetensors",
+        "sha256": "8c54187654c0176b73ae73785bf791dc9a14c9df7fb4310083a09d42048cb57e",
+        "size_bytes": 4915962496
+      },
+      {
+        "path": "text_encoder/model-00004-of-00004.safetensors",
+        "sha256": "5311532aaaeae3259eb6a7b2c600636be1159adf7ded35f53579f7d0e7d43cdd",
+        "size_bytes": 2704357976
+      },
+      {
+        "path": "text_encoder/model.safetensors.index.json",
+        "sha256": "859146bff8db1d617fca8b457a5223edff963bb70076b3645f2189fe0540a147",
+        "size_bytes": 67795
+      },
+      {
+        "path": "transformer/config.json",
+        "sha256": "56ae3281c4e6c2d1aa3658252d187488071815fd79bef15808bb0205fc1a2241",
+        "size_bytes": 370
+      },
+      {
+        "path": "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+        "sha256": "9e6bc2d641e67bf277895ea8777141044a38f3edb7101bc469b2961dd7c36b4b",
+        "size_bytes": 9968332504
+      },
+      {
+        "path": "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+        "sha256": "3aaf234dcbe128530479735854a346b5e3e66283b7c11db56f836bbd1c13ebaa",
+        "size_bytes": 4261951904
+      },
+      {
+        "path": "transformer/diffusion_pytorch_model.safetensors.index.json",
+        "sha256": "17987f6623b1c814d0ef55a137d99142b7b3b040eb1bf241b5575dd35af803a2",
+        "size_bytes": 30283
+      },
+      {
+        "path": "vae/config.json",
+        "sha256": "9785d527b278cb8b210e9f48a8028d92a4190968ce7e24c8fc85d9d1b82f6ba2",
+        "size_bytes": 2079
+      },
+      {
+        "path": "vae/diffusion_pytorch_model.safetensors",
+        "sha256": "a07a1b7c4ee2966a1b3bdc37de9b4f983d56937e46619f709a80b6e490675417",
+        "size_bytes": 1350989512
+      }
+    ]
+  },
+  "engine": {
+    "harness_package": "dinf-image-component-audit",
+    "profile": "default release; no RUSTFLAGS; default engine features and target-native Metal on macOS"
+  },
+  "fixture": {
+    "schema_version": 1,
+    "steps": 4,
+    "scope": "deterministic synthetic conditioning and normalized latents; no prompt encoding claim",
+    "image_shape": [
+      1,
+      32,
+      32
+    ],
+    "image_mask": {
+      "text_slots": 32,
+      "target_slots": 256
+    },
+    "generator": "integer sawtooth; values exactly representable in F32 and BF16",
+    "latents": {
+      "file": "latents.f32",
+      "shape": [
+        1,
+        1024,
+        64
+      ],
+      "sha256": "fdef363ab569ac5bc51d417f5ca08c36a98fa4cbdc167924faf491e5cf8af232"
+    },
+    "conditioning": {
+      "file": "conditioning.f32",
+      "shape": [
+        1,
+        32,
+        4096
+      ],
+      "sha256": "bb1d152a9a91fa018c13c061ed46a2daef3cc2f9e14092c1742f35a3ff0e992b"
+    }
+  },
+  "checks": {
+    "rust_release_and_strict_clippy": "passed",
+    "python_imports": "passed without model instances",
+    "scheduler": "all 5 sigmas/all 4 timesteps bit-identical, no model weights",
+    "raw_comparator": "7 F32 + 7 BF16 synthetic checks passed; no model instances.",
+    "full_weight_runs": "F32 CPU/Metal denoiser+VAE and CPU four-step/cache pass; F32 CPU text passes; Metal BF16 text and BF16 denoiser match native (see results).",
+    "portable_text_prepare": "Full rehash of local text shards/config/tokenizer reproduces the recorded F32 input manifest exactly."
+  },
+  "files": {
+    "README.md": "6850abbba6e38868700bad359a44e9d068b50d2e0460729098466974bbffd47e",
+    "bf16-trajectory-gates.json": "6c268b5b2747f10255b4eeecb12c57a12b5addf8693ae405ab337bafa651df44",
+    "bf16_preflight.py": "e460120b9c316385df5abe0434c532c73eff9e6a61ee6696dff72c81fa5c8d04",
+    "check_bf16_results.py": "3d32a58cf4b633e91f64b259738352f1a1bbb8b4ea7df83c631de94d26ae9790",
+    "check_bf16_trajectory.py": "ea9b6dc873a8505c12b39af20869b5fce1313b0584cf7c9eaeda8f9af57243fd",
+    "check_results.py": "9b1fda622f8f95419cfbd8eed5953b4a7d1ec92c91d650f40c7d2b4a3664ffdf",
+    "generate_inputs.py": "dc46af4da39111b6d0be257ad2d7f1621142a8d911a15f78545dee2a91c6fd49",
+    "numeric-gates.json": "628ddd27ba6c47f59d79802a5b0f3449637a7434fe2632658891c837d632974f",
+    "reference.py": "a4d1bb38ed05d4890599909c73e79af15fe3c4c1ce8ff674b0f446fe075e48da",
+    "requirements.in": "b04e53c468e161ed588aae1e31a0b30491196cb33efab20c4eb88972b7b52e49",
+    "requirements.lock": "43e9274df4cf67239d5e2c7ab0d9909a5bf005acfa4fd6e866802d6123770c47",
+    "rust/Cargo.lock": "c8994129dc0f6e86c484455f9dfb2530ff86e98561bb54d9386a723bf75d535c",
+    "rust/Cargo.toml.example": "17c36045a4482dbad5aceb57fd8d340e9d2ec4a17e3bdf5f50dbf63e418368ab",
+    "rust/src/main.rs": "4168b959d66ec2da2f1f3717284bfe57016e2e1ab5c0f8d0f82929dbcd9ce36b",
+    "test_bf16_checker.py": "6bfadebdec6a862f462726b8d86133ca87e9e7a7d061a8f5bcbdf9811c8c7101",
+    "test_bf16_trajectory.py": "1c7bd360a470d1f9a2373aa91539984c31b83f8634191dadd48a058137350c95",
+    "test_checker.py": "a07a6f846af739fada48f37f5232c2a99d0407368c59690e5f90156816f1d065",
+    "text_reference.py": "a9c2114e5bdecfdf02c21eefa445001e0c95d5d34b830d1a417962a0a32949d1"
+  },
+  "text_conditioning_contract": {
+    "status": "CPU F32 passes. Metal BF16 full and suffix outputs match native byte for byte.",
+    "snapshot_class": "QwenImage21Pipeline",
+    "snapshot_model_index_sha256": "cf1ecd104ea090855d60d8cec0895c1e9d6ee41b2f87e231b678beecd1cf7809",
+    "versions": {
+      "diffusers": "0.42.0",
+      "transformers": "5.22.1",
+      "torch": "2.15.0"
+    },
+    "sources": [
+      {
+        "module": "diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py",
+        "sha256": "e75e4ce38d38e194edaac818bba99b2115b4bb2bfdbd15ce03a2813b0fe8856c",
+        "lines": "304-318",
+        "meaning": "Exact Image 2.1 pipeline overrides final language norm output with its input, then reads full encoder hidden_states[-1]."
+      },
+      {
+        "module": "transformers/utils/output_capturing.py",
+        "sha256": "a188aeb10cca3a3238d7df1d4e3c08b44dac283ba5b8b7a7cafd2d2bbc532e7c",
+        "lines": "234-246,293-307",
+        "meaning": "Default tie_last_hidden_states overwrites the captured last entry with outputs.last_hidden_state."
+      },
+      {
+        "module": "transformers/models/qwen3_vl/modeling_qwen3_vl.py",
+        "sha256": "c402239e741216d28471f77fb5eaf302b9b7bdc080e1f9fb2f9c36d95943b3d2",
+        "lines": "622-625,794-805,840-843",
+        "meaning": "Decoder-layer recorder; text-only positions match all axes; last_hidden_state is the final norm output."
+      }
+    ],
+    "conclusion": "The reference hook matches the actual pinned Image 2.1 pipeline. Both direct last_hidden_state and full hidden_states[-1] are the same pre-final-RMSNorm tensor when that upstream hook is installed. Without the hook, Transformers 5.22.1 default hidden_states[-1] is post-norm. The older pipeline_qwenimage.py is not the class selected by this snapshot.",
+    "tiny_cpu_execution": {
+      "passed": true,
+      "scope": "Tiny CPU Qwen3VL output-capture unit fixture; no checkpoint files or GPU operations",
+      "script_sha256": "68e3e24037084f55a8d22eadd389b6846d5257797f1bad3f1b7a76ef869c322f",
+      "result_sha256": "d5251d755d933701319b5b2bb83580a41adab829e7660b29f0b1075fc7124b40",
+      "stderr_sha256": "b8d940d98c16e39b033338e66263812b43c2fec519232d75d3b5b7e83e55f8c1",
+      "result": {
+        "passed": true,
+        "exact_full_pipeline_vs_direct_hook": true,
+        "without_hook_is_normalized": true,
+        "shape": [
+          1,
+          4,
+          64
+        ],
+        "parameters": 125184,
+        "torch_threads": 1,
+        "interop_threads": 1,
+        "all_parameters_cpu": true,
+        "real_checkpoint_weights_loaded": false,
+        "backend": "cpu"
+      },
+      "result_field_note": "exact_full_pipeline_vs_direct_hook denotes the full Qwen3VL encoder forward used by Image21 versus direct language forward, both with the same upstream hook; no complete image pipeline was instantiated.",
+      "cpu_seed": "torch.random.default_generator.manual_seed(0); does not visit GPU backends",
+      "shape": [
+        1,
+        4,
+        64
+      ],
+      "model_parameters": 125184
+    }
+  },
+  "results": {
+    "f32": {
+      "component_processes": 10,
+      "independent_and_cache_comparisons_passed": 8,
+      "text_full_relative_l2": 1.3658503084977994e-05,
+      "text_suffix_relative_l2": 8.176259511695983e-06,
+      "cpu_cache_per_runtime": "all four predictions and latents bit-identical cached vs uncached",
+      "norm_correction_regression": "F32 one-step denoiser and full text outputs are bit-identical before and after the BF16 norm correction; the independent oracle has a small nonzero error."
+    },
+    "bf16_text": {
+      "scope": "One 34-token prompt on Metal; all 20 conditioning rows.",
+      "full_hidden": {
+        "relative_l2": 0.0,
+        "cosine": 1.0,
+        "max_abs": 0.0,
+        "passed": true
+      },
+      "conditioning_suffix": {
+        "relative_l2": 0.0,
+        "cosine": 1.0,
+        "max_abs": 0.0,
+        "passed": true
+      }
+    },
+    "bf16_denoiser": {
+      "scope": {
+        "model": "Qwen Image 2.1",
+        "image_pixels": [
+          512,
+          512
+        ],
+        "synthetic_conditioning_rows": 32,
+        "conditioning_width": 4096,
+        "latent_shape": [
+          1,
+          1024,
+          64
+        ],
+        "steps": 4,
+        "compute_dtype": "BF16",
+        "native_backend": "MPS",
+        "engine_backend": "Metal",
+        "hardware": "Apple GPU (Metal)",
+        "semantic_image_quality": false,
+        "full_generation_validated": false,
+        "forty_step_validated": false,
+        "other_hardware_validated": false
+      },
+      "fixed_limits": {
+        "component_relative_l2_max": 0.01,
+        "component_cosine_min": 0.9999,
+        "scheduler_max_abs": 1e-06,
+        "same_runtime_cache": "byte_exact_all_outputs"
+      },
+      "one_step": {
+        "passed": true,
+        "prediction_and_latent_bit_exact": true,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "focused_tests": 30
+      },
+      "four_step": {
+        "passed": true,
+        "prediction_latent_outputs_per_mode": 8,
+        "all_outputs_per_mode": 12,
+        "all_native_engine_outputs_bit_exact": true,
+        "native_cache_bit_exact": true,
+        "engine_cache_bit_exact": true,
+        "relative_l2_all_step_outputs": 0.0,
+        "max_abs_all_step_outputs": 0.0,
+        "seconds_total": 12.827718459069729,
+        "peak_rss_bytes": 28479193088,
+        "swapout_growth_bytes": 0
+      }
+    },
+    "limits": "Denoiser fixture uses synthetic shared conditioning/latents. Text compares exact IDs and pre-final-norm hidden states. No semantic image quality claim; no forty-step, end-to-end or long-context validation; not validated on other hardware."
+  },
+  "engine_norm_correction": {
+    "scope": "Engine-local BF16 image Q/K and image text RMSNorm paths normalize in F32 then cast before learned weight; F32 paths unchanged; no vendor edits.",
+    "sources": [
+      "src/diffusion/text_encoder.rs",
+      "src/diffusion/text_reference_tests.rs",
+      "src/diffusion/transformer.rs"
+    ],
+    "proof": "Eight real Q/K weight vectors: old fused outputs exactly match premature BF16 inverse rounding; portable path matches Diffusers bit-for-bit. Scalar CPU/Metal regressions cover head128 and text4096 widths. This proves local arithmetic, not full-model gate clearance."
+  },
+  "checker": {
+    "synthetic_cases": 36,
+    "passed": true,
+    "rules": [
+      "Require each output key to use its own matching basename; reject step aliases and swaps.",
+      "Validate finite exact F32 scheduler anchor values against original little-endian SHA256.",
+      "Bound regular fixture/raw files before reading and hash the bytes used for comparison."
+    ]
+  }
+}

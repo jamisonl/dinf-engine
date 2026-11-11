@@ -1,0 +1,2 @@
+# Independent logit review and cross-tier comparisons.
+numpy==2.5.4

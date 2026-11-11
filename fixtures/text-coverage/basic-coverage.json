@@ -1,0 +1,2242 @@
+{
+ "schema_version": 1,
+ "recorded_date": "2026-11-09",
+ "scope": "Exact artifact and backend basic checks. This records short request-state coverage, not independent numeric agreement, answer quality, or every quant/context setting.",
+ "ready_for_release": false,
+ "baseline_source_identity": {
+  "algorithm": "SHA256 of sorted compact JSON mapping workspace-relative build input paths to SHA256",
+  "sha256": "09ec9d15ad7f0c49342d2a85841064ba75fbce37fbab198c3f517b21923d3ea4"
+ },
+ "profiles": {
+  "basic-v1": {
+   "example": "qualify_text",
+   "arguments": [
+    "MODEL.gguf",
+    "cpu|metal",
+    "--smoke"
+   ],
+   "target_runs": 3,
+   "tokens_per_target_run": 4,
+   "noise_tokens": 2,
+   "prefill_chunk": 8,
+   "prompt": "Write a Rust function to merge two sorted slices. Include tests.",
+   "interleaved_prompt": "Name three oceans and explain how they differ.",
+   "checks": [
+    "finite logits",
+    "exact greedy replay after chunked prefill",
+    "partial-prefill cancellation",
+    "interleaved decode cancellation",
+    "cache positions",
+    "empty cache after cleanup"
+   ]
+  },
+  "vision-basic": {
+   "example": "qualify_vision",
+   "tokens": 4,
+   "scope": "projection and decoder image sensitivity, exact replay, request isolation and cancellation"
+  },
+  "draft-basic": {
+   "example": "qualify_draft",
+   "tokens": 32,
+   "scope": "exact fallback and replay, sampled draft execution, chunking and cancellation"
+  },
+  "image-basic": {
+   "example": "qualify_image",
+   "steps": 2,
+   "width": 512,
+   "height": 512,
+   "seed": 42,
+   "scope": "full-pipeline seeded replay, conditioning cache modes, finite output and cancellation; not image quality"
+  }
+ },
+ "text_artifacts": [
+  {
+   "id": "DeepSeek-V2-Lite-Chat-Q4_K_M",
+   "architecture": "deepseek2",
+   "entry": "DeepSeek-V2-Lite-Chat-Q4_K_M.gguf",
+   "files": [
+    {
+     "filename": "DeepSeek-V2-Lite-Chat-Q4_K_M.gguf",
+     "size_bytes": 10364416320,
+     "sha256": "30b4fb4ab1fbe1c6a827303ea898296c9faf8f54d6cdf8b9fbdda7a7ebfb292a"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 14.059,
+     "rss_cap_bytes": 26843545600,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 19799195648,
+     "report_sha256": "99aab7093d9b74a5d1fcac4f3e081afeeae3da4c0166988a643d2858dbc8e629",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 11.787,
+       "rss_cap_bytes": 26843545600,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "27da2781e976f9ae1f5137658b734fdafbf42f21a7124b93ae097c56113ecaca",
+       "report_sha256": "66e78be3339770089b67feba0dc569010c763bf323fc86c7ff952b09bccc9860",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 5.514,
+     "rss_cap_bytes": 27917287424,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 22098788352,
+     "report_sha256": "8984e98ee4c198683076b2475fdbc059e195f9f5bcd12f4c4cb59439f21b0a15",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 5.156,
+       "rss_cap_bytes": 27917287424,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "88abebb05eaf61903ff9023711f988072c1330fa26255053956d6e6d7213ea5d",
+       "report_sha256": "7afcf6629b29a5c4813056b33e9e55935236f57076dc19b14940a69d343ff361",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "DeepSeek-V2-Lite-Chat-Q8_0",
+   "architecture": "deepseek2",
+   "entry": "DeepSeek-V2-Lite-Chat-Q8_0.gguf",
+   "files": [
+    {
+     "filename": "DeepSeek-V2-Lite-Chat-Q8_0.gguf",
+     "size_bytes": 16702517568,
+     "sha256": "458d8dbb5c64109623751f3c7e691f285770a6521bf06bf86172980b995b3bde"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 9.637,
+     "rss_cap_bytes": 40802189312,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 32833863680,
+     "report_sha256": "e0cf477407b0fc15b0cbdc66204cf3dec2f526517e996606736515bbd84c89b8",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 9.761,
+       "rss_cap_bytes": 40802189312,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "51c9f06bf702aeffa2f1b42443a96e0df9f275cce07947daa36211e058eac0e1",
+       "report_sha256": "6fce0c19169fb44de715bd1e9bed4267507826f3ad38157f75aa9783c20ce19e",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 6.623,
+     "rss_cap_bytes": 41875931136,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 33655652352,
+     "report_sha256": "d869463e340bc844e5d5427a25d5250e8f37c02d0cab60c0244bb04e81916c0a",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 6.356,
+       "rss_cap_bytes": 41875931136,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "78536cece0db8af3413e5289586c4270db88d55ab296df108f65a5832af78e34",
+       "report_sha256": "b19c15dcaef31209df6bb54398c003e594a0f63410de8795412f0c3bad9b7d02",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "DeepSeek-V4-Flash-0731-UD-IQ1_S-00001-of-00003",
+   "architecture": "deepseek4",
+   "entry": "DeepSeek-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf",
+   "files": [
+    {
+     "filename": "DeepSeek-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf",
+     "size_bytes": 5257664,
+     "sha256": "2fa152e25a14500e42e6d98f20d200eec1e945f34dc1cfb981b651b9c86b97be"
+    },
+    {
+     "filename": "DeepSeek-V4-Flash-0731-UD-IQ1_S-00002-of-00003.gguf",
+     "size_bytes": 49093726624,
+     "sha256": "e9fc77544cd48aa0c31fbf32fdf5432f2b560b92a9aeffd9f690d99867cf0e5f"
+    },
+    {
+     "filename": "DeepSeek-V4-Flash-0731-UD-IQ1_S-00003-of-00003.gguf",
+     "size_bytes": 33440253504,
+     "sha256": "fd99d5cd0503d668b6febc2eedcc9db68e264cfb79dd355efc88c15eabe4248d"
+    }
+   ],
+   "backends": {
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "direct qualify_text (run_basic.py admission refused: reclaimable page cache counted as unavailable)",
+     "seconds": 36.713,
+     "max_rss_bytes": 41514319872,
+     "swapout_growth_bytes": 14378008576,
+     "report_sha256": "e7b4d2b95812b157aa6600451812567f832837e7fed2392b8deac2b1ce0dec50",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/direct/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 33.126,
+       "rss_cap_bytes": 88583700480,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "41aa79037e9843f1dfdedef8cc3fbb0e570c44e275ec968255553e1ab479ed42",
+       "report_sha256": "e7b4d2b95812b157aa6600451812567f832837e7fed2392b8deac2b1ce0dec50",
+       "binary_sha256": "231d57af76e1f8fa9e97ff3034d876d31de5dbbb1fb76380fbd44adfb82e6d25",
+       "source_build_sha256": "e68e167df4fdd670eee615426e7877605760e5f19675a8fd8018182eb07978a9"
+      }
+     ]
+    },
+    "cpu": {
+     "status": "unsupported",
+     "reason": "This packed DeepSeek implementation requires Metal."
+    }
+   }
+  },
+  {
+   "id": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00001-of-00006",
+   "architecture": "deepseek41",
+   "entry": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00001-of-00006.gguf",
+   "files": [
+    {
+     "filename": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00001-of-00006.gguf",
+     "size_bytes": 5780704,
+     "sha256": "108e63d27240da2d99846250727a7b282e05a7fdf2448435e81904b9a98d8a4a"
+    },
+    {
+     "filename": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00002-of-00006.gguf",
+     "size_bytes": 19776064960,
+     "sha256": "75079999eb3a492ad695f3466fd6a068a1cf1920980eac1c7f51406363fadf7a"
+    },
+    {
+     "filename": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00003-of-00006.gguf",
+     "size_bytes": 19939989696,
+     "sha256": "ea964e525922f36d3b984299c1a5bb8d896f50b9c2942364cd221c37863331f2"
+    },
+    {
+     "filename": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00004-of-00006.gguf",
+     "size_bytes": 19682533472,
+     "sha256": "2d95806d186597cb0ea32635c92f0b66a9a6afae1a399ff74b13aebaa4ac7a52"
+    },
+    {
+     "filename": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00005-of-00006.gguf",
+     "size_bytes": 12719198624,
+     "sha256": "3665b48c3bd46330780caf286ee40a087ac11499e5b7df8c943b098d10f426d4"
+    },
+    {
+     "filename": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00006-of-00006.gguf",
+     "size_bytes": 110595290816,
+     "sha256": "3dac4c54893ad7aa89103c0028500eadc78e74112cef3a2930a97e67dc9fb4f3"
+    }
+   ],
+   "backends": {
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "direct qualify_text (run_basic.py admission refused: reclaimable page cache counted as unavailable)",
+     "seconds": 21.485,
+     "max_rss_bytes": 39593459712,
+     "swapout_growth_bytes": 0,
+     "report_sha256": "5f998ef06d565f0a1b057e01ea40857e2ad2f10389eb7d5a3e5ff9152e5d1aa4",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/direct/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 21.792,
+       "rss_cap_bytes": 80530636800,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "f6078b3b3b9eca1bfe8f9e3bd090f1f547a5ae19013230daa9d103ce79464ac0",
+       "report_sha256": "5f998ef06d565f0a1b057e01ea40857e2ad2f10389eb7d5a3e5ff9152e5d1aa4",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "cpu": {
+     "status": "unsupported",
+     "reason": "This packed DeepSeek implementation requires Metal."
+    }
+   }
+  },
+  {
+   "id": "DeepSeek-V4.1-Flash-1017-Maya-XS",
+   "architecture": "deepseek41",
+   "entry": "DeepSeek-V4.1-Flash-1017-Maya-XS.gguf",
+   "files": [
+    {
+     "filename": "DeepSeek-V4.1-Flash-1017-Maya-XS.gguf",
+     "size_bytes": 365713686528,
+     "sha256": "f414995b3797f77009634fac995f50834e70393771f9423fca984c892503b42a"
+    }
+   ],
+   "backends": {
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "direct qualify_text (run_basic.py admission refused: reclaimable page cache counted as unavailable)",
+     "seconds": 20.117,
+     "max_rss_bytes": 43967709184,
+     "swapout_growth_bytes": 0,
+     "report_sha256": "aa192287badfd3144fda2534f18b4f86d87d73cc71d8016b5863ea79737bf41a",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/direct/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 19.979,
+       "rss_cap_bytes": 92073361408,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "d79aebd6740f7300daddfdb29d34ad3782846a4f99e149b41877a94eb3e5f940",
+       "report_sha256": "aa192287badfd3144fda2534f18b4f86d87d73cc71d8016b5863ea79737bf41a",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "cpu": {
+     "status": "unsupported",
+     "reason": "This packed DeepSeek implementation requires Metal."
+    }
+   }
+  },
+  {
+   "id": "google_gemma-4-31B-it-Q4_K_M",
+   "architecture": "gemma4",
+   "entry": "google_gemma-4-31B-it-Q4_K_M.gguf",
+   "files": [
+    {
+     "filename": "google_gemma-4-31B-it-Q4_K_M.gguf",
+     "size_bytes": 19598489952,
+     "sha256": "2959c1b0a4f792493bb0092846ea06aec54547e47be979c282634d938d501b75"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 31.564,
+     "rss_cap_bytes": 47244640256,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 39200063488,
+     "report_sha256": "8df21b21e744a563ca0eb06c7f3e9b63fb7ba00fce3aa070f234e772f57e2b1e",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-retry1/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 31.883,
+       "rss_cap_bytes": 47244640256,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "d4220c81d7cf010360fd89d903c879f016e5012bda4d0a17c97ed303c367ec91",
+       "report_sha256": "06ee81d18c50b45c4365d7d225af2635718bbac1a81da801f7b4e179c0b602a5",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 18.079,
+     "rss_cap_bytes": 42949672960,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 29398876160,
+     "report_sha256": "f242e52a9780939f74ede91c88778b0ea2c6fe65ff4c416ccb91ee961f56f0b5",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-retry1/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 17.804,
+       "rss_cap_bytes": 42949672960,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "6274cafda263947767a15bec5ff50faf94f95aa6cd5cbe740c655164a23094d1",
+       "report_sha256": "3bd0f095f7be490a56705c54159be48b5cebdc903516b9febf9f564f5e41687b",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "GLM-5.3-Flash-Q2_K",
+   "architecture": "glm5next",
+   "entry": "GLM-5.3-Flash-Q2_K.gguf",
+   "source": "vcruz305/GLM-5.3-Flash-GGUF@b19ca66573c0f50a96720f4395788ed32a158f37",
+   "files": [
+    {
+     "filename": "GLM-5.3-Flash-Q2_K.gguf",
+     "size_bytes": 116728212640,
+     "sha256": "aed0eb12f2baf7a3a68bdc94c96841ac0536a19be2bc76b2d15c10d9f6f22b05"
+    }
+   ],
+   "backends": {
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "direct qualify_text; run_basic.py memory admission reserve exceeded; check ran directly",
+     "seconds": 56.77,
+     "max_rss_bytes": 107979423744,
+     "peak_footprint_bytes": 120314909512,
+     "swapout_growth_gb_approx": 17,
+     "report_sha256": "f084830634acf1f78a0cc6e28d1866d89f9e76ce7324485f6b71a5e55ead5ae8",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "glm53-flash-q2k-2026-11-09"
+    },
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "direct qualify_text; run_basic.py memory admission reserve exceeded; check ran directly",
+     "seconds": 71.5,
+     "max_rss_bytes": 62440112128,
+     "peak_footprint_bytes": 119073768896,
+     "swapout_growth_gb_approx": 32,
+     "report_sha256": "bd876eb904a763b01538163e9f909df44b709fc2b883d0997cf37d4507c5944a",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "glm53-flash-q2k-2026-11-09"
+    }
+   },
+   "note": "Requires substantial swap when host memory is close to the model size. Basic state checks only; no independent numeric qualification."
+  },
+  {
+   "id": "Llama-4-Scout-17B-16E-Instruct-Q2_K",
+   "architecture": "llama4",
+   "entry": "Llama-4-Scout-17B-16E-Instruct-Q2_K.gguf",
+   "files": [
+    {
+     "filename": "Llama-4-Scout-17B-16E-Instruct-Q2_K.gguf",
+     "size_bytes": 39563317760,
+     "sha256": "bcb64ced7a5acabf1a153e438bba41132f52fa721a1af7e6fe148768d98f461e"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "direct qualify_text (run_basic.py admission refused: reclaimable page cache counted as unavailable)",
+     "seconds": 28.374,
+     "max_rss_bytes": 76623003648,
+     "swapout_growth_bytes": 80150528,
+     "report_sha256": "a7e9decba4d68eb3cefca567a35216c4a7c5c281c5c6fe21de05ce9999a93d9d",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/direct/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 28.25,
+       "rss_cap_bytes": 93415538688,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "9d55803e2d50172b98f554a35ca5836c904ab3e7ef689410369f268bbf84ffc6",
+       "report_sha256": "442970f41c285d727df933cd894f7122b55ed8078bb9d3f631d68095f0d1a0af",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "direct qualify_text (run_basic.py admission refused: reclaimable page cache counted as unavailable)",
+     "seconds": 19.854,
+     "max_rss_bytes": 89931431936,
+     "swapout_growth_bytes": 0,
+     "report_sha256": "272a8f8fed29023a24c2a629d4008804f578d9af3d3ffbf92baec0a12db0ae8d",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/direct/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 23.333,
+       "rss_cap_bytes": 92073361408,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "057284070db8bd5d5be4679e7627aab77d0ef661175ffafbe7b623f226af6543",
+       "report_sha256": "5b5a44fe7f1f05fe9b9a7bf392dc17f1b1abd8137bf289337aa7e71fcdc568a7",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      },
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 25.913,
+       "rss_cap_bytes": 92073361408,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "21a8283d6610a88056bef7aeec739d5db55ddce8ad6a45acff23d1264311b836",
+       "report_sha256": "5b5a44fe7f1f05fe9b9a7bf392dc17f1b1abd8137bf289337aa7e71fcdc568a7",
+       "report_encoding": "qualify_text stdout JSON",
+       "binary_sha256": "92538854fbb9eef6ba286177a20c8490f0f328bfa3c480fc6fc23582b761b8bf",
+       "source_build_sha256": "01528132da1b80c500ec7e705f944fb7a94324e0ffa662685737a8464c60116e",
+       "note": "Targeted rerun after the shared Q2_K Metal buffer safety fix."
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "MiniMax-M2-5-UD-Q2_K_XL",
+   "architecture": "minimax-m2",
+   "entry": "UD-Q2_K_XL/MiniMax-M2.5-UD-Q2_K_XL-00001-of-00003.gguf",
+   "source": "unsloth/MiniMax-M2.5-GGUF@7c50dca0e5592483ad308ecffc876aecac725660",
+   "files": [
+    {
+     "filename": "UD-Q2_K_XL/MiniMax-M2.5-UD-Q2_K_XL-00001-of-00003.gguf",
+     "size_bytes": 8238112,
+     "sha256": "2f3fe39c2a4594af8e2cfd186b9f7d9571946908687800b7887e6e71a0c3a725"
+    },
+    {
+     "filename": "UD-Q2_K_XL/MiniMax-M2.5-UD-Q2_K_XL-00002-of-00003.gguf",
+     "size_bytes": 49936768160,
+     "sha256": "8cc0a6e7e054dda72f2b8b969599d089658562b64b93ea57971a18cba9893435"
+    },
+    {
+     "filename": "UD-Q2_K_XL/MiniMax-M2.5-UD-Q2_K_XL-00003-of-00003.gguf",
+     "size_bytes": 35972986144,
+     "sha256": "28e41e96f512bd100ef98e8a09c018f9730cbd1487283f4eb9995567ce976e2a"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "source_commit": "repository source tree",
+     "runner": "direct qualify_text with /usr/bin/time -l; run_basic.py memory admission reserve exceeded; check ran directly",
+     "seconds": 60.05,
+     "max_rss_bytes": 64022298624,
+     "peak_footprint_bytes": 98536414496,
+     "report_sha256": "b550374658d66b6e65eef198a96c0b96e88c437fa14217811bb426d83466500f"
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "source_commit": "repository source tree",
+     "runner": "direct qualify_text with /usr/bin/time -l; run_basic.py memory admission reserve exceeded; check ran directly",
+     "seconds": 26.78,
+     "max_rss_bytes": 93038346240,
+     "peak_footprint_bytes": 98020447352,
+     "report_sha256": "ca0e8f63c102748948c0b8524ff63a338bb01cac1c0ed178d883139df69e07e8"
+    }
+   },
+   "numeric_status": "passed on both backends against same-backend llama.cpp 15fa3c493 references, original64 teacher history (64 full-vocabulary rows): Metal argmax 63/64, mean KL 0.0021, max KL 0.0177; CPU argmax 61/64, mean KL 0.0058, max KL 0.0597. llama.cpp CPU vs llama.cpp Metal on the same history: argmax 61/64, mean KL 0.0064, max KL 0.0353. This is the 64-row targeted profile, not the shared six-case matrix.",
+   "numeric_evidence": {
+    "directory": "minimax-m25-ud-q2kxl-2026-11-09",
+    "engine_cpu_report_sha256": "0f7be88b34e08d2ee8bf6457e8ae189ccbf20a9696d5ad4f9ef50f22e2c0fc99",
+    "engine_metal_report_sha256": "e6864e9d9062cd0f0e95844d89edd411185ab04fb7b47433c150b06ef850c612",
+    "reference_cpu_sha256": "7cf24871ed261b748f874ea9c4de1b553f62cc0312de7c67187f1e50385094cd",
+    "reference_metal_sha256": "5e68903461726c93c2d682c07a19601a07852aac527b1291097b34da61618c1d",
+    "qualify_reference_binary_sha256": "93152ed87d990e9195e78e963801eb93413be12c829fa39578148b5f551e6971",
+    "cross_compare_sha256": "7fb99a6558865a7958dbc3463f021c4f9f34cf3d79f674b182ca739cb784d18e"
+   }
+  },
+  {
+   "id": "MiniMax-M2-5-REAP-50-Q2_K",
+   "architecture": "minimax-m2",
+   "entry": "MiniMax-M2-5-REAP-50-Q2_K.gguf",
+   "files": [
+    {
+     "filename": "MiniMax-M2-5-REAP-50-Q2_K.gguf",
+     "size_bytes": 42540305920,
+     "sha256": "b8515427dd76e95dd82bf1060f7898c9bc398bf15c4a1fcfb7b370afb26b8103"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 27.283,
+     "rss_cap_bytes": 54760833024,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 47232450560,
+     "report_sha256": "1fd4319d9a799e14dbec11319e6e417c6af32fd627c28a6fbf8ecc3a146003ae",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-retry1/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 28.563,
+       "rss_cap_bytes": 54760833024,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "13d80d45f14d2fb8b3b6b9ae098918d42e1f43d6052e7c034f2b315c9cfbd0a7",
+       "report_sha256": "6e8c7fdd2ae6936877db316beb27374fcd740ca2929696cd3fdadd7ae7718e80",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 15.305,
+     "rss_cap_bytes": 60129542144,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 52057210880,
+     "report_sha256": "f71cfad0566e4133b3524432ca4f1b356a05cb3515fac92b59b390f8a3297aa0",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-retry1/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 14.959,
+       "rss_cap_bytes": 60129542144,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "82cb9f5a03bef8a619337e1943381db7422365bebb25d3a513be9c97230e7b76",
+       "report_sha256": "dadbd9e03d731dc80f6ae0f1631b22f405b98b2d60b27e21cc6908d5b23a697a",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      },
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 15.3,
+       "rss_cap_bytes": 60129542144,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "86dd15b3a691b2dff23598199599a661b90635c1bae289780347cafca5d76c86",
+       "report_sha256": "dadbd9e03d731dc80f6ae0f1631b22f405b98b2d60b27e21cc6908d5b23a697a",
+       "report_encoding": "qualify_text stdout JSON",
+       "binary_sha256": "92538854fbb9eef6ba286177a20c8490f0f328bfa3c480fc6fc23582b761b8bf",
+       "source_build_sha256": "01528132da1b80c500ec7e705f944fb7a94324e0ffa662685737a8464c60116e",
+       "note": "Targeted rerun after the shared Q2_K Metal buffer safety fix."
+      }
+     ]
+    }
+   },
+   "numeric_status": "not qualifiable with the fixed limits: llama.cpp itself fails them across its own backends on this pruned 2-bit checkpoint (CPU vs Metal argmax 59/64, mean KL 0.065, max KL 1.21, original64 history). Current engine: Metal vs llama.cpp Metal 61/64, mean KL 0.0148, max KL 0.131; CPU vs llama.cpp CPU 59/64, mean KL 0.085, max KL 1.49. The basic state pass stands; MiniMax-M2 numeric qualification rests on the unpruned UD-Q2_K_XL entry.",
+   "numeric_evidence": {
+    "directory": "minimax-reap-noise-floor-2026-11-09",
+    "recorded_date": "2026-11-09"
+   }
+  },
+  {
+   "id": "Mistral-7B-Instruct-v0.3-Q4_K_M",
+   "architecture": "llama",
+   "entry": "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
+   "files": [
+    {
+     "filename": "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
+     "size_bytes": 4372812000,
+     "sha256": "1270d22c0fbb3d092fb725d4d96c457b7b687a5f5a715abe1e818da303e562b6"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 4.739,
+     "rss_cap_bytes": 12884901888,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 8547762176,
+     "report_sha256": "d37ec48822838426d13aa49ea8ecc9865df68c1c85a31bc3674a903e1013a4df",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 4.149,
+       "rss_cap_bytes": 12884901888,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "0e1ac6a827bdd402fdc522acc98710797241f1d690ebc2e3049fe9dea65d04f8",
+       "report_sha256": "d6c131f36a49fe9b1d0581bdf4acc0faa55468a070bbb2fb031f6f397d27bd5c",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 1.673,
+     "rss_cap_bytes": 12884901888,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 5840257024,
+     "report_sha256": "8857d69740cb83b57ab813c993208df2b6f5ff74eeec6bc61128088016ed0a66",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 1.6,
+       "rss_cap_bytes": 12884901888,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "bb69daec0b280d16a67397f6c83bfe1d7e3bbe5dd7ef9bc9d2c9d779ef0e1327",
+       "report_sha256": "eb6b14708f9780987051ced298888e3d590f62b77ce11ec6bc2bf701c94063d5",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "Nemotron-3-Nano-30B-A3B-Q4_0",
+   "architecture": "nemotron_h_moe",
+   "entry": "Nemotron-3-Nano-30B-A3B-Q4_0.gguf",
+   "files": [
+    {
+     "filename": "Nemotron-3-Nano-30B-A3B-Q4_0.gguf",
+     "size_bytes": 18214716192,
+     "sha256": "32385f5c469d3a362758f942726d484362214345a9788f6b402d35c5eccb9da3"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 14.453,
+     "rss_cap_bytes": 44023414784,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 37084348416,
+     "report_sha256": "f0538f62bc6ab85c22c2957feecca5d92d7de23ae83c44a51542685fab6853cd",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-retry1/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 13.781,
+       "rss_cap_bytes": 44023414784,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "3f43b8f513c0530a0df47d5bb6f6ebf3d9f303863086321a49cbd66826eb7982",
+       "report_sha256": "3857a191b24c40e92e6fb0c670e6224e67fe771f5866d5fc4c59c56cc467745a",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 9.462,
+     "rss_cap_bytes": 47244640256,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 38695845888,
+     "report_sha256": "95e1bbca4f039bb1a611e16bdfb2028d6d77f54cf04470d2abd8f8404b891c15",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-retry1/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 9.284,
+       "rss_cap_bytes": 47244640256,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "e8af4ac5755f16da620dec2e1bce41f88f51e59883988c6f7ac87782868de5ad",
+       "report_sha256": "43a77b62d37671c99ab4538742cc432ef74d634e367bdfc9cb01fbb98795d763",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "nvidia_Nemotron-H-8B-Reasoning-128K-Q4_K_M",
+   "architecture": "nemotron_h",
+   "entry": "nvidia_Nemotron-H-8B-Reasoning-128K-Q4_K_M.gguf",
+   "files": [
+    {
+     "filename": "nvidia_Nemotron-H-8B-Reasoning-128K-Q4_K_M.gguf",
+     "size_bytes": 4983360480,
+     "sha256": "312ebd50999058707868f49011d87225fcc92af0f5a526cd3553f821dc161956"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 12.404,
+     "rss_cap_bytes": 21474836480,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 11629232128,
+     "report_sha256": "a7f5a83c5dd6e084b512ba5dafbb8163ce1dadee1a7a2f696f34882831b883df",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 11.733,
+       "rss_cap_bytes": 21474836480,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "ff454965c34278e8654c51bee6e3fb5f01613393c4cca26cf6a0d3557c80ceaa",
+       "report_sha256": "ec3d1fadbaef279b1e89519e1ffc999e1aad049367dc241ed681bfca873720f7",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 7.43,
+     "rss_cap_bytes": 21474836480,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 10308485120,
+     "report_sha256": "a716c13ea3f53d1b2660d587e57049168b658d2c6686381c3c4079ce00ab1a40",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 7.843,
+       "rss_cap_bytes": 21474836480,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "f8f2042b8840a52913f6401c20496f5f03a90788f12f216c6623afbe52322c0e",
+       "report_sha256": "d7c26043dd1383e97a256dd7c7ec79cf06f96376c2229ac30bcdd2015f87bb61",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "Phi-3-mini-4k-instruct-Q4_K_M",
+   "architecture": "phi3",
+   "entry": "Phi-3-mini-4k-instruct-Q4_K_M.gguf",
+   "files": [
+    {
+     "filename": "Phi-3-mini-4k-instruct-Q4_K_M.gguf",
+     "size_bytes": 2393231360,
+     "sha256": "28a89b4ddb5766355f24e362ae4078b4c35b9ca9568df5fc9e6d9aeee4dee834"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 13.522,
+     "rss_cap_bytes": 6442450944,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 3107373056,
+     "report_sha256": "409c7900f6cb9d8db2be9d606e2c153903f9c03c4c9fd462a19f663d11c2b7f0",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 13.464,
+       "rss_cap_bytes": 6442450944,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "c2ba4ae8ebf6d22de02ae4d149b72dcada00db733b12e11004fe017e50203aa1",
+       "report_sha256": "be1f27de88e5e5713456378c127a31ec8446dbdc9b4d171c51e3b8bd73a2965e",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 1.412,
+     "rss_cap_bytes": 6442450944,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 5735186432,
+     "report_sha256": "d770e28e90de9a75c6b87675d9b70c75e60fd7b82dc960d6a85e3bb989d94407",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 5.311,
+       "rss_cap_bytes": 6442450944,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "174f9720e467b9ecf44e62868c89cc9cdcb90b18819f1974ee53fbd3f7ba58d7",
+       "report_sha256": "70985b3c598b4609dacc1726e3973b592c3719abc1db70441e74e34077e245e0",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "Phi-3-mini-4k-instruct-Q8_0",
+   "architecture": "phi3",
+   "entry": "Phi-3-mini-4k-instruct-Q8_0.gguf",
+   "files": [
+    {
+     "filename": "Phi-3-mini-4k-instruct-Q8_0.gguf",
+     "size_bytes": 4061221376,
+     "sha256": "0ac8ee48aeebf7d1b354691fd1e29e91c32ad88bbad10ad45ac880dcd4372a47"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 5.074,
+     "rss_cap_bytes": 15032385536,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 4725817344,
+     "report_sha256": "72df87dd2eec028f7609fa25dffbe3c34048b799e6a50577a70e39062f3bbdbd",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-retry1/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 4.951,
+       "rss_cap_bytes": 15032385536,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "7e543e1a12ef3d57d7ce20c48001e5000e235cff06b0c5a73461c2da09cd2d86",
+       "report_sha256": "ac1740e7097a77fddb1c9d13b43ee5fb9943c00ced40e7e5ece2b493bdb0c44a",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 2.01,
+     "rss_cap_bytes": 15032385536,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 8745172992,
+     "report_sha256": "d4522fae00c81b7f2c6f16ffd21df07a779116ede3c4637a13ccb1eaa00db095",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-retry1/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 1.727,
+       "rss_cap_bytes": 15032385536,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "9eb874a518d5f0fc6d4d2ed3bd6eccc715de46e618fa4513294be77fa5590495",
+       "report_sha256": "de83c2673465de2d2074e015b223c805e013d3331b1822d3c4a89ea11ee2cd7c",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "qwen2.5-coder-1.5b-instruct-q4_k_m",
+   "architecture": "qwen2",
+   "entry": "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+   "files": [
+    {
+     "filename": "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+     "size_bytes": 1117320768,
+     "sha256": "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 5.527,
+     "rss_cap_bytes": 6442450944,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 3038986240,
+     "report_sha256": "3d2d5e43d33be7ea19bf57af80ec506454f672f96e9ab719adeed3b039b69088",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 5.193,
+       "rss_cap_bytes": 6442450944,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "533019a3802a5130f48f49f747e33adcc69e6cc53179d093a54b31bd4522011b",
+       "report_sha256": "dc1798d6e982fef1a45203d092e02103fad7e6a3d1c34c80a43f71f570d744b1",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 4.689,
+     "rss_cap_bytes": 6442450944,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 3360456704,
+     "report_sha256": "0545d4b0d9a172d5ead14c4e846c2063293b4d71d4d4541bedb541b18dc68614",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 4.479,
+       "rss_cap_bytes": 6442450944,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "281035080949f3fc415beebfd6b319b9d4a861ada6e4039bb67d38c4dbe53e06",
+       "report_sha256": "c7c09af47ba8c045eb8ef4bc7d302bf543bd0f5673602635622d1010bff08b24",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "Qwen3.5-4B-Q6_K",
+   "architecture": "qwen35",
+   "entry": "Qwen3.5-4B-Q6_K.gguf",
+   "files": [
+    {
+     "filename": "Qwen3.5-4B-Q6_K.gguf",
+     "size_bytes": 3525956768,
+     "sha256": "fdedd781c9ce676ab66b018ca247ff78e8a33c98098a822c1e2d5075e7718f66"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 10.733,
+     "rss_cap_bytes": 6442450944,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 4710612992,
+     "report_sha256": "b3b2f0b6c13007dfb8cdb2bdb2c5e4bca045cb8351b2f3d75d14c9a3d6c87179",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 10.336,
+       "rss_cap_bytes": 6442450944,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "a6b78f738bb66b72bb5489f5c74560b7226c3f50d55b958ea686afc1ba2604cd",
+       "report_sha256": "60cb289045b41bc6fa80922ee78b985e19d3ffe15236ac5afb3a2d939efbe63a",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 7.966,
+     "rss_cap_bytes": 6442450944,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 4928061440,
+     "report_sha256": "1799ded087034b3e095ee6e6c6908a500858d1f22366dd711b3176f37b420793",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 7.727,
+       "rss_cap_bytes": 6442450944,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "ffe09342072dbc76ff5bbf2d45d53100b09f76e33b21198bf2bf957f73342a40",
+       "report_sha256": "c5fcf4dc158b8a3f0ca739971671ce599e7e90e7920ea0ad6a51b53eaac174d3",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "Qwen3.5-9B-Q6_K",
+   "architecture": "qwen35",
+   "entry": "Qwen3.5-9B-Q6_K.gguf",
+   "files": [
+    {
+     "filename": "Qwen3.5-9B-Q6_K.gguf",
+     "size_bytes": 7458301152,
+     "sha256": "91898433cf5ce0a8f45516a4cc3e9343b6e01d052d01f684309098c66a326c59"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 13.8,
+     "rss_cap_bytes": 11811160064,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 8823472128,
+     "report_sha256": "767dd450ea5cec535e969e129e95572b492f83fda06953a8155878cee5be7541",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 13.18,
+       "rss_cap_bytes": 11811160064,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "b4ada3fbfa94cc18edf6d9390252f416437e94a3610884275f038a921d4d807d",
+       "report_sha256": "86276cbc659b1f8b94f3da6681673594a48b929740d928bab465aec6178b74f9",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 9.373,
+     "rss_cap_bytes": 12884901888,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 9487958016,
+     "report_sha256": "28e9288c9857224301ef628d800803f1bf71049e81c1166f6570dca6a7c6ff1b",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 8.883,
+       "rss_cap_bytes": 12884901888,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "2ba80689a3377abc8950d110de48448fa07ec11651ac2403d5896f990deb336c",
+       "report_sha256": "06e678321d18220391b0de83f4a006f74a4675039652f777d6fc4ae920e2bcf6",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "Qwen3.6-27B-Q4_K_M",
+   "architecture": "qwen35",
+   "entry": "Qwen3.6-27B-Q4_K_M.gguf",
+   "files": [
+    {
+     "filename": "Qwen3.6-27B-Q4_K_M.gguf",
+     "size_bytes": 16547399040,
+     "sha256": "e412f90056900952293cd1e7074f562f2011345ca23b7b75ce8beec84c59e965"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 24.02,
+     "rss_cap_bytes": 38654705664,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 30322606080,
+     "report_sha256": "31cf2592e5aee7e698195332da94dc0965eed08e78253715b6e4afde791ee172",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 23.714,
+       "rss_cap_bytes": 38654705664,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "48a49876eda503b8ecaa57c67fe6d7735b6f9a02788242a1d0d5a46bfb4a1b6c",
+       "report_sha256": "849ac4739307f6c0c719570363f6d9bc5f61ca122219fb4857d0ccaea147e9a2",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 12.087,
+     "rss_cap_bytes": 27917287424,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 20264517632,
+     "report_sha256": "9edba3ca7260c85ffd2fd50c90b3d5f4e52e2b770d5e0d09b9a9a39181791deb",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 11.873,
+       "rss_cap_bytes": 27917287424,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "4b41e41bccdf3ced4164ab807fd00b22aee6005dc9634ad57bc4bb97a0d93c84",
+       "report_sha256": "a896a415c99ef1d09193e34b7c1c2c40117277cf0cdafd61e646a932010b9a79",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "Qwen3.8-27B-Q4_K_M",
+   "architecture": "qwen35",
+   "entry": "Qwen3.8-27B-Q4_K_M.gguf",
+   "files": [
+    {
+     "filename": "Qwen3.8-27B-Q4_K_M.gguf",
+     "size_bytes": 18973870432,
+     "sha256": "31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 42.402,
+     "rss_cap_bytes": 38654705664,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 31002460160,
+     "report_sha256": "659489bce5e98ed765c7a00a20738be2237211afd42aea0195556d99b2709dcc",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 41.019,
+       "rss_cap_bytes": 38654705664,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "e197f5131cb23519a867268545d804aae9d3cf7c9b2acbbe2ef73d5a8403980c",
+       "report_sha256": "782b413a49a42e073912b58e2821befbf625acbdd60e28cf293f00f041fba996",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 13.47,
+     "rss_cap_bytes": 31138512896,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 23464837120,
+     "report_sha256": "90c9b6c4d2d634277e679b4a1065c12513adb0649074b8445254ae9713c06d82",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 13.281,
+       "rss_cap_bytes": 31138512896,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "535252c544e88349087282c954c75d60ea5b9a75bcef91266938e892bb2bf72e",
+       "report_sha256": "b7a6f4a1a4e5f67ca09aa242637a338d7ae579826c09b2f7957f9aaf186c47ab",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "Qwen_Qwen3-30B-A3B-bf16-00001-of-00002",
+   "architecture": "qwen3moe",
+   "entry": "Qwen_Qwen3-30B-A3B-bf16-00001-of-00002.gguf",
+   "files": [
+    {
+     "filename": "Qwen_Qwen3-30B-A3B-bf16-00001-of-00002.gguf",
+     "size_bytes": 39719749984,
+     "sha256": "21e6278c5e1c828558e9236cd22029d27695c143d9982c0a8d7db2819bf8b529"
+    },
+    {
+     "filename": "Qwen_Qwen3-30B-A3B-bf16-00002-of-00002.gguf",
+     "size_bytes": 21376053504,
+     "sha256": "c7b54e256621f592599de9a3665bbb469dec1a61ac5467f0944fd3cd56ff4916"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 28.904,
+     "rss_cap_bytes": 81604378624,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 62493900800,
+     "report_sha256": "4e196114fc4c4585921bf1599c8fa30b9981dae7903b99a56b136633b65fe19c",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 30.262,
+       "rss_cap_bytes": 81604378624,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "97db5f5eb38d5dcf6d105b2e4844c28e0d91fab287aa482f99f6c87f9c5644b1",
+       "report_sha256": "5c44314a9bc57ae53a8325ebfc858afd49dc4792fd764c757e0ee952f4ffc86b",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "direct qualify_text (run_basic.py admission refused: reclaimable page cache counted as unavailable)",
+     "seconds": 48.409,
+     "max_rss_bytes": 64981106688,
+     "swapout_growth_bytes": 0,
+     "report_sha256": "66a1de2e51584e7edff0b2f257edb9f3cfa0c5bf83b578522956f4cc9c8ecd7a",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/direct/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 46.844,
+       "rss_cap_bytes": 84825604096,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "56aa168ddb7e01bad641462ee4bc89c05116bd28256e724b21edbe7082b230a4",
+       "report_sha256": "66a1de2e51584e7edff0b2f257edb9f3cfa0c5bf83b578522956f4cc9c8ecd7a",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "Qwen_Qwen3-30B-A3B-Q4_K_M",
+   "architecture": "qwen3moe",
+   "entry": "Qwen_Qwen3-30B-A3B-Q4_K_M.gguf",
+   "files": [
+    {
+     "filename": "Qwen_Qwen3-30B-A3B-Q4_K_M.gguf",
+     "size_bytes": 18632184480,
+     "sha256": "a015794bfb1d69cb03dbb86b185fb2b9b339f757df5f8f9dd9ebdab8f6ed5d32"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 15.806,
+     "rss_cap_bytes": 46170898432,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 34772402176,
+     "report_sha256": "745041eddabe50830f26463c53fda84ef0119fe8bf5da73045a48ae1a0885c48",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 16.984,
+       "rss_cap_bytes": 46170898432,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "ca32605ac31b17c6421268690a202369d722c9f0f8d6d4034d6b5aaebd87641c",
+       "report_sha256": "ace55d43a6ef046df1fc901a057cfbdbe956f6bbcdc2982e799b7b8f31ea572c",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 8.925,
+     "rss_cap_bytes": 49392123904,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 39435812864,
+     "report_sha256": "9e0e114848248429c285b9c3ef7aee00399a36b2418e13003b4fb7b11bf9c4bf",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 8.528,
+       "rss_cap_bytes": 49392123904,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "3d4c03f2af090b55e17ee99a5fb2f431e4a4b06a6b936dc5aa2c244384a6866c",
+       "report_sha256": "66f0d34c371625aa1ffb59f20aee572ef73dc09ed1079136606d11360b12b843",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "Qwen_Qwen3-30B-A3B-Q8_0",
+   "architecture": "qwen3moe",
+   "entry": "Qwen_Qwen3-30B-A3B-Q8_0.gguf",
+   "files": [
+    {
+     "filename": "Qwen_Qwen3-30B-A3B-Q8_0.gguf",
+     "size_bytes": 32483932832,
+     "sha256": "da6389ca8b6bd9e15565b6137dc2c3aacd624cc35208c0b8b5ffbfa80493e967"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "run_basic.py",
+     "seconds": 16.447,
+     "rss_cap_bytes": 78383153152,
+     "reserve_bytes": 25769803776,
+     "peak_sampled_rss_bytes": 62139416576,
+     "report_sha256": "15922146ed37ec56de06d834a84f6063cc9271b190db31de7c83fcfc503e54f8",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/sweep-text-v2/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 17.058,
+       "rss_cap_bytes": 78383153152,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "3679e8984ab9fa9c71822dd9a244f42fd8cb517e63f9cc6ca19faaac8a5484cc",
+       "report_sha256": "95056628f0c23ac8096fc03ac43ea0789aa4c7605a8be9499a92f3e2b67f7485",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "basic-v1",
+     "runner": "direct qualify_text (run_basic.py admission refused: reclaimable page cache counted as unavailable)",
+     "seconds": 12.667,
+     "max_rss_bytes": 66770599936,
+     "swapout_growth_bytes": 0,
+     "report_sha256": "6fed9ea5ee9a0172783efdeb7ad53b641d3e9b2b200802b5ddf1c1a3be210c17",
+     "binary_sha256": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+     "evidence": "fresh-sweep-2026-11-09/direct/summary.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "profile": "basic-v1",
+       "seconds": 11.106,
+       "rss_cap_bytes": 79456894976,
+       "reserve_bytes": 25769803776,
+       "receipt_sha256": "bb809275490dd55fcd8aaee5a6a58cb320102ce7b0b3bfc3107d3634f162ed0b",
+       "report_sha256": "6fed9ea5ee9a0172783efdeb7ad53b641d3e9b2b200802b5ddf1c1a3be210c17",
+       "binary_sha256": "b3c37c976607f767fff1754fd0c2f91f9b57dd1791a230f9f0a937b2cfe893c3",
+       "source_build_sha256": "f008cced02a17ff3f0fbfead519cd48ba069bfe68a635cb472e03243eb51078c"
+      }
+     ]
+    }
+   }
+  }
+ ],
+ "shared_numeric_matrix": {
+  "manifest": "models.json",
+  "artifact_count": 18,
+  "recorded_cpu_metal_passes": 36,
+  "scope": "Recorded full/Q8_0/Q4_K_M numeric and state results across their tested builds; not a fresh run of one final binary. Removed weights do not erase prior evidence."
+ },
+ "open_basic_coverage": [],
+ "architecture_dispatch": [
+  {
+   "gguf_architectures": [
+    "llama",
+    "mistral",
+    "qwen2"
+   ],
+   "implementation": "llama::LlamaStage"
+  },
+  {
+   "gguf_architectures": [
+    "qwen3moe"
+   ],
+   "implementation": "qwen3moe::Qwen3MoeStage"
+  },
+  {
+   "gguf_architectures": [
+    "qwen35"
+   ],
+   "implementation": "qwen35::Qwen35Stage"
+  },
+  {
+   "gguf_architectures": [
+    "phi3"
+   ],
+   "implementation": "phi3::Phi3Stage"
+  },
+  {
+   "gguf_architectures": [
+    "nemotron_h",
+    "nemotron_h_moe"
+   ],
+   "implementation": "nemotron_h::NemotronStage"
+  },
+  {
+   "gguf_architectures": [
+    "deepseek2",
+    "glm-dsa"
+   ],
+   "implementation": "deepseek2::DeepSeek2Stage",
+   "release_support": "deepseek2 supported; glm-dsa variant unsupported (no qualified checkpoint)"
+  },
+  {
+   "gguf_architectures": [
+    "deepseek4"
+   ],
+   "implementation": "deepseek4::DeepSeek4Stage"
+  },
+  {
+   "gguf_architectures": [
+    "deepseek41"
+   ],
+   "implementation": "deepseek41::DeepSeek41Stage"
+  },
+  {
+   "gguf_architectures": [
+    "glm5next",
+    "glm5-next"
+   ],
+   "implementation": "glm5_next::Glm5NextStage",
+   "release_support": "supported for the pinned GLM-5.3-Flash-Q2_K checkpoint (basic checks only)"
+  },
+  {
+   "gguf_architectures": [
+    "llama4"
+   ],
+   "implementation": "llama4::Llama4Stage"
+  },
+  {
+   "gguf_architectures": [
+    "gemma4"
+   ],
+   "implementation": "gemma4::Gemma4Stage"
+  },
+  {
+   "gguf_architectures": [
+    "minimax-m2"
+   ],
+   "implementation": "minimax_m2::MiniMaxM2Stage"
+  },
+  {
+   "gguf_architectures": [
+    "muse-spark"
+   ],
+   "implementation": "muse_spark::MuseSparkStage",
+   "release_support": "unsupported; implemented but no qualified checkpoint"
+  }
+ ],
+ "policy": "Every advertised checkpoint and supported backend needs basic evidence. Missing files, memory limits and failed runs are gaps, never passes. Architecture dispatch alone does not qualify all checkpoints. Numeric thresholds are unchanged. Architectures without a qualified checkpoint are listed under unadvertised_untested and are not release-supported.",
+ "nontext_artifacts": [
+  {
+   "id": "vision-scout",
+   "mode": "vision",
+   "files": [
+    {
+     "filename": "Llama-4-Scout-17B-16E-Instruct-Q2_K.gguf",
+     "size_bytes": 39563317760,
+     "sha256": "bcb64ced7a5acabf1a153e438bba41132f52fa721a1af7e6fe148768d98f461e",
+     "kind": "weight"
+    },
+    {
+     "filename": "aux-llama4-scout-q2k-70240ddf9daa0a91570a0975c0480044cb6b84bea427feb52bc0226df682fdeb.gguf",
+     "size_bytes": 1746780928,
+     "sha256": "70240ddf9daa0a91570a0975c0480044cb6b84bea427feb52bc0226df682fdeb",
+     "kind": "weight"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "runner": "direct qualify_vision",
+     "seconds": 139.52,
+     "max_rss_bytes": 58858651648,
+     "report_sha256": "51cef56f38d8a054968e5230eba0dae07782fbcccfd8e9c4893728791770477e",
+     "binary_sha256": "664869960b8489802bce443cc82ede430da01cb4e8ba2b3ac33a9d541e2d5887",
+     "evidence": "fresh-sweep-2026-11-09/nontext/vision-scout-cpu.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "seconds": 130.71,
+       "receipt_sha256": "4183d5bfaffc84ad7099d3775cebd48fff9341b96c20c9ff331e6cf58d084da6",
+       "binary_sha256": "51017d303f12fe6f09494face2f037f6809a3efaaa360ac8eda97dcfdc69959f",
+       "rss_cap_bytes": 85899345920,
+       "reserve_bytes": 25769803776
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "runner": "direct qualify_vision",
+     "seconds": 27.36,
+     "max_rss_bytes": 82190663680,
+     "report_sha256": "2530b0da19809b7ace7666fb6259f3f69268f1ada29df3a6707bde914048ec8c",
+     "binary_sha256": "664869960b8489802bce443cc82ede430da01cb4e8ba2b3ac33a9d541e2d5887",
+     "evidence": "fresh-sweep-2026-11-09/nontext/vision-scout-metal.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "seconds": 25.445,
+       "receipt_sha256": "7d9ae4c2510708ae7d8079ab046fceb77e7bf5dbbd0f2042f92905eae1fddf49",
+       "binary_sha256": "51017d303f12fe6f09494face2f037f6809a3efaaa360ac8eda97dcfdc69959f",
+       "rss_cap_bytes": 89120571392,
+       "reserve_bytes": 25769803776
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "draft-direct",
+   "mode": "draft",
+   "files": [
+    {
+     "filename": "Qwen3.8-27B-Q4_K_M.gguf",
+     "size_bytes": 18973870432,
+     "sha256": "31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34",
+     "kind": "weight"
+    },
+    {
+     "filename": "Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+     "size_bytes": 1143006752,
+     "sha256": "18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594",
+     "kind": "weight"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "runner": "direct qualify_draft",
+     "seconds": 136.82,
+     "max_rss_bytes": 33816002560,
+     "report_sha256": "b2fee93ffc92ab8648f90e7377ed4b209012ff8ca998aa25ccd4aa709769a7d7",
+     "binary_sha256": "a09d99337c63807d44089d6080781e2372586f31875a8dbe96103109f231da59",
+     "evidence": "fresh-sweep-2026-11-09/nontext/draft-direct-cpu.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "seconds": 136.107,
+       "receipt_sha256": "33c816b047e51fbb635543ed38b5757f7f6b91f737f3ce9d96351e6ddbd76d7f",
+       "binary_sha256": "2eb024a8f7606b07db67148b5f4fd1efd9041bc562c5455e82712c99566cffba",
+       "rss_cap_bytes": 41875931136,
+       "reserve_bytes": 25769803776
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "runner": "direct qualify_draft",
+     "seconds": 25.52,
+     "max_rss_bytes": 23815127040,
+     "report_sha256": "3cccf77ccc6506ba78fe10b6c16faf504a1ad574bba702708d7d791edc1d4114",
+     "binary_sha256": "a09d99337c63807d44089d6080781e2372586f31875a8dbe96103109f231da59",
+     "evidence": "fresh-sweep-2026-11-09/nontext/draft-direct-metal.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "seconds": 24.104,
+       "receipt_sha256": "90d7a36768e4194387e033d567a18095272c4e2d451e516dfc9bcb2466e22c5b",
+       "binary_sha256": "2eb024a8f7606b07db67148b5f4fd1efd9041bc562c5455e82712c99566cffba",
+       "rss_cap_bytes": 31138512896,
+       "reserve_bytes": 25769803776
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "qwen-image",
+   "mode": "image",
+   "files": [
+    {
+     "filename": "text_encoder/model-00001-of-00004.safetensors",
+     "size_bytes": 4998056552,
+     "sha256": "dde00291b5f7fb92013895310a3da0ddba78674df9f10d505d375243dc01fc6f",
+     "kind": "weight"
+    },
+    {
+     "filename": "text_encoder/model-00002-of-00004.safetensors",
+     "size_bytes": 4915962464,
+     "sha256": "9047faccc0a6d98496a52d55f27be1c94a9c259d1e283fbea0128d054a948d42",
+     "kind": "weight"
+    },
+    {
+     "filename": "text_encoder/model-00003-of-00004.safetensors",
+     "size_bytes": 4915962496,
+     "sha256": "8c54187654c0176b73ae73785bf791dc9a14c9df7fb4310083a09d42048cb57e",
+     "kind": "weight"
+    },
+    {
+     "filename": "text_encoder/model-00004-of-00004.safetensors",
+     "size_bytes": 2704357976,
+     "sha256": "5311532aaaeae3259eb6a7b2c600636be1159adf7ded35f53579f7d0e7d43cdd",
+     "kind": "weight"
+    },
+    {
+     "filename": "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+     "size_bytes": 9968332504,
+     "sha256": "9e6bc2d641e67bf277895ea8777141044a38f3edb7101bc469b2961dd7c36b4b",
+     "kind": "weight"
+    },
+    {
+     "filename": "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+     "size_bytes": 4261951904,
+     "sha256": "3aaf234dcbe128530479735854a346b5e3e66283b7c11db56f836bbd1c13ebaa",
+     "kind": "weight"
+    },
+    {
+     "filename": "vae/diffusion_pytorch_model.safetensors",
+     "size_bytes": 1350989512,
+     "sha256": "a07a1b7c4ee2966a1b3bdc37de9b4f983d56937e46619f709a80b6e490675417",
+     "kind": "weight"
+    },
+    {
+     "filename": "download-manifest.json",
+     "size_bytes": 6421,
+     "sha256": "b42b7c201ade395e15a75019e5e5e2ae2a8e8403154d65e55ca655427cc5f3b3",
+     "kind": "configuration_or_tokenizer"
+    },
+    {
+     "filename": "model_index.json",
+     "size_bytes": 447,
+     "sha256": "cf1ecd104ea090855d60d8cec0895c1e9d6ee41b2f87e231b678beecd1cf7809",
+     "kind": "configuration_or_tokenizer"
+    },
+    {
+     "filename": "transformer/config.json",
+     "size_bytes": 370,
+     "sha256": "56ae3281c4e6c2d1aa3658252d187488071815fd79bef15808bb0205fc1a2241",
+     "kind": "configuration_or_tokenizer"
+    },
+    {
+     "filename": "transformer/diffusion_pytorch_model.safetensors.index.json",
+     "size_bytes": 30283,
+     "sha256": "17987f6623b1c814d0ef55a137d99142b7b3b040eb1bf241b5575dd35af803a2",
+     "kind": "configuration_or_tokenizer"
+    },
+    {
+     "filename": "processor/tokenizer_config.json",
+     "size_bytes": 5445,
+     "sha256": "81ec7bb9530159b326c0bef1d0b6c33d392090524014ea3f0123a3c1eb9c2af5",
+     "kind": "configuration_or_tokenizer"
+    },
+    {
+     "filename": "processor/tokenizer.json",
+     "size_bytes": 11422654,
+     "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+     "kind": "configuration_or_tokenizer"
+    },
+    {
+     "filename": "scheduler/scheduler_config.json",
+     "size_bytes": 485,
+     "sha256": "5895f3a167c14a967fe9ac70c64924ae5acc79799e0679fd12907e594a713cd1",
+     "kind": "configuration_or_tokenizer"
+    },
+    {
+     "filename": "text_encoder/config.json",
+     "size_bytes": 1517,
+     "sha256": "6001331949f7f86ab6d791a80b12246d4f8da5159fa08c3e62368a39f36d63a9",
+     "kind": "configuration_or_tokenizer"
+    },
+    {
+     "filename": "text_encoder/model.safetensors.index.json",
+     "size_bytes": 67795,
+     "sha256": "859146bff8db1d617fca8b457a5223edff963bb70076b3645f2189fe0540a147",
+     "kind": "configuration_or_tokenizer"
+    },
+    {
+     "filename": "vae/config.json",
+     "size_bytes": 2079,
+     "sha256": "9785d527b278cb8b210e9f48a8028d92a4190968ce7e24c8fc85d9d1b82f6ba2",
+     "kind": "configuration_or_tokenizer"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "runner": "direct qualify_image",
+     "seconds": 651.65,
+     "max_rss_bytes": 35575496704,
+     "report_sha256": "aa1cd6f7c40071338e79d97d2fd059a97b5f4cf3dc5549054448b6ba5d7f939d",
+     "binary_sha256": "ccac300ff0821aadf2db489d72a6eea8ccebd2ad81733a9575512ce538034c7e",
+     "evidence": "fresh-sweep-2026-11-09/nontext/qwen-image-cpu.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "seconds": 544.818,
+       "receipt_sha256": "09b5c06d2186bd1cdb1dae59d310b3e2d4305334d7e19f976eb4302262a058da",
+       "binary_sha256": "9848cd781d42123877899d932eea6867475f30fd05444566859efc56063450e1",
+       "rss_cap_bytes": 65498251264,
+       "reserve_bytes": 25769803776
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "runner": "direct qualify_image",
+     "seconds": 32.2,
+     "max_rss_bytes": 17982013440,
+     "report_sha256": "ef62a60c2f92ceb7c9ff6af7574f562e735280fe8057c326f889a92e6e6d2197",
+     "binary_sha256": "ccac300ff0821aadf2db489d72a6eea8ccebd2ad81733a9575512ce538034c7e",
+     "evidence": "fresh-sweep-2026-11-09/nontext/qwen-image-metal.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "seconds": 31.331,
+       "receipt_sha256": "7b866c1be1558f5bdaa4ce53724abfe2941a190dd21cc5773d3bb83a57db5669",
+       "binary_sha256": "9848cd781d42123877899d932eea6867475f30fd05444566859efc56063450e1",
+       "rss_cap_bytes": 65498251264,
+       "reserve_bytes": 25769803776
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "vision-gemma4",
+   "mode": "vision",
+   "files": [
+    {
+     "filename": "google_gemma-4-31B-it-Q4_K_M.gguf",
+     "size_bytes": 19598489952,
+     "sha256": "2959c1b0a4f792493bb0092846ea06aec54547e47be979c282634d938d501b75",
+     "kind": "weight"
+    },
+    {
+     "filename": "aux-gemma-4-31b-q4km-3e3f3f593b34bb4f518ada3e7999e4cbcd2a5864fa86ebc23fad3cbc4fbeba40.gguf",
+     "size_bytes": 1198956736,
+     "sha256": "3e3f3f593b34bb4f518ada3e7999e4cbcd2a5864fa86ebc23fad3cbc4fbeba40",
+     "kind": "weight"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "runner": "direct qualify_vision",
+     "seconds": 318.23,
+     "max_rss_bytes": 37761073152,
+     "report_sha256": "7c7d347f36421d9cfd5180a60a0d83bf67bf598bef8a36d94fd941df2b8360a1",
+     "binary_sha256": "664869960b8489802bce443cc82ede430da01cb4e8ba2b3ac33a9d541e2d5887",
+     "evidence": "fresh-sweep-2026-11-09/nontext/vision-gemma4-cpu.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "seconds": 323.561,
+       "receipt_sha256": "e33683ebfd18b68cecce9248d0b9aed06d866b279ac9fe95b8c4976b6f9a3d37",
+       "binary_sha256": "51017d303f12fe6f09494face2f037f6809a3efaaa360ac8eda97dcfdc69959f",
+       "rss_cap_bytes": 47244640256,
+       "reserve_bytes": 25769803776
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "runner": "direct qualify_vision",
+     "seconds": 25.27,
+     "max_rss_bytes": 33827471360,
+     "report_sha256": "ad8cb9a8aca2fcbfbcb760aab4933bd3962ae56ae3add066f5f9555d470ef87c",
+     "binary_sha256": "664869960b8489802bce443cc82ede430da01cb4e8ba2b3ac33a9d541e2d5887",
+     "evidence": "fresh-sweep-2026-11-09/nontext/vision-gemma4-metal.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "seconds": 25.567,
+       "receipt_sha256": "48cad04180fb73530c88220a4cff381ecd4b5f12dade3ccd9340b75a992cd37d",
+       "binary_sha256": "51017d303f12fe6f09494face2f037f6809a3efaaa360ac8eda97dcfdc69959f",
+       "rss_cap_bytes": 42949672960,
+       "reserve_bytes": 25769803776
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "vision-qwen38",
+   "mode": "vision",
+   "files": [
+    {
+     "filename": "Qwen3.8-27B-Q4_K_M.gguf",
+     "size_bytes": 18973870432,
+     "sha256": "31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34",
+     "kind": "weight"
+    },
+    {
+     "filename": "mmproj-Qwen3.8-27B-Q8_0.gguf",
+     "size_bytes": 629247008,
+     "sha256": "2e968a6af97ce35d8971890b257b9b7edabf20ad91450501fa53162a19ee33eb",
+     "kind": "weight"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "runner": "direct qualify_vision",
+     "seconds": 137.35,
+     "max_rss_bytes": 30517067776,
+     "report_sha256": "bc968819d54dbdff0bf6928c7813801aff2f5f6b64f947cddc123cdb588a31b8",
+     "binary_sha256": "664869960b8489802bce443cc82ede430da01cb4e8ba2b3ac33a9d541e2d5887",
+     "evidence": "fresh-sweep-2026-11-09/nontext/vision-qwen38-cpu.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "seconds": 130.453,
+       "receipt_sha256": "6adfeebb2825061528864fb75bcdecea4f43b88b8662614756f7c60898e3d463",
+       "binary_sha256": "51017d303f12fe6f09494face2f037f6809a3efaaa360ac8eda97dcfdc69959f",
+       "rss_cap_bytes": 38654705664,
+       "reserve_bytes": 25769803776
+      }
+     ]
+    },
+    "metal": {
+     "status": "passed",
+     "runner": "direct qualify_vision",
+     "seconds": 16.92,
+     "max_rss_bytes": 22755540992,
+     "report_sha256": "0660f7eae56864610b67a8b52ae30c534f81379c8572cd0e56fdf7b4231453b1",
+     "binary_sha256": "664869960b8489802bce443cc82ede430da01cb4e8ba2b3ac33a9d541e2d5887",
+     "evidence": "fresh-sweep-2026-11-09/nontext/vision-qwen38-metal.json",
+     "prior_passes": [
+      {
+       "status": "passed",
+       "seconds": 18.57,
+       "receipt_sha256": "af71edd86edceb190570691ae7b8076c9054e0f0fcaf246fa2713755af117709",
+       "binary_sha256": "51017d303f12fe6f09494face2f037f6809a3efaaa360ac8eda97dcfdc69959f",
+       "rss_cap_bytes": 31138512896,
+       "reserve_bytes": 25769803776
+      }
+     ]
+    }
+   }
+  }
+ ],
+ "historical_nontext_artifacts": [
+  {
+   "id": "qwen38-draft-header-variant",
+   "mode": "draft",
+   "historical": true,
+   "scope": "Separate DFlash header variant; prior 64-token state checks on its recorded build, not part of the fresh 32-token pass count.",
+   "files": [
+    {
+     "filename": "Qwen3.8-27B-Q4_K_M.gguf",
+     "size_bytes": 18973870432,
+     "sha256": "31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34"
+    },
+    {
+     "filename": "aux-qwen3.8-27b-q4km-vision-1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd.gguf",
+     "size_bytes": 1143006816,
+     "sha256": "1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd"
+    }
+   ],
+   "backends": {
+    "cpu": {
+     "status": "passed",
+     "profile": "draft-state-64",
+     "tokens": 64,
+     "checks": [
+      "greedy_policy",
+      "greedy_replay",
+      "chunked_prefill",
+      "cancel_cleanup",
+      "sampled_draft_execution"
+     ],
+     "seconds": 171.062,
+     "receipt_sha256": "d49b58a3403d2bed241fffab2620713431aa13e06a65e398572ab0a85ef2a636",
+     "after_sha256": "ab813757b6079f27457249c2ef31b7f1c34774283e1c6900ec28827254ca2372",
+     "binary_sha256": "8d66e1f77c79d412f61b0d8e33d9dee22e0a12b51a2f0f6e4b08d2396e30e419",
+     "source_build_sha256": "2e43320da7c0c42077322e514cbba3a5c06aafe6c843ac951185801db26f67a8",
+     "execution_pin_sha256": "e174123a28f1a84955a3da6287fe8ce9a0eeba1535a121ebf3cfd5b7bd4e1fa1"
+    },
+    "metal": {
+     "status": "passed",
+     "profile": "draft-state-64",
+     "tokens": 64,
+     "checks": [
+      "greedy_policy",
+      "greedy_replay",
+      "chunked_prefill",
+      "cancel_cleanup",
+      "sampled_draft_execution"
+     ],
+     "seconds": 31.916,
+     "receipt_sha256": "aa50e0081b0a76d0040c262a9788ef21f0bb6ba45e5215a3e35095d2fe0af921",
+     "after_sha256": "e9aae1cc74cdb78da8755d32dae9fee784dd5e5a418af83a67f3b395d982b42e",
+     "binary_sha256": "8d66e1f77c79d412f61b0d8e33d9dee22e0a12b51a2f0f6e4b08d2396e30e419",
+     "source_build_sha256": "2e43320da7c0c42077322e514cbba3a5c06aafe6c843ac951185801db26f67a8",
+     "execution_pin_sha256": "e174123a28f1a84955a3da6287fe8ce9a0eeba1535a121ebf3cfd5b7bd4e1fa1"
+    }
+   }
+  }
+ ],
+ "historical_text_artifacts": [
+  {
+   "id": "deepseek-v4-flash-0731-iq3xxs",
+   "architecture": "deepseek4",
+   "historical": true,
+   "entry": "UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf",
+   "scope": "Recorded local Metal load, decode and cancellation evidence on an older build. The nine-case text profile is separate from basic-v1; it does not establish independent numeric agreement or general answer quality. Direct loading bypassed run_basic.py memory admission.",
+   "files": [
+    {
+     "filename": "UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf",
+     "size_bytes": 5257696,
+     "sha256": "dec1cee704800267d9d836d5a61aefc33705be939bbb3058fa9006d98191576d"
+    },
+    {
+     "filename": "UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00002-of-00004.gguf",
+     "size_bytes": 49910532416,
+     "sha256": "3064d3c4c1d6363e9f9ad88e90a3e2c5fb2d6f7ae16ca72135c3ce6a5c984da5"
+    },
+    {
+     "filename": "UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00003-of-00004.gguf",
+     "size_bytes": 49257859456,
+     "sha256": "2e9b2732eca7da8324f731653624a4f5c9846258926fd9f468cc703afb51a019"
+    },
+    {
+     "filename": "UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00004-of-00004.gguf",
+     "size_bytes": 5034198464,
+     "sha256": "4ca79d8e5107dd1b9bb57b176a7c09948837425dee49f0f1dfd6547a3769fea7"
+    }
+   ],
+   "aggregate_identity": {
+    "algorithm": "dinf-split-gguf-sha256-v1",
+    "sha256": "2e400ed07e16b8cb341200d286f579869a5590ee44221bf900eea0b960f012f5",
+    "size_bytes": 104207848032
+   },
+   "backends": {
+    "metal": {
+     "status": "passed",
+     "profile": "text-9case-20261009",
+     "case_count": 9,
+     "cases": [
+      {
+       "id": "smoke",
+       "status": "passed",
+       "results": [
+        {
+         "file": "smoke-1.result.json",
+         "sha256": "df95f86498cd6290a26c8591ccfdf722aba96c6b47277d6229693235a39eb6d3"
+        }
+       ]
+      },
+      {
+       "id": "tool-chain",
+       "status": "passed",
+       "results": [
+        {
+         "file": "tool-chain-1.result.json",
+         "sha256": "05ffc67d075e82855669fc14e6526bc36a75364889d10811ee7eb8dafa25208e"
+        },
+        {
+         "file": "tool-chain-2.result.json",
+         "sha256": "2e8cbb61a471d467eadf790802754fb8a454a8cb295dba3d7ddd7d12a98eb54e"
+        },
+        {
+         "file": "tool-chain-3.result.json",
+         "sha256": "2f6988597173378cc5f168935a455a1daf25b112fff2dac513525169cfd54070"
+        }
+       ]
+      },
+      {
+       "id": "tool-named",
+       "status": "passed",
+       "results": [
+        {
+         "file": "tool-named-1.result.json",
+         "sha256": "f01eedafe54e8228efe8b959741e5fcdb9ac9803de746bf7bce468da76e9cc8f"
+        },
+        {
+         "file": "tool-named-2.result.json",
+         "sha256": "1d9732f42cf9fabd15ff1d51268caebc907423f4c0b0592eaa4303f96672b860"
+        }
+       ]
+      },
+      {
+       "id": "tool-parallel",
+       "status": "passed",
+       "results": [
+        {
+         "file": "tool-parallel-1.result.json",
+         "sha256": "15172f5a94d323b63fbeba6e863322a1b19e5de51266b9b784b84db50e57e5bb"
+        },
+        {
+         "file": "tool-parallel-2.result.json",
+         "sha256": "47b1801ba3004bcf0db5ededa97ca0ac27e0a400fbe5476413312286c71e960b"
+        }
+       ]
+      },
+      {
+       "id": "tool-none",
+       "status": "passed",
+       "results": [
+        {
+         "file": "tool-none-1.result.json",
+         "sha256": "e7b071b5f1c0b0c152a5d4d9f638a99c32dd0c51c01ce6cd4efa89138fb66241"
+        }
+       ]
+      },
+      {
+       "id": "sustained",
+       "status": "passed",
+       "results": [
+        {
+         "file": "sustained-1.result.json",
+         "sha256": "9835e80ff7d590c191c6ca44f4d13ae3ea9becea7930e5e0f2782f8f85dbed21"
+        }
+       ]
+      },
+      {
+       "id": "web-app",
+       "status": "passed",
+       "results": [
+        {
+         "file": "web-app-1.result.json",
+         "sha256": "ded92d9d06f84038ad0f046fa39e32683ea8885ab6ecb0e6e1dbbec429f6bcd8"
+        }
+       ]
+      },
+      {
+       "id": "cancel",
+       "status": "passed",
+       "results": [
+        {
+         "file": "cancel-1.result.json",
+         "sha256": "9b5b0bddd0027d30709e7599087388b34491e364c4286d449db588169929358f"
+        }
+       ]
+      },
+      {
+       "id": "after-cancel",
+       "status": "passed",
+       "results": [
+        {
+         "file": "after-cancel-1.result.json",
+         "sha256": "588f79d9e6e1d84c619c0513dcc3d29438a416823f0b1e39f004bdd94c54ec21"
+        }
+       ]
+      }
+     ],
+     "binary_sha256": "e93a968826d026e17e8cc1ba987a9e80e94974125fbdd75d77d7003cd611e9d3",
+     "source_head": "5a4ab12f429484aad87e19b73dd0fd8035f779ba",
+     "source_diff_sha256": "553d10b9a4d235e6b59078431a4bd94e599deec53e0c15ddc66d05c272cf3abf",
+     "report_sha256": "df6d3fa0930305b825bc9d0ba56e822022cb6a5eb23a503756e884b30253a6e4",
+     "verification_sha256": "ec5306ddcd6b73b14e31daead2aa61b01672ff9c61c87cbd4a2cb3e267e916e3"
+    }
+   },
+   "current_path_review": {
+    "shared_q2_change": "No impact: DeepSeek4 uses its separate RawTensor/DeepSeek4QMatMul path; these exact shards contain no Q2_K tensors.",
+    "q4_output_change": "No impact: these exact shards contain no Q4_K tensors; output.weight uses Q6_K.",
+    "header_index_sha256": "be90123d40e2f1387be0deb12526b40beb71981b9d6b14708e07b084a0e4f315",
+    "weights_revision": "fbbb5b93fb787c21338159b0af3318bb3f4d9768"
+   },
+   "fresh_recheck": {
+    "backend": "metal",
+    "profile": "basic-v1",
+    "status": "not_run_memory",
+    "note": "The exact IQ3 shards are absent and the current construction estimate plus host reserve does not fit. The separate IQ1_S pass does not replace this artifact. Chunked replay, cache-position and empty-cache assertions from basic-v1 remain untested on this exact artifact."
+   }
+  }
+ ],
+ "unadvertised_untested": {
+  "decision_date": "2026-11-09",
+  "scope": "Removed from release support claims because no complete full-model basic check is possible on the qualification host. The code paths remain in the dispatch and are not release-supported. A future claim needs exact pinned weights and passing basic-v1 runs on each backend.",
+  "entries": [
+   {
+    "model": "DeepSeek V4 Flash 0731 UD-IQ3_XXS",
+    "backend": "metal",
+    "status": "not_run_memory",
+    "note": "Recorded Metal evidence from the nine-case text profile is preserved in historical_text_artifacts. The fresh basic-v1 recheck remains open: exact weights are absent and the current construction estimate plus host reserve does not fit. IQ1_S is a separate artifact.",
+    "profile": "basic-v1",
+    "historical_evidence_id": "deepseek-v4-flash-0731-iq3xxs",
+    "advertised": false
+   },
+   {
+    "model": "GLM-DSA",
+    "backend": "cpu,metal",
+    "status": "missing_fixture",
+    "note": "Distinct implemented sparse-attention variant lacks a complete admitted model fixture.",
+    "advertised": false
+   },
+   {
+    "model": "Muse Spark Open 816B A42B Q2_K",
+    "backend": "cpu,metal",
+    "status": "missing_shards_and_memory",
+    "note": "Only the first of 22 shards remains; complete weights exceed this host capacity.",
+    "advertised": false
+   }
+  ]
+ },
+ "fresh_sweep": {
+  "date": "2026-11-09",
+  "binaries": {
+   "qualify_text": "f51790b3a2dfef315506e50c69a76dc49e0f60e7b395c39b409cde4adfc57f6d",
+   "qualify_vision": "664869960b8489802bce443cc82ede430da01cb4e8ba2b3ac33a9d541e2d5887",
+   "qualify_draft": "a09d99337c63807d44089d6080781e2372586f31875a8dbe96103109f231da59",
+   "qualify_image": "ccac300ff0821aadf2db489d72a6eea8ccebd2ad81733a9575512ce538034c7e",
+   "qualify_reference": "93152ed87d990e9195e78e963801eb93413be12c829fa39578148b5f551e6971"
+  },
+  "source": "repository source tree",
+  "evidence": "fresh-sweep-2026-11-09",
+  "scope": "All supported text artifacts on each supported backend plus all non-text artifacts on CPU and Metal, one build. 30 text jobs via run_basic.py, 7 large text jobs and full MiniMax-M2.5 directly; non-text checks directly. GLM-5.3-Flash Q2_K added after restoring its complete file."
+ }
+}

@@ -1,0 +1,54 @@
+{
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "license_url": "https://llvm.org/LICENSE.txt",
+  "source": {
+    "path": "heap.rs",
+    "sha256": "9779725584f471851553670183ba82a10762c62e995bac2da9edf292ed15ac42"
+  },
+  "headers_origin": "libc++ headers as shipped in the Apple macOS 27.2 SDK; sha256 values are of those shipped files. Upstream: https://github.com/llvm/llvm-project/tree/main/libcxx/include/__algorithm",
+  "headers": [
+    {
+      "file": "libcxx/include/__algorithm/make_heap.h",
+      "upstream_url": "https://github.com/llvm/llvm-project/blob/main/libcxx/include/__algorithm/make_heap.h",
+      "sha256": "5ab9161e636194bcd093a590e1b8dc60fd6b51dd61914bd93525bb767bf08bfe"
+    },
+    {
+      "file": "libcxx/include/__algorithm/sort_heap.h",
+      "upstream_url": "https://github.com/llvm/llvm-project/blob/main/libcxx/include/__algorithm/sort_heap.h",
+      "sha256": "9e6f491404587d7008813a6ba261686be81be4dddab95a483232fd53eb78d014"
+    },
+    {
+      "file": "libcxx/include/__algorithm/pop_heap.h",
+      "upstream_url": "https://github.com/llvm/llvm-project/blob/main/libcxx/include/__algorithm/pop_heap.h",
+      "sha256": "029b6ccb3f1111118825615131564ecddf5ed1504f6d72276087d49ec03def33"
+    },
+    {
+      "file": "libcxx/include/__algorithm/sift_down.h",
+      "upstream_url": "https://github.com/llvm/llvm-project/blob/main/libcxx/include/__algorithm/sift_down.h",
+      "sha256": "4373650c4f27d3a28db01ed8202ae05336dd174d242d5d329a75b2fbc4fe2246"
+    },
+    {
+      "file": "libcxx/include/__algorithm/push_heap.h",
+      "upstream_url": "https://github.com/llvm/llvm-project/blob/main/libcxx/include/__algorithm/push_heap.h",
+      "sha256": "e0c6e2d27018c570c1e97450d5035cb5b337149ef73d0744c27e62a49c618ace"
+    },
+    {
+      "file": "libcxx/include/__algorithm/partial_sort.h",
+      "upstream_url": "https://github.com/llvm/llvm-project/blob/main/libcxx/include/__algorithm/partial_sort.h",
+      "sha256": "6f032a4cc26abb6cc33c52a24d10a076d43180bc61d50c859aaa79cc8c3f041c"
+    },
+    {
+      "file": "libcxx/include/__algorithm/sort.h",
+      "upstream_url": "https://github.com/llvm/llvm-project/blob/main/libcxx/include/__algorithm/sort.h",
+      "sha256": "b644503828e13c3c90b5d343684eb993add9330762c5a7957001876be653e014"
+    }
+  ],
+  "scope": "Safe Rust translation of arithmetic-index libc++ make_heap + sort_heap fallback, custom descending score comparator scores[a] > scores[b].",
+  "details": [
+    "make_heap builds an odd prefix with assume_both_children then calls sift_up on the full range.",
+    "Equal scores follow exact original move decisions; no stable-index tie break.",
+    "pop_heap uses Floyd sift-down then optional prefix sift-up, including the original hole==last branch.",
+    "Omitted empty/one-element no-op internal calls do not change index order.",
+    "Caller validates finite scores and valid index range."
+  ]
+}

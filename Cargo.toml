@@ -1,0 +1,80 @@
+[package]
+name = "dinf-engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+build = "build.rs"
+license = "MIT AND Apache-2.0 AND (Apache-2.0 WITH LLVM-exception) AND BSD-3-Clause AND BSL-1.0"
+description = "GGUF model inference engine for CPU, Apple Metal and CUDA"
+repository = "https://github.com/jamisonl/dinf-engine"
+readme = "README.md"
+keywords = ["gguf", "inference", "machine-learning", "candle", "metal"]
+categories = ["science"]
+include = ["build.rs", "LICENSE", "README.md", "SAFETY.md", "src/**", "THIRD_PARTY_LICENSES/**", "tests/**", "examples/**", "fixtures/**", "!**/__pycache__/**", "!**/*.pyc", "!**/*.pyo"]
+
+[features]
+# CPU is the portable baseline. Metal is enabled automatically on macOS;
+# enable `cuda` explicitly where a CUDA toolchain is available.
+default = ["cpu"]
+cpu = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:candle-flash-attn"]
+metal = []
+
+[lib]
+name = "dinf_engine"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+candle-core = "0.11"
+candle-flash-attn = { version = "0.11", optional = true }
+candle-nn = "0.11"
+chrono = "0.4"
+half = { version = "2", features = ["num-traits"] }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+llguidance = { version = "=1.9.1", default-features = false, features = ["lark"] }
+toktrie = "=1.9.1"
+tracing = "0.1"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+rand = "0.9"
+rand_distr = "0.5"
+regex = "1"
+sha2 = "0.10"
+unicode-normalization = "0.1"
+
+[build-dependencies]
+cc = "=1.2.57"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.11", features = ["metal"] }
+candle-nn = { version = "0.11", features = ["metal"] }
+candle-metal-kernels = "0.11"
+objc2-metal = "0.3"
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+
+[workspace]
+# Vendored dependency sources are patched in below, not built as members.
+exclude = ["third_party/candle-metal-kernels", "third_party/cudaforge", "third_party/gemm-common"]
+
+[patch.crates-io]
+# Candle Metal kernels 0.11.1 with local attention, synchronization, buffer and
+# sort fixes. See third_party/candle-metal-kernels/UPSTREAM.md.
+candle-metal-kernels = { path = "third_party/candle-metal-kernels" }
+# Multi-architecture CUDA builds with embedded PTX fallback.
+# See third_party/cudaforge/DINF_PATCH.md.
+cudaforge = { path = "third_party/cudaforge" }
+# Keep ARM FP16 instructions inside runtime-dispatched functions on generic Linux.
+# See third_party/gemm-common/UPSTREAM.md.
+gemm-common = { path = "third_party/gemm-common" }

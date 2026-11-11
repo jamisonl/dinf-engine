@@ -1,0 +1,49 @@
+{
+  "profile": "hf-contract-v1-cpu-f32-gelu-w8a32",
+  "upstream_revision": "15fa3c493bfcd040b5f4dcb29e1c998a0846de16",
+  "existing_hf_patch_sha256": "98a3f2f65673e691a8dc8c92495c6c7462b429685bb6fd2768cb64ed582391b6",
+  "patches": [
+    {
+      "path": "cpu-w8a32-v1.patch",
+      "sha256": "a01b6e2b295566dd52059b6f2c6de8a77f91b9cb9ff672a3e86e75fa77e317ab"
+    },
+    {
+      "path": "cpu-w8a32-producer-v1.patch",
+      "sha256": "d9a233046b4bdf8427678761ec0e306ea62c0044b5e188d2daf2992f3bcc4a5e"
+    }
+  ],
+  "producer_base_sha256": "09a77ce6a16a9a1ecd15cf05bd718296bfa9690365c5187931d37cded502a8a7",
+  "producer_patched_sha256": "214ed8b4b5d45906e992831e8b3878361abe7f70799dfb76fb3eac3e06622f7b",
+  "exact_tested_plugin": {
+    "path": "libggml-cpu-apple_m4.so",
+    "sha256": "b7d250081636fadbb6d008c94876e069966d7f949068011ce3fd28fd6757b0dd"
+  },
+  "exact_tested_library": {
+    "path": "libmtmd.0.0.8920.dylib",
+    "sha256": "8ca22f631de9d728463f66515aae7f589af3f73f2a1df9161905475b48bd2f45"
+  },
+  "execution": {
+    "path": "validation-only.json",
+    "sha256": "f24f1f68fd1f58fcf9003409922488a4dc49987278f84c0ac38e2195460c8b8c"
+  },
+  "F64_evidence": [
+    {
+      "path": "qwen38-gelu-component-v1/comparison.json",
+      "sha256": "09b2769c619ecaa107d4bcc208616fe502b9afbbe4374512392a438e651b6b39"
+    },
+    {
+      "path": "qwen38-down-component-v1/comparison.json",
+      "sha256": "85196951c84ff37fd5fa85c1a2a39988b7df20087ccaaa28614375fec8e7f676"
+    },
+    {
+      "path": "qwen38-w8a32-component-v1/comparison.json",
+      "sha256": "c1c18b8079cd78a43af0b72aee6a0c1f03f880c5e64e14d84bf8e721e1d5b7e4"
+    }
+  ],
+  "model_outcome": {
+    "path": "target-v1/execution.json",
+    "sha256": "36d9abda3ae7129987f29974aa7c9c2b76ae816e70694f8c1107577b49deac94"
+  },
+  "scope": "One Qwen3.8 Q8 CPU projector fixture only; no inference for other projectors. Stored F16/Q8 weights widen exactly, activation policy changes from default conversion to original F32. F32 GELU replaces lookup rounding. Old failures remain.",
+  "engine_change": "Only per-call bounded Q8-to-F32 widening; original vision operations preserved."
+}

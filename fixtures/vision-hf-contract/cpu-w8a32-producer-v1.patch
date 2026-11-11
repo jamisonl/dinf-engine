@@ -1,0 +1,31 @@
+--- a/vision_reference.cpp
++++ b/vision_reference.cpp
+@@ -47,6 +47,7 @@
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
++#include <cstdlib>
+ 
+ #ifndef VISION_ORACLE_VARIANT
+ #define VISION_ORACLE_VARIANT "upstream"
+@@ -201,7 +202,11 @@
+     const auto info = inspect(argv[1], argv[2]);
+     const auto image = fixture(argc == 8 ? fixture_size(argv[7]) : 64);
+     write_fixture(prefix, image);
+-    ggml_backend_load_all();
++    const char * cpu_plugin = std::getenv("DINF_VISION_CPU_REFERENCE_PLUGIN");
++    const char * cpu_policy = std::getenv("DINF_VISION_CPU_REFERENCE_POLICY");
++    require(backend == "cpu" && cpu_plugin && cpu_policy, "explicit CPU reference plugin/policy required");
++    require(std::string(cpu_policy) == "f32-gelu-w8a32", "known reference policy required");
++    require(ggml_backend_load(cpu_plugin) != nullptr, "explicit CPU plugin load failed");
+     clip_context_params params{backend == "metal", CLIP_FLASH_ATTN_TYPE_DISABLED, -1, -1, false, nullptr, nullptr};
+     const auto loaded = clip_init(argv[2], params);
+     const std::unique_ptr<clip_ctx, decltype(&clip_free)> vision(loaded.ctx_v, clip_free);
+@@ -219,6 +224,7 @@
+          << "{\n\"schema_version\":1,\"producer\":\"llama.cpp clip projector\",\"revision\":" << quote(revision)
+          << ",\"oracle_variant\":" << quote(variant)
+          << ",\"oracle_patch_sha256\":" << (patch.empty() ? "null" : quote(patch))
++         << ",\"cpu_reference_policy\":" << quote(cpu_policy) << ",\"cpu_reference_plugin\":" << quote(cpu_plugin)
+          << ",\"backend_requested\":" << quote(backend) << ",\"text_weights_loaded\":false,\"hash_verification\":\"caller_required_not_performed_by_producer\""
+          << ",\"unused_audio_encoder_loaded\":" << (audio ? "true" : "false")
+          << ",\"text_model_sha256\":" << quote(argv[3]) << ",\"projector_sha256\":" << quote(argv[4])

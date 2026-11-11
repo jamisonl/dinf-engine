@@ -1,0 +1,38 @@
+{
+  "scope": "BF16 denoiser attention on admitted Apple10/Metal4/macOS26.2+ tensors. No other backend, dtype or head-width claim.",
+  "upstream_revision": "d0f2af8b66b20da4baa50644c0cd3f887a2eae2e",
+  "sources": [
+    {
+      "repository_path": "aten/src/ATen/native/mps/kernels/PrefillAttention.h",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/d0f2af8b66b20da4baa50644c0cd3f887a2eae2e/aten/src/ATen/native/mps/kernels/PrefillAttention.h",
+      "sha256": "2aa9d742853715421cbbd977bc18aaa4f8a1e1995c7e919fe9c8fe7500abb637"
+    },
+    {
+      "repository_path": "aten/src/ATen/native/mps/kernels/MppAttention.h",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/d0f2af8b66b20da4baa50644c0cd3f887a2eae2e/aten/src/ATen/native/mps/kernels/MppAttention.h",
+      "sha256": "5ec66e344bfd8d6c7fa14a144671e1e93fbbedf63664a6c7abad71d4f9d54956"
+    },
+    {
+      "repository_path": "c10/metal/utils.h",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/d0f2af8b66b20da4baa50644c0cd3f887a2eae2e/c10/metal/utils.h",
+      "sha256": "22f6d2254045b143726226dd84e8d930903feb821d4b506d9673dbb9edce7e9d"
+    }
+  ],
+  "adaptations": [
+    "Retain PrefillAttnParams, mask params, Max/Sum/Mul/ExpSub operators; specialize accum type toF32 for the sole BF16 use.",
+    "Retain MPP tensor fragment/kernel body; remove unused Apple8 K fragment class. Only instantiate Apple10 BF16 D128/BQ64/BK32, one additive-mask and one unmasked entry.",
+    "Host constructs causal masks where admitted; arbitrary caller masks and other devices/dtypes/shapes fall back.",
+    "Retain Prefill pointer_element address-space trait required by typed BF16 stores; use Metal SDK METAL_FUNC macro.",
+    "Retain both PyTorch BSD and MLX MIT notices; shader header adds the combined SPDX expression and Apple copyright. No operation changed."
+  ],
+  "output_sha256": "ecd344226443f3086c51507410163d29dea26590d3d6532ff6667b5925c4056f",
+  "license_files": {
+    "PyTorch": "THIRD_PARTY_LICENSES/PYTORCH-BSD-3-CLAUSE.txt",
+    "MLX": "THIRD_PARTY_LICENSES/MLX-MIT.txt"
+  },
+  "mlx_license_source": {
+    "url": "https://raw.githubusercontent.com/ml-explore/mlx/02efb310cac667bc547d1b96f21596c221f84fe7/LICENSE",
+    "sha256": "ccfab7ccb2ea306f71531c8ca77bb55507606cd90768b1e32b8b52ab5b48cf01",
+    "note": "This pinned MIT notice matches the current MLX notice. It records the license text, not the revision of the later MPP kernel adapted by PyTorch."
+  }
+}

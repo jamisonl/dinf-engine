@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "policy": "ggml-cpu-f32-activations-v3",
+  "extends": "ggml-cpu-flash-f32-v2",
+  "source_revision": "15fa3c493bfcd040b5f4dcb29e1c998a0846de16",
+  "patches": [
+    {
+      "file": "ggml-cpu-softplus-v1.patch",
+      "sha256": "15aeadac5e8fe659390575f4a5fd3caaa1e6c7b829f67faf1bf927107cd76a5d",
+      "source_file": "src/ggml-impl.h",
+      "original_sha256": "2ed56e264202906d107e26d08eabb242d3107b026ebfb78096fa1e5f94bdbbb8",
+      "patched_sha256": "bd1e80d6d4071114fa868d51f270ebf159846775e75f8048e573efbcc22b7af8"
+    },
+    {
+      "file": "ggml-cpu-gelu-f32-v1.patch",
+      "sha256": "e0414d1da2f24395e9a407927cd6b845e7245ed02ee87d0e0aae66e5687e63bb",
+      "source_file": "src/ggml-cpu/vec.h",
+      "original_sha256": "ff40e8241c6f55d327500fffbead982a92c157dddbc9c9c330a7512d1b28832e",
+      "patched_sha256": "2ca0574060d2bde1044908b822afa3bd8b5050fede475c3fb5472b41d83c4d70"
+    }
+  ],
+  "scope": "CPU oracle only: log1pf preserves negative softplus precision; F32 tanh-GELU keeps F32 input/output rather than a half table. F16 GELU and Metal stay unchanged. Numeric gates stay unchanged."
+}

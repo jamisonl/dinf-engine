@@ -1,0 +1,30 @@
+CudaForge 0.1.6 — upstream license and source record
+
+Upstream project: https://github.com/guoqingbao/cudaforge
+Crate: https://crates.io/crates/cudaforge/0.1.6
+Upstream source revision: 903f226b64b737a23610df361ec6371aaebdfd0d
+Published crate SHA-256: 8d475ff95b9e4096878f47fe0ca5dbad0e23849a79fc225305ea06c2f25771cd
+
+Upstream Cargo.toml declares:
+  authors = ["Guoqing Bao"]
+  license = "MIT OR Apache-2.0"
+The upstream README repeats the same license expression.
+
+The exact upstream revision and published crate contain no separate license
+text, NOTICE file, or copyright notice. The author field above is attribution
+from package metadata, not an invented copyright notice or ownership claim.
+No copyright year or holder has been supplied by dinf for upstream CudaForge.
+
+LICENSE-APACHE is the unchanged standard Apache License 2.0 text from
+https://www.apache.org/licenses/LICENSE-2.0.txt, included for the Apache option
+named by upstream. It is not a file recovered from the CudaForge repository.
+No MIT copyright line has been added. This record does not set the
+dinf-engine project license or change upstream's license expression.
+
+This directory contains a modified copy of CudaForge 0.1.6. Compared with the
+pinned upstream revision, dinf changes README.md, src/builder.rs,
+src/compute_cap.rs and src/lib.rs, and adds DINF_PATCH.md, NOTICE,
+LICENSE-APACHE and SOURCE.json. DINF_PATCH.md describes reproducible
+multi-architecture static CUDA builds, architecture-aware cache keys and a PTX
+fallback. Keep that patch note and the upstream attribution with this source.
+SOURCE.json records the upstream and local file hashes reviewed for this notice.

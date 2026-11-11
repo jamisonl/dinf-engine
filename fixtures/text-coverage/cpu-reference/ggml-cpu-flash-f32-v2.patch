@@ -1,0 +1,70 @@
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8165,6 +8165,16 @@
+     }
+ }
+ 
++// Keep the existing half-rounded Q/K inputs, but honor requested F32 dot accumulation.
++static float ggml_flash_attn_ext_dot_f16_f32(
++        int64_t n, const ggml_fp16_t * x, const ggml_fp16_t * y) {
++    float sum = 0.0f;
++    for (int64_t i = 0; i < n; ++i) {
++        sum += GGML_CPU_FP16_TO_FP32(x[i]) * GGML_CPU_FP16_TO_FP32(y[i]);
++    }
++    return sum;
++}
++
+ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+         const ggml_compute_params * params,
+         ggml_tensor * dst,
+@@ -8178,6 +8188,10 @@
+     const ggml_tensor * v     = dst->src[2];
+     const ggml_tensor * mask  = dst->src[3];
+     const ggml_tensor * sinks = dst->src[4];
++
++    // Honor requested F32 sums while preserving the stored half inputs.
++    const bool use_f16_accumulator = v->type == GGML_TYPE_F16 && dst->op_params[3] != GGML_PREC_F32;
++    const bool use_f32_kq_dot = k->type == GGML_TYPE_F16 && dst->op_params[3] == GGML_PREC_F32;
+ 
+     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+@@ -8266,7 +8280,7 @@
+         ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV); // (temporary) FP16 VKQ accumulator
+         ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV); // (temporary) buffer for Q converted to quantized/FP16
+ 
+-        if (v->type == GGML_TYPE_F16) {
++        if (use_f16_accumulator) {
+             memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
+         } else {
+             memset(VKQ32, 0, DV*sizeof(float));
+@@ -8298,7 +8312,11 @@
+             float s; // KQ value
+ 
+             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+-            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
++            if (use_f32_kq_dot) {
++                s = ggml_flash_attn_ext_dot_f16_f32(DK, (const ggml_fp16_t *) k_data, Q_q);
++            } else {
++                kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
++            }
+ 
+             s = s*scale; // scale KQ value
+ 
+@@ -8315,7 +8333,7 @@
+ 
+             const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+ 
+-            if (v->type == GGML_TYPE_F16) {
++            if (use_f16_accumulator) {
+                 if (s > M) {
+                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
+                     M = s;
+@@ -8356,7 +8374,7 @@
+             S = S*ms + vs; // scale and increment sum with partial sum
+         }
+ 
+-        if (v->type == GGML_TYPE_F16) {
++        if (use_f16_accumulator) {
+             for (int64_t d = 0; d < DV; ++d) {
+                 VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
+             }

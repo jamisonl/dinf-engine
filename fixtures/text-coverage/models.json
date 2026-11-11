@@ -1,0 +1,607 @@
+{
+  "schema_version": 1,
+  "scope": "Exact same-checkpoint artifacts for FULL (actual BF16/F32), Q8_0 and Q4_K_M coverage on CPU and Metal. Weights remain separate downloads. The Coder FULL file requires the recorded metadata-only preparation.",
+  "tiers": [
+    "FULL",
+    "Q8_0",
+    "Q4_K_M"
+  ],
+  "common_total_context_tokens": 4096,
+  "provenance_limit": "Published same-checkpoint provenance and exact within-pair metadata/layout agreement support this selection. Headers do not prove historical source weights or independently reproduce conversion. No complete source-snapshot hash, converter invocation, and calibration hash chain is published for all six. Q8_0 is a higher-precision quantized comparison, not unquantized ground truth; publisher qualitative quality labels are not fixed-corpus validation.",
+  "models": [
+    {
+      "id": "qwen25-coder-1.5b",
+      "checkpoint": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+      "architecture": "qwen2",
+      "declared_context_tokens": 32768,
+      "publisher_card": "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/blob/f86cb2c1fa58255f8052cc32aeede1b7482d4361/README.md",
+      "publisher_card_sha256": "561e43593961e498b2fdafaedd614d3123b4b3e038fef8e9cfa80f73a451c7c0",
+      "conversion_notes": "Qwen publisher; exact llama.cpp converter commit not disclosed",
+      "pair_checks": {
+        "metadata_key_count": 26,
+        "differing_keys": [
+          "general.file_type"
+        ],
+        "tokenizer_typed_values_sha256": "77794fc86456a99bba8d91f5ad6d78806994e6b388f7427a8a4a279a2a1b48a8",
+        "tensor_count": 339,
+        "ordered_tensor_names_and_shapes_sha256": "663ee59178933d967556a7b5ef95954701b3c8773439b8e63ddc94ffca333e0e"
+      },
+      "artifacts": [
+        {
+          "id": "qwen25-coder-1.5b-full",
+          "tier": "FULL",
+          "quantization": "BF16",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "Qwen2.5-Coder-1.5B-Instruct.BF16.gguf",
+              "size_bytes": 3093669376,
+              "sha256": "25edee9adb3b7d8a521a54a903c6773fafdcc6b225aa852a551b74b49ef30e91",
+              "repo": "legraphista/Qwen2.5-Coder-1.5B-Instruct-IMat-GGUF",
+              "revision": "3df48e5fa4436cf4dedf8bced506dda183e43ba1"
+            }
+          ],
+          "published_card": "https://huggingface.co/legraphista/Qwen2.5-Coder-1.5B-Instruct-IMat-GGUF/blob/3df48e5fa4436cf4dedf8bced506dda183e43ba1/README.md",
+          "source_precision_note": "The published GGUF stores BF16 weight tensors and F32 tensors. We retain those values and do not create this artifact by upcasting quantized weights. The publisher's full conversion history, including any intermediate formats, is not independently proved.",
+          "requires_preparation": true,
+          "metadata_differences_from_q4": [
+            "general.base_model.0.name",
+            "general.base_model.0.organization",
+            "general.base_model.0.repo_url",
+            "general.base_model.count",
+            "general.file_type",
+            "general.finetune",
+            "general.languages",
+            "general.license",
+            "general.license.link",
+            "general.name",
+            "general.tags",
+            "tokenizer.chat_template"
+          ],
+          "tensor_dtype_counts": {
+            "30": 197,
+            "0": 141
+          },
+          "logical_tensor_aliases": {
+            "output.weight": "token_embd.weight"
+          },
+          "preparation": {
+            "helper": "prepare_bf16.py",
+            "operation": "replace_chat_template_only",
+            "reference_artifact": "qwen25-coder-1.5b-q4_k_m",
+            "config": {
+              "repo": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+              "revision": "2e1fd397ee46e1388853d2af2c993145b0f1098a",
+              "filename": "config.json",
+              "sha256": "88f9a17863c05fb313515d2ff74b1098e0c35579f99068e32beda00618508ae0"
+            },
+            "expected_output": {
+              "filename": "Qwen2.5-Coder-1.5B-Instruct.BF16.template-aligned.gguf",
+              "size_bytes": 3093669440,
+              "sha256": "ecf32bc918cabeb4a1e37c3e8eee949a93ed4e93924e3d751c2d0cf37d414f3a"
+            },
+            "source_and_output_tensor_payload_sha256": "8e8040aff25b4f63518575a688cd80860ba65d8236a33c6d7d379c32c8ddce74",
+            "tensor_payload_bytes": 3087718400,
+            "physical_output_tensor_added": false
+          },
+          "functional_metadata_matches_quant_pair": true,
+          "physical_tensor_count": 338
+        },
+        {
+          "id": "qwen25-coder-1.5b-q4_k_m",
+          "quantization": "Q4_K_M",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+              "size_bytes": 1117320768,
+              "sha256": "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046",
+              "repo": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
+              "revision": "f86cb2c1fa58255f8052cc32aeede1b7482d4361"
+            }
+          ],
+          "header_sha256": "91f66a7c03ae9f565690a2cea285ea32ba4f03c6ebfac9249ec4b6070acbe4c4",
+          "tensor_dtype_counts": {
+            "14": 29,
+            "12": 169,
+            "0": 141
+          },
+          "tier": "Q4_K_M"
+        },
+        {
+          "id": "qwen25-coder-1.5b-q8_0",
+          "quantization": "Q8_0",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "qwen2.5-coder-1.5b-instruct-q8_0.gguf",
+              "size_bytes": 1894532160,
+              "sha256": "507de59046601282ba768a9789900e6ccf60ed93ddf346730b7c68eb0715bc47",
+              "repo": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
+              "revision": "f86cb2c1fa58255f8052cc32aeede1b7482d4361"
+            }
+          ],
+          "header_sha256": "d45d2250d93304ead0d3b3f70d7968e0e893fa1e1397a997b21b6b03b0bcf165",
+          "tensor_dtype_counts": {
+            "8": 198,
+            "0": 141
+          },
+          "tier": "Q8_0"
+        }
+      ]
+    },
+    {
+      "id": "mistral-7b-v03",
+      "checkpoint": "mistralai/Mistral-7B-Instruct-v0.3",
+      "architecture": "llama",
+      "declared_context_tokens": 32768,
+      "publisher_card": "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/blob/61fd4167fff3ab01ee1cfe0da183fa27a944db48/README.md",
+      "publisher_card_sha256": "0644c4030c8388f3e5e1db036c8a94814376a4e182fd1e0bbb6d9d8bbd05c98b",
+      "conversion_notes": "Bartowski; llama.cpp b2965; imatrix dataset link disclosed",
+      "pair_checks": {
+        "metadata_key_count": 29,
+        "differing_keys": [
+          "general.file_type"
+        ],
+        "tokenizer_typed_values_sha256": "5ab54b91ed7bab709313292f205caab3460ea9df0e43a594f0e344417931c08f",
+        "tensor_count": 291,
+        "ordered_tensor_names_and_shapes_sha256": "243f3f6c0dd5dad4ca0141158439ab438610ccf600f09bf5f30eba7318d018d7"
+      },
+      "artifacts": [
+        {
+          "id": "mistral-7b-v03-full",
+          "tier": "FULL",
+          "quantization": "BF16",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "Mistral-7B-Instruct-v0.3.BF16.gguf",
+              "size_bytes": 14497337280,
+              "sha256": "f0dc625a6ea4e05e4f5190f9acd0d139d04a638c39eeeee10c5d96c57f880248",
+              "repo": "legraphista/Mistral-7B-Instruct-v0.3-IMat-GGUF",
+              "revision": "08733f8986e2c0ccfebd2abdfd3deb09e3fb7673"
+            }
+          ],
+          "published_card": "https://huggingface.co/legraphista/Mistral-7B-Instruct-v0.3-IMat-GGUF/blob/08733f8986e2c0ccfebd2abdfd3deb09e3fb7673/README.md",
+          "source_precision_note": "The published GGUF stores BF16 weight tensors and F32 tensors. We retain those values and do not create this artifact by upcasting quantized weights. The publisher's full conversion history, including any intermediate formats, is not independently proved.",
+          "requires_preparation": false,
+          "metadata_differences_from_q4": [
+            "general.file_type",
+            "quantize.imatrix.chunks_count",
+            "quantize.imatrix.dataset",
+            "quantize.imatrix.entries_count",
+            "quantize.imatrix.file"
+          ],
+          "tensor_dtype_counts": {
+            "30": 226,
+            "0": 65
+          },
+          "functional_metadata_matches_quant_pair": true,
+          "physical_tensor_count": 291
+        },
+        {
+          "id": "mistral-7b-v03-q4_k_m",
+          "quantization": "Q4_K_M",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
+              "size_bytes": 4372812000,
+              "sha256": "1270d22c0fbb3d092fb725d4d96c457b7b687a5f5a715abe1e818da303e562b6",
+              "repo": "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+              "revision": "61fd4167fff3ab01ee1cfe0da183fa27a944db48"
+            }
+          ],
+          "header_sha256": "2894fefa89355cb36fde9a58e9bfcad284e2743f587d5d3d9d331146413973bf",
+          "tensor_dtype_counts": {
+            "12": 193,
+            "0": 65,
+            "14": 33
+          },
+          "tier": "Q4_K_M"
+        },
+        {
+          "id": "mistral-7b-v03-q8_0",
+          "quantization": "Q8_0",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "Mistral-7B-Instruct-v0.3-Q8_0.gguf",
+              "size_bytes": 7702565088,
+              "sha256": "404857e776114baada71a08ebd3bba79d721ec7fca99705e7e7b892ae8bc583f",
+              "repo": "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+              "revision": "61fd4167fff3ab01ee1cfe0da183fa27a944db48"
+            }
+          ],
+          "header_sha256": "3e2223d4da18aa05e06a58621b0aaa24ce9b617219eed885bd2285157e19abd8",
+          "tensor_dtype_counts": {
+            "8": 226,
+            "0": 65
+          },
+          "tier": "Q8_0"
+        }
+      ]
+    },
+    {
+      "id": "phi3-mini-4k",
+      "checkpoint": "microsoft/Phi-3-mini-4k-instruct",
+      "architecture": "phi3",
+      "declared_context_tokens": 4096,
+      "publisher_card": "https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/blob/e1447f6da0be91f91683c5d19f938d4f51122d88/README.md",
+      "publisher_card_sha256": "460a5f289160336250fc015d5aab253492edcb6c0eb8f82ed99a7a016ba846db",
+      "conversion_notes": "Bartowski; llama.cpp ffe666572f98a686b17a2cd1dbf4c0a982e5ac0a; Kalomaze imatrix dataset link disclosed",
+      "pair_checks": {
+        "metadata_key_count": 28,
+        "differing_keys": [
+          "general.file_type"
+        ],
+        "tokenizer_typed_values_sha256": "f09a17eaff912bfc070f4dda3aa4f89bad1d47b37e5cb0ec66032fa0d7f7fbce",
+        "tensor_count": 195,
+        "ordered_tensor_names_and_shapes_sha256": "c21d1ca7b7567331e97aa0e971ea424521d388578e52970d05b5ab14f9929fb8"
+      },
+      "artifacts": [
+        {
+          "id": "phi3-mini-4k-full",
+          "tier": "FULL",
+          "quantization": "F32",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "Phi-3-mini-4k-instruct-fp32.gguf",
+              "size_bytes": 15285055680,
+              "sha256": "6a09f093145febeecda12640d472e8c89094371cd0efbe8386de0fdf5f2dcb04",
+              "repo": "bartowski/Phi-3-mini-4k-instruct-GGUF",
+              "revision": "e1447f6da0be91f91683c5d19f938d4f51122d88"
+            }
+          ],
+          "published_card": "https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/blob/e1447f6da0be91f91683c5d19f938d4f51122d88/README.md",
+          "source_precision_note": "The published GGUF stores F32 tensors for the selected April checkpoint. We use those values directly, without casting them to BF16 or creating this artifact by upcasting quantized weights. The publisher's full conversion history, including any intermediate formats, is not independently proved.",
+          "requires_preparation": false,
+          "metadata_differences_from_q4": [
+            "general.file_type",
+            "general.quantization_version",
+            "quantize.imatrix.chunks_count",
+            "quantize.imatrix.dataset",
+            "quantize.imatrix.entries_count",
+            "quantize.imatrix.file"
+          ],
+          "tensor_dtype_counts": {
+            "0": 195
+          },
+          "functional_metadata_matches_quant_pair": true,
+          "physical_tensor_count": 195
+        },
+        {
+          "id": "phi3-mini-4k-q4_k_m",
+          "quantization": "Q4_K_M",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "Phi-3-mini-4k-instruct-Q4_K_M.gguf",
+              "size_bytes": 2393231360,
+              "sha256": "28a89b4ddb5766355f24e362ae4078b4c35b9ca9568df5fc9e6d9aeee4dee834",
+              "repo": "bartowski/Phi-3-mini-4k-instruct-GGUF",
+              "revision": "e1447f6da0be91f91683c5d19f938d4f51122d88"
+            }
+          ],
+          "header_sha256": "465893a4ac2f834849a06fed69bc73eedc7231c5106c8c9be87db18c55780d51",
+          "tensor_dtype_counts": {
+            "12": 81,
+            "0": 65,
+            "14": 17,
+            "13": 32
+          },
+          "tier": "Q4_K_M"
+        },
+        {
+          "id": "phi3-mini-4k-q8_0",
+          "quantization": "Q8_0",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "Phi-3-mini-4k-instruct-Q8_0.gguf",
+              "size_bytes": 4061221376,
+              "sha256": "0ac8ee48aeebf7d1b354691fd1e29e91c32ad88bbad10ad45ac880dcd4372a47",
+              "repo": "bartowski/Phi-3-mini-4k-instruct-GGUF",
+              "revision": "e1447f6da0be91f91683c5d19f938d4f51122d88"
+            }
+          ],
+          "header_sha256": "c8b3b484cc34ed58fb08bbdaecd8111cb48a4a6ee929ab472261c4e05daf5a6d",
+          "tensor_dtype_counts": {
+            "8": 130,
+            "0": 65
+          },
+          "tier": "Q8_0"
+        }
+      ]
+    },
+    {
+      "id": "qwen35-4b",
+      "checkpoint": "Qwen/Qwen3.5-4B",
+      "architecture": "qwen35",
+      "declared_context_tokens": 262144,
+      "publisher_card": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/blob/e87f176479d0855a907a41277aca2f8ee7a09523/README.md",
+      "publisher_card_sha256": "28546f5fc4f22ee1b3f17b908957f17fcfa66174032136265bdb27f404bc1e6c",
+      "conversion_notes": "Unsloth; exact converter commit and per-file calibration record not disclosed",
+      "pair_checks": {
+        "metadata_key_count": 46,
+        "differing_keys": [
+          "general.file_type"
+        ],
+        "tokenizer_typed_values_sha256": "de52c444b498639f223b2644bf2b7fbdc7c8b2d94dde00754e6444ad69ca6619",
+        "tensor_count": 426,
+        "ordered_tensor_names_and_shapes_sha256": "e438876594c32c24db9a091363a3e995e41156087cc0a9aef86f7f768d055445"
+      },
+      "artifacts": [
+        {
+          "id": "qwen35-4b-full",
+          "tier": "FULL",
+          "quantization": "BF16",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "Qwen3.5-4B-BF16.gguf",
+              "size_bytes": 8424393632,
+              "sha256": "9e6e2841a75f503ccb330831832fd7861266e187e0dbf149a954219ccb8c197a",
+              "repo": "unsloth/Qwen3.5-4B-GGUF",
+              "revision": "e87f176479d0855a907a41277aca2f8ee7a09523"
+            }
+          ],
+          "published_card": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/blob/e87f176479d0855a907a41277aca2f8ee7a09523/README.md",
+          "source_precision_note": "The published GGUF stores BF16 weight tensors and F32 tensors. We retain those values and do not create this artifact by upcasting quantized weights. The publisher's full conversion history, including any intermediate formats, is not independently proved.",
+          "requires_preparation": false,
+          "metadata_differences_from_q4": [
+            "general.file_type",
+            "quantize.imatrix.chunks_count",
+            "quantize.imatrix.dataset",
+            "quantize.imatrix.entries_count",
+            "quantize.imatrix.file"
+          ],
+          "tensor_dtype_counts": {
+            "30": 249,
+            "0": 177
+          },
+          "functional_metadata_matches_quant_pair": true,
+          "physical_tensor_count": 426
+        },
+        {
+          "id": "qwen35-4b-q4_k_m",
+          "quantization": "Q4_K_M",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "Qwen3.5-4B-Q4_K_M.gguf",
+              "size_bytes": 2740937888,
+              "sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+              "repo": "unsloth/Qwen3.5-4B-GGUF",
+              "revision": "e87f176479d0855a907a41277aca2f8ee7a09523"
+            }
+          ],
+          "header_sha256": "43c907d3f4a31bae9456b9d265c2e89120bb28596c56c03c69ff2852e3260cc8",
+          "tensor_dtype_counts": {
+            "0": 177,
+            "14": 22,
+            "12": 131,
+            "13": 48,
+            "8": 48
+          },
+          "tier": "Q4_K_M"
+        },
+        {
+          "id": "qwen35-4b-q8_0",
+          "quantization": "Q8_0",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "Qwen3.5-4B-Q8_0.gguf",
+              "size_bytes": 4482403488,
+              "sha256": "10cc391b403021dd11c614679d2fd92f611c3681d29e29651b717316965d61e1",
+              "repo": "unsloth/Qwen3.5-4B-GGUF",
+              "revision": "e87f176479d0855a907a41277aca2f8ee7a09523"
+            }
+          ],
+          "header_sha256": "fcc26eda911ec2f9f79b2fc399fab01d926b41b41498cebf1aa600a00aab5ba5",
+          "tensor_dtype_counts": {
+            "0": 177,
+            "8": 249
+          },
+          "tier": "Q8_0"
+        }
+      ]
+    },
+    {
+      "id": "qwen3-moe-30b-a3b",
+      "checkpoint": "Qwen/Qwen3-30B-A3B",
+      "architecture": "qwen3moe",
+      "declared_context_tokens": 32768,
+      "publisher_card": "https://huggingface.co/bartowski/Qwen_Qwen3-30B-A3B-GGUF/blob/46f17e079cba70b04390bef39b57d2783e9fd015/README.md",
+      "publisher_card_sha256": "0982c59e8388aa9fd5fe26006ca9eab35a07cc2907a6a5a05d6b71ae79770a8c",
+      "conversion_notes": "Bartowski; llama.cpp b5200; imatrix dataset link plus undisclosed extra synthetic data; BF16 files published",
+      "pair_checks": {
+        "metadata_key_count": 41,
+        "differing_keys": [
+          "general.file_type"
+        ],
+        "tokenizer_typed_values_sha256": "f3b931e206a2c89269cc88b3249af5dad6f9d44bff62997ec75efe4d8091fada",
+        "tensor_count": 579,
+        "ordered_tensor_names_and_shapes_sha256": "7958a1c44573028a9e82aa822019178828c5718777fdf21445880294683b4e01"
+      },
+      "artifacts": [
+        {
+          "id": "qwen3-moe-30b-a3b-full",
+          "tier": "FULL",
+          "quantization": "BF16",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "Qwen_Qwen3-30B-A3B-bf16/Qwen_Qwen3-30B-A3B-bf16-00001-of-00002.gguf",
+              "size_bytes": 39719749984,
+              "sha256": "21e6278c5e1c828558e9236cd22029d27695c143d9982c0a8d7db2819bf8b529",
+              "repo": "bartowski/Qwen_Qwen3-30B-A3B-GGUF",
+              "revision": "46f17e079cba70b04390bef39b57d2783e9fd015"
+            },
+            {
+              "filename": "Qwen_Qwen3-30B-A3B-bf16/Qwen_Qwen3-30B-A3B-bf16-00002-of-00002.gguf",
+              "size_bytes": 21376053504,
+              "sha256": "c7b54e256621f592599de9a3665bbb469dec1a61ac5467f0944fd3cd56ff4916",
+              "repo": "bartowski/Qwen_Qwen3-30B-A3B-GGUF",
+              "revision": "46f17e079cba70b04390bef39b57d2783e9fd015"
+            }
+          ],
+          "published_card": "https://huggingface.co/bartowski/Qwen_Qwen3-30B-A3B-GGUF/blob/46f17e079cba70b04390bef39b57d2783e9fd015/README.md",
+          "source_precision_note": "The published GGUF stores BF16 weight tensors and F32 tensors. We retain those values and do not create this artifact by upcasting quantized weights. The publisher's full conversion history, including any intermediate formats, is not independently proved.",
+          "requires_preparation": false,
+          "metadata_differences_from_q4": [
+            "general.file_type",
+            "quantize.imatrix.chunks_count",
+            "quantize.imatrix.dataset",
+            "quantize.imatrix.entries_count",
+            "quantize.imatrix.file",
+            "split.count",
+            "split.no",
+            "split.tensors.count"
+          ],
+          "tensor_dtype_counts": {
+            "30": 338,
+            "0": 241
+          },
+          "functional_metadata_matches_quant_pair": true,
+          "physical_tensor_count": 579
+        },
+        {
+          "id": "qwen3-moe-30b-a3b-q4_k_m",
+          "quantization": "Q4_K_M",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "Qwen_Qwen3-30B-A3B-Q4_K_M.gguf",
+              "size_bytes": 18632184480,
+              "sha256": "a015794bfb1d69cb03dbb86b185fb2b9b339f757df5f8f9dd9ebdab8f6ed5d32",
+              "repo": "bartowski/Qwen_Qwen3-30B-A3B-GGUF",
+              "revision": "46f17e079cba70b04390bef39b57d2783e9fd015"
+            }
+          ],
+          "header_sha256": "72f532f6def37dc26eeedddaab3d3bfe546ae37f05f95e56725a76b5c24c68f0",
+          "tensor_dtype_counts": {
+            "14": 49,
+            "0": 241,
+            "12": 193,
+            "8": 48,
+            "13": 48
+          },
+          "tier": "Q4_K_M"
+        },
+        {
+          "id": "qwen3-moe-30b-a3b-q8_0",
+          "quantization": "Q8_0",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "Qwen_Qwen3-30B-A3B-Q8_0.gguf",
+              "size_bytes": 32483932832,
+              "sha256": "da6389ca8b6bd9e15565b6137dc2c3aacd624cc35208c0b8b5ffbfa80493e967",
+              "repo": "bartowski/Qwen_Qwen3-30B-A3B-GGUF",
+              "revision": "46f17e079cba70b04390bef39b57d2783e9fd015"
+            }
+          ],
+          "header_sha256": "63dc58de8522b8b32c9bf16d97ffbb3bf4945fb53c327d6749a7eaa012b43e86",
+          "tensor_dtype_counts": {
+            "8": 338,
+            "0": 241
+          },
+          "tier": "Q8_0"
+        }
+      ]
+    },
+    {
+      "id": "deepseek-v2-lite-chat",
+      "checkpoint": "deepseek-ai/DeepSeek-V2-Lite-Chat",
+      "architecture": "deepseek2",
+      "declared_context_tokens": 163840,
+      "publisher_card": "https://huggingface.co/second-state/DeepSeek-V2-Lite-Chat-GGUF/blob/fbba16c9ee1ba016b0ab083938acb7be061f970f/README.md",
+      "publisher_card_sha256": "685d8dc6ceb2fbd61dc6716760eb39e16a5d2302c0eacf214f397051a0afbb6d",
+      "conversion_notes": "Second State; llama.cpp b3333; per-file calibration record not disclosed",
+      "pair_checks": {
+        "metadata_key_count": 38,
+        "differing_keys": [
+          "general.file_type"
+        ],
+        "tokenizer_typed_values_sha256": "1308d2742a3e288c162a691aaf4d5ababfbf3c97c6cfef3d54daa08f5adcd17d",
+        "tensor_count": 377,
+        "ordered_tensor_names_and_shapes_sha256": "49780ea7be336bb7a7a2353ce425dafb3c6d09eb11a0774acf1399bec6afcf0b"
+      },
+      "artifacts": [
+        {
+          "id": "deepseek-v2-lite-chat-full",
+          "tier": "FULL",
+          "quantization": "BF16",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "DeepSeek-V2-Lite-Chat.BF16.gguf",
+              "size_bytes": 31424033088,
+              "sha256": "00696aa8b0e1755d1bb2e07fc12f9bc0b6f499c17cc79704819c02e951a10f7e",
+              "repo": "legraphista/DeepSeek-V2-Lite-Chat-IMat-GGUF",
+              "revision": "b6350f4c672640e949652ae480226b25deb88091"
+            }
+          ],
+          "published_card": "https://huggingface.co/legraphista/DeepSeek-V2-Lite-Chat-IMat-GGUF/blob/b6350f4c672640e949652ae480226b25deb88091/README.md",
+          "source_precision_note": "The published GGUF stores BF16 weight tensors and F32 tensors. We retain those values and do not create this artifact by upcasting quantized weights. The publisher's full conversion history, including any intermediate formats, is not independently proved.",
+          "requires_preparation": false,
+          "metadata_differences_from_q4": [
+            "general.file_type"
+          ],
+          "tensor_dtype_counts": {
+            "30": 269,
+            "0": 108
+          },
+          "functional_metadata_matches_quant_pair": true,
+          "physical_tensor_count": 377
+        },
+        {
+          "id": "deepseek-v2-lite-chat-q4_k_m",
+          "quantization": "Q4_K_M",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "DeepSeek-V2-Lite-Chat-Q4_K_M.gguf",
+              "size_bytes": 10364416320,
+              "sha256": "30b4fb4ab1fbe1c6a827303ea898296c9faf8f54d6cdf8b9fbdda7a7ebfb292a",
+              "repo": "second-state/DeepSeek-V2-Lite-Chat-GGUF",
+              "revision": "fbba16c9ee1ba016b0ab083938acb7be061f970f"
+            }
+          ],
+          "header_sha256": "848c148efa1df0ff25c8d2b88752d74584acc0dbe5be8238d43c63a8b9e6d7b5",
+          "tensor_dtype_counts": {
+            "14": 13,
+            "12": 229,
+            "0": 108,
+            "8": 13,
+            "6": 14
+          },
+          "tier": "Q4_K_M"
+        },
+        {
+          "id": "deepseek-v2-lite-chat-q8_0",
+          "quantization": "Q8_0",
+          "format": "gguf",
+          "files": [
+            {
+              "filename": "DeepSeek-V2-Lite-Chat-Q8_0.gguf",
+              "size_bytes": 16702517568,
+              "sha256": "458d8dbb5c64109623751f3c7e691f285770a6521bf06bf86172980b995b3bde",
+              "repo": "second-state/DeepSeek-V2-Lite-Chat-GGUF",
+              "revision": "fbba16c9ee1ba016b0ab083938acb7be061f970f"
+            }
+          ],
+          "header_sha256": "59475cfb63b08805c3f156633724e895c9d7116019658ece6b227a191958b723",
+          "tensor_dtype_counts": {
+            "8": 269,
+            "0": 108
+          },
+          "tier": "Q8_0"
+        }
+      ]
+    }
+  ]
+}

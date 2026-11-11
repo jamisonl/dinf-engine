@@ -1,0 +1,152 @@
+{
+  "schema_version": 1,
+  "component": "cudaforge",
+  "version": "0.1.6",
+  "upstream_repository": "https://github.com/guoqingbao/cudaforge",
+  "upstream_revision": "903f226b64b737a23610df361ec6371aaebdfd0d",
+  "upstream_revision_source": ".cargo_vcs_info.json in the verified published crate",
+  "published_crate_sha256": "8d475ff95b9e4096878f47fe0ca5dbad0e23849a79fc225305ea06c2f25771cd",
+  "declared_license": "MIT OR Apache-2.0",
+  "author_metadata": [
+    "Guoqing Bao"
+  ],
+  "upstream_license_text_found": false,
+  "upstream_copyright_notice_found": false,
+  "no_copyright_holder_or_year_invented": true,
+  "standard_apache_text": {
+    "url": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+    "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "size_bytes": 11358,
+    "origin": "Apache Software Foundation standard license text; not an upstream CudaForge file"
+  },
+  "primary_evidence_urls": {
+    "manifest": "https://raw.githubusercontent.com/guoqingbao/cudaforge/903f226b64b737a23610df361ec6371aaebdfd0d/Cargo.toml",
+    "readme": "https://raw.githubusercontent.com/guoqingbao/cudaforge/903f226b64b737a23610df361ec6371aaebdfd0d/README.md",
+    "tree": "https://api.github.com/repos/guoqingbao/cudaforge/git/trees/903f226b64b737a23610df361ec6371aaebdfd0d?recursive=1",
+    "crate_version": "https://crates.io/api/v1/crates/cudaforge/0.1.6"
+  },
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "upstream_sha256": "91fc0f512d3354cf0ade7b6b14a2aa9c1ed25e5fbc324adf02ba99500d584bfe",
+      "crate_present": true,
+      "crate_sha256": "91fc0f512d3354cf0ade7b6b14a2aa9c1ed25e5fbc324adf02ba99500d584bfe",
+      "crate_equal": true,
+      "vendor_present": true,
+      "vendor_sha256": "91fc0f512d3354cf0ade7b6b14a2aa9c1ed25e5fbc324adf02ba99500d584bfe",
+      "vendor_equal": true
+    },
+    {
+      "path": "README.md",
+      "upstream_sha256": "fe7b5cee09f457e500a83359b31bf18502069f1d5ca4cf4722949991e95dd425",
+      "crate_present": true,
+      "crate_sha256": "fe7b5cee09f457e500a83359b31bf18502069f1d5ca4cf4722949991e95dd425",
+      "crate_equal": true,
+      "vendor_present": true,
+      "vendor_sha256": "1a85cfd947a392ffa953aee1a4de27eccca8626ba0a280df5c50632ca057052b",
+      "vendor_equal": false
+    },
+    {
+      "path": ".gitignore",
+      "upstream_sha256": "2ebe6cb6f5289849dce5a8a6cdd77e06b1385302c862982f8e181c4782d19214",
+      "crate_present": true,
+      "crate_sha256": "2ebe6cb6f5289849dce5a8a6cdd77e06b1385302c862982f8e181c4782d19214",
+      "crate_equal": true,
+      "vendor_present": false,
+      "vendor_sha256": null,
+      "vendor_equal": false
+    },
+    {
+      "path": "src/compute_cap.rs",
+      "upstream_sha256": "4623b6dc8925599569d4c8a480896d7259945238b6db02ac4e50ffbf4b79d92a",
+      "crate_present": true,
+      "crate_sha256": "4623b6dc8925599569d4c8a480896d7259945238b6db02ac4e50ffbf4b79d92a",
+      "crate_equal": true,
+      "vendor_present": true,
+      "vendor_sha256": "92f1f16f2d9ddff054435ffe1c8b0b9e0ff54a02c6f53d7c647316458bb30831",
+      "vendor_equal": false
+    },
+    {
+      "path": "src/error.rs",
+      "upstream_sha256": "8afd5edd5cb87ab11f4ed3d39153957a004d730918be3be12002558921612f18",
+      "crate_present": true,
+      "crate_sha256": "8afd5edd5cb87ab11f4ed3d39153957a004d730918be3be12002558921612f18",
+      "crate_equal": true,
+      "vendor_present": true,
+      "vendor_sha256": "8afd5edd5cb87ab11f4ed3d39153957a004d730918be3be12002558921612f18",
+      "vendor_equal": true
+    },
+    {
+      "path": "src/toolkit.rs",
+      "upstream_sha256": "b73aa8a810f736b63ba42b4f2754c81bf6b2055cb1e498dddf63563a08ec636c",
+      "crate_present": true,
+      "crate_sha256": "b73aa8a810f736b63ba42b4f2754c81bf6b2055cb1e498dddf63563a08ec636c",
+      "crate_equal": true,
+      "vendor_present": true,
+      "vendor_sha256": "b73aa8a810f736b63ba42b4f2754c81bf6b2055cb1e498dddf63563a08ec636c",
+      "vendor_equal": true
+    },
+    {
+      "path": "src/lib.rs",
+      "upstream_sha256": "3dd748e501bbe18a1f63679b56e923d136bf5680d46c0cb8e1680cbd7103e477",
+      "crate_present": true,
+      "crate_sha256": "3dd748e501bbe18a1f63679b56e923d136bf5680d46c0cb8e1680cbd7103e477",
+      "crate_equal": true,
+      "vendor_present": true,
+      "vendor_sha256": "02be038e0b1ae7c924a38f52264f583bf1abf7c1af3d472d194d4d47de8a31f3",
+      "vendor_equal": false
+    },
+    {
+      "path": "src/source.rs",
+      "upstream_sha256": "e3255406611e25cbbb224666ed956ec84fd80a29e6a9c2c5d427cb5b06b97a70",
+      "crate_present": true,
+      "crate_sha256": "e3255406611e25cbbb224666ed956ec84fd80a29e6a9c2c5d427cb5b06b97a70",
+      "crate_equal": true,
+      "vendor_present": true,
+      "vendor_sha256": "e3255406611e25cbbb224666ed956ec84fd80a29e6a9c2c5d427cb5b06b97a70",
+      "vendor_equal": true
+    },
+    {
+      "path": "src/parallel.rs",
+      "upstream_sha256": "0e8dc68fb4883436c75cbdceb30c94589ce4ebfd7cafb1eae2149d1eec2ad2c5",
+      "crate_present": true,
+      "crate_sha256": "0e8dc68fb4883436c75cbdceb30c94589ce4ebfd7cafb1eae2149d1eec2ad2c5",
+      "crate_equal": true,
+      "vendor_present": true,
+      "vendor_sha256": "0e8dc68fb4883436c75cbdceb30c94589ce4ebfd7cafb1eae2149d1eec2ad2c5",
+      "vendor_equal": true
+    },
+    {
+      "path": "src/dependency.rs",
+      "upstream_sha256": "5f1af4e1e7136b204d331bad6524ae6ae3371747ab0b225caf750aa2fcb7fd59",
+      "crate_present": true,
+      "crate_sha256": "5f1af4e1e7136b204d331bad6524ae6ae3371747ab0b225caf750aa2fcb7fd59",
+      "crate_equal": true,
+      "vendor_present": true,
+      "vendor_sha256": "5f1af4e1e7136b204d331bad6524ae6ae3371747ab0b225caf750aa2fcb7fd59",
+      "vendor_equal": true
+    },
+    {
+      "path": "src/hash.rs",
+      "upstream_sha256": "9e87ff2bb299bf53dbd5dde48c8c5c912ce67425ca82c782e6f553db08ad86a3",
+      "crate_present": true,
+      "crate_sha256": "9e87ff2bb299bf53dbd5dde48c8c5c912ce67425ca82c782e6f553db08ad86a3",
+      "crate_equal": true,
+      "vendor_present": true,
+      "vendor_sha256": "9e87ff2bb299bf53dbd5dde48c8c5c912ce67425ca82c782e6f553db08ad86a3",
+      "vendor_equal": true
+    },
+    {
+      "path": "src/builder.rs",
+      "upstream_sha256": "dca84c46724d92edbb20dcca16ef7b34f625d1f985891a3b6cca96c5ee28b6f8",
+      "crate_present": true,
+      "crate_sha256": "dca84c46724d92edbb20dcca16ef7b34f625d1f985891a3b6cca96c5ee28b6f8",
+      "crate_equal": true,
+      "vendor_present": true,
+      "vendor_sha256": "b10155e4c147d7b5bdd5ca3f83b029cd1b53c671ac0b609d591281b766cbb7a5",
+      "vendor_equal": false
+    }
+  ],
+  "notice_sha256": "2f01f19aedcb5f821835655f21025b058f6ffe79c79739d924e33ead89ad12d1",
+  "dinf_patch_sha256": "93bc9ee4d1acdab576188ca4f716e66dba8fe16edab3781769678c68992d3750"
+}

@@ -1,0 +1,51 @@
+{
+  "all_owned_processes_closed": true,
+  "cases": 6,
+  "compiler_warnings": 0,
+  "default_control_bit_differences": 0,
+  "f32_nonfinite": 0,
+  "gpu_calls": 0,
+  "max_forward_bound_ratio": 0.07421861009788387,
+  "max_sampled_tree_rss_bytes": 253460480,
+  "model_calls": 0,
+  "outputs": 91136,
+  "passed": true,
+  "python_version": "3.15.1",
+  "same_executable_sources_as_tested": {
+    "LICENSE-MIT": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+    "build.py": "52d44e494f488a5750b103212278cadcfb43e52cf5361f2c589516bd96705437",
+    "control-producer.cpp": "254d5feec34154c91e117798abe650c729ca9c056e6074f5325bb153ca506f9a",
+    "precision_probe.cpp": "acc0221df059795c82658c35bf7d3e6ac4b449c68c3abd94b82ea379c2b44e3b",
+    "producer.cpp": "c7c57e4f4cfdad662f6a72de81d2fe9f2e3a67d2aa6cf47bfaf71b756aab0cae",
+    "reference-repair.patch": "ad2a034ec55f4d9f231846f68d5090b5db57ea1ee76cd0c1893ffb21e026356f"
+  },
+  "scope": "Fresh CPU-only build and synthetic proof. No model qualification.",
+  "sdk": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+  "sdk_version": "27.2",
+  "seconds": 4.6935201670276,
+  "source_review": {
+    "path": "cpu-reference-fixture-package-v1-loader-source-review.json",
+    "sha256": "6f9bc324368996122ca35bcd59bdd4709a1188a2466d349727aa3e9bc56395ca",
+    "size_bytes": 2346
+  },
+  "tested_build_result": {
+    "path": "build-result.json",
+    "sha256": "aa837bf9a6ca0c26f9de69e3146c0949e98a4a93371354742533e2f85552167c",
+    "size_bytes": 19882
+  },
+  "tested_control_proof": {
+    "path": "control/proof.json",
+    "sha256": "3a872528362c845c662fba6130460d9329220b7f8b1b0ca0394906df11eca854",
+    "size_bytes": 1241
+  },
+  "tested_execution": {
+    "path": "execution.json",
+    "sha256": "8dec694916c9d3b3748d41abecf0b2659669489442a40d475a385bd0ca1330c1",
+    "size_bytes": 68135
+  },
+  "tested_repaired_proof": {
+    "path": "repaired/proof.json",
+    "sha256": "52195a9226ea4cea13417de6d61875f2dc869e729fab1e6a878e76b171e460e5",
+    "size_bytes": 1177
+  }
+}

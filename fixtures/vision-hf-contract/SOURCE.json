@@ -1,0 +1,111 @@
+{
+  "upstream_repository": "https://github.com/ggml-org/llama.cpp",
+  "upstream_revision": "15fa3c493bfcd040b5f4dcb29e1c998a0846de16",
+  "upstream_archive_url": "https://github.com/ggml-org/llama.cpp/archive/15fa3c493bfcd040b5f4dcb29e1c998a0846de16.tar.gz",
+  "upstream_archive_sha256": "b26a31bf04cb65be8561af80b5c7765557d336fd2faebaf2e127cc7f9cd1f2b6",
+  "oracle_variant": "hf-contract-v1",
+  "patch_sha256": "98a3f2f65673e691a8dc8c92495c6c7462b429685bb6fd2768cb64ed582391b6",
+  "source_files": [
+    {
+      "path": "tools/mtmd/models/qwen3vl.cpp",
+      "base_sha256": "11eafa731e860e736c58661edcd4cea87710abb9f608590976e587e6b0d4201b",
+      "patched_sha256": "72599f50f4f0de92f5b5a1d6855de3f791eb1c70374d4b205651fe8a7533aa5b"
+    },
+    {
+      "path": "tools/mtmd/models/gemma4v.cpp",
+      "base_sha256": "7faea068d8755d2a56cb35b621df80ae8e8663d44f9d8a0fec84ac761ae48e00",
+      "patched_sha256": "bbedb31e989596b0960e91f0f03a98b2d13165ad1113ba669802c8e23a8c9c09"
+    },
+    {
+      "path": "tools/mtmd/models/llama4.cpp",
+      "base_sha256": "0697403992a6d9ef39c4f283ff8eb822e5dc00d7317eaedeebc15c2c9119b044",
+      "patched_sha256": "488d9fe9b913bead0d359178368760c1c4961aca4b06447f39aedf7ed4f6bd76"
+    }
+  ],
+  "attribution": "MIT; Copyright (c) 2023-2026 The ggml authors",
+  "observed_runtime_versions": {
+    "llama.cpp": "b8920 / 15fa3c493bfcd040b5f4dcb29e1c998a0846de16",
+    "ggml": "0.10.0"
+  },
+  "observed_runtime_pins": [
+    {
+      "name": "libmtmd.0.0.8920.dylib",
+      "sha256": "20372260b350fc1a8f9b7b8b88cfff5ed558b166ac63f5e081656daf564fb83c",
+      "size_bytes": 898768
+    },
+    {
+      "name": "libggml.0.10.0.dylib",
+      "sha256": "681e21748654d5400107edd2b7b6fe0071952314fd9ccd94052fdf2df3021d9b",
+      "size_bytes": 77936
+    },
+    {
+      "name": "libggml-base.0.10.0.dylib",
+      "sha256": "54424d67d0d1ce3f685f5f6a179a6340316dd2c1f76bb39eecef0acdd037fc73",
+      "size_bytes": 499808
+    },
+    {
+      "name": "libggml-blas.so",
+      "sha256": "3ea3ba3453656dc990a22b5eb9a38f538b089df1f0aaf1eefa6fec0053661dcb",
+      "size_bytes": 58752
+    },
+    {
+      "name": "libggml-cpu-apple_m4.so",
+      "sha256": "ef94935f27f98d5ead3c65a61dff0f2730713c62acc2ab607b5f970d6c86e699",
+      "size_bytes": 548848
+    },
+    {
+      "name": "libggml-cpu-apple_m2_m3.so",
+      "sha256": "20e07e79c56c55a33ca45965a32c83b549a3cb920217d680190557c2b3bca1ad",
+      "size_bytes": 548864
+    },
+    {
+      "name": "libggml-cpu-apple_m1.so",
+      "sha256": "acf353abfc8cf9ba77b68fa7655070fcda384ce4eecf6babbb0ef7fc74f6fe2b",
+      "size_bytes": 532432
+    },
+    {
+      "name": "libggml-metal.so",
+      "sha256": "798980cb0c635d0c63737005bfe8aed85cd2ff0299d98dc8f10afe911b8968de",
+      "size_bytes": 806256
+    },
+    {
+      "name": "libllama.0.0.8920.dylib",
+      "sha256": "aa15156d7b89a5fb2d58d230c11fb0d8f5b6ad497ba22d11b7bbe0713ad53e61",
+      "size_bytes": 2180464
+    }
+  ],
+  "producer_source_sha256": "09a77ce6a16a9a1ecd15cf05bd718296bfa9690365c5187931d37cded502a8a7",
+  "fixture_rgb_sha256": {
+    "64": "30782b3b60a49a004cb918c0a651ff7d7a65a588b5cbfadacae3bed94a86a129",
+    "256": "7c11746547bef08703076d8edcad7d35bd5c8b73df75252833ea80701562d329",
+    "768": "f081b102996eedb840ef25294057cbd71a77de272d36c5a6030e1b8311580b07"
+  },
+  "patch_dry_run_and_patched_source_hash_check": "passed",
+  "model_runs": 0,
+  "hf_contract_sources": [
+    {
+      "url": "https://raw.githubusercontent.com/huggingface/transformers/d203390173fc074638e2268c6becd140fca5d92b/src/transformers/models/qwen3_5/modeling_qwen3_5.py",
+      "sha256": "4463b8a108f678c166755101d95f188179f54143305953d78147de0389b80ebc"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/huggingface/transformers/d203390173fc074638e2268c6becd140fca5d92b/src/transformers/vision_utils.py",
+      "sha256": "bcecd5a92b3266b9926272a549d2b1a0f1fe7646c698c0fa19bd96f976085356"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/huggingface/transformers/v4.57.1/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py",
+      "sha256": "dd63ed3b124232735b3dca1bfa28f9d6b0d3f7182afcb75dde8f3e724b2b22da"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/huggingface/transformers/fd3cf0140de03f7619ac95b5cfed05b711ff9e22/src/transformers/models/gemma4/modeling_gemma4.py",
+      "sha256": "6845c98e2d5bb0a7e50ac65e69ba36399166319a0ef99f33b11a101b8ec6153b"
+    },
+    {
+      "url": "https://github.com/huggingface/transformers/blob/fd3cf0140de03f7619ac95b5cfed05b711ff9e22/src/transformers/models/llama4/modeling_llama4.py",
+      "sha256": "82e8de98c04f42fb56e01da2c08113e51f724df02a43080c017a40e39bb8e5c2"
+    },
+    {
+      "url": "https://github.com/huggingface/transformers/blob/2932f318a20d9e54cc7aea052e040164d85de7d6/src/transformers/models/llama4/modeling_llama4.py",
+      "sha256": "70c36256ab880f564cab5c1104c9a94940e7f3d6fb370e5fe96dc36c732d7700"
+    }
+  ]
+}

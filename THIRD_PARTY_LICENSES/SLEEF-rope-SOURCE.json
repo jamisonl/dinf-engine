@@ -1,0 +1,47 @@
+{
+  "copyright": [
+    "Copyright Naoki Shibata and contributors 2010 - 2024.",
+    "Copyright ARM Ltd. 2010 - 2024."
+  ],
+  "license": "BSL-1.0",
+  "license_file": "THIRD_PARTY_LICENSES/SLEEF-BOOST-1.0.txt",
+  "license_sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566",
+  "upstream_repository": "https://github.com/shibatch/sleef",
+  "upstream_revision": "5a1d179df9cf652951b59010a2d2075372d67f68",
+  "torch_revision": "d0f2af8b66b20da4baa50644c0cd3f887a2eae2e",
+  "torch_submodule_path": "third_party/sleef",
+  "sources": [
+    {
+      "path": "src/libm/sleefsimdsp.c",
+      "url": "https://raw.githubusercontent.com/shibatch/sleef/5a1d179df9cf652951b59010a2d2075372d67f68/src/libm/sleefsimdsp.c",
+      "sha256": "726d962aaa9cfb0b1696122f4d26765495491c0cbc26c084c899704de46b2f5c"
+    },
+    {
+      "path": "src/common/df.h",
+      "url": "https://raw.githubusercontent.com/shibatch/sleef/5a1d179df9cf652951b59010a2d2075372d67f68/src/common/df.h",
+      "sha256": "cd3c7de0e47f3751a15dd62878effabdec9e47a892a03fefd75981c26fdaf097"
+    },
+    {
+      "path": "src/common/misc.h",
+      "url": "https://raw.githubusercontent.com/shibatch/sleef/5a1d179df9cf652951b59010a2d2075372d67f68/src/common/misc.h",
+      "sha256": "516ddeb5cc9501039b104967f1830b92e94cc6053c401fbb6773873dfb1b6178"
+    },
+    {
+      "path": "src/arch/helperadvsimd.h",
+      "url": "https://raw.githubusercontent.com/shibatch/sleef/5a1d179df9cf652951b59010a2d2075372d67f68/src/arch/helperadvsimd.h",
+      "sha256": "8db49cb2881771dde2ac6b7fcf5031b3fecf302b92220ff4cf0ed04f169bb610"
+    }
+  ],
+  "retained": [
+    "Positive-base logkf/expkf/xpowf arithmetic; FMA two-F32 helper order and coefficients.",
+    "F32 exponent division and per-axis eight-value vector block/scalar-tail schedule from the pinned Torch CPU kernel."
+  ],
+  "changes": [
+    "Scalar Rust translation of a single ARM vector lane; no SIMD or Torch dependency.",
+    "Explicit finite domain base[1,65536], exponent[0,1]; reject other inputs. Omit unreachable negative, subnormal, NaN, infinity and overflow branches.",
+    "Within the admitted domain exp exponent stays[0,16], so general ldexp reduces to a single exact normal power-of-two multiplication.",
+    "Apple paired sin/cos uses the public math.h __sincosf through a C pointer-ABI shim. The shim is original glue, not copied SLEEF."
+  ],
+  "scope": "BF16 Metal denoiser RoPE on macOS ARM64 only. Existing table allocation and position bounds remain. CPU/F32 and other platforms retain the previous paths.",
+  "rust_output_sha256": "b9a6944761a05c8f3411b0c9295b577e4e00efcef3401bae18bdb8f61a615f70"
+}

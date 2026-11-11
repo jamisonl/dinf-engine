@@ -1,0 +1,17 @@
+The text_norm_metal.metal mean reduction and reciprocal-square-root order adapt PyTorch
+commit d0f2af8b66b20da4baa50644c0cd3f887a2eae2e.
+Sources: aten/src/ATen/native/mps/kernels/ReduceOps.metal,
+aten/src/ATen/native/mps/operations/ReduceOps.mm and
+aten/src/ATen/native/mps/kernels/UnaryKernel.metal.
+The host keeps the same contiguous-row dispatch rules for supported widths 128 and 4096.
+BF16 text conditioning and denoiser Q/K normalization on supported Apple Metal devices admit this path.
+
+The text_softmax_metal.metal contiguous-row softmax also adapts the same
+commit: aten/src/ATen/native/mps/kernels/SoftMax.metal and
+aten/src/ATen/native/mps/operations/SoftMax.mm. The host uses only that
+source row-dispatch scope; other shapes retain the previous path.
+
+The text_silu_metal.metal scalar formula is independently expressed as
+x / (1 + precise::exp(-x)), evaluated in F32 with final BF16 rounding.
+The pinned native finite-BF16 domain and saved layer 27 proof verify this contract.
+No input-specific branch or copied native kernel body is used.

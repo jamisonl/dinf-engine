@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "declared_before_model_runs": true,
+  "steps": 4,
+  "dtype": "bf16",
+  "component": {
+    "relative_l2_max": 0.01,
+    "cosine_min": 0.9999
+  },
+  "scheduler_max_abs": 1e-06,
+  "same_runtime_cache": "byte_exact_all_outputs",
+  "fixture_sha256": "c857cce7af3ec191eb9d303220354f4c166203f7a2eaf1fe3e74b612e6444669",
+  "schedule_anchor": {
+    "sigmas": {
+      "shape": [
+        5
+      ],
+      "values": [
+        1.0,
+        0.7492682337760925,
+        0.4325879216194153,
+        0.019999921321868896,
+        0.0
+      ],
+      "origin_sha256": "fd5ce437bfd3184a1a01180ffe7359a9fd38b989be4ca07b7080ad3f9eb7fde8"
+    },
+    "timesteps": {
+      "shape": [
+        4
+      ],
+      "values": [
+        1000.0,
+        749.2682495117188,
+        432.5879211425781,
+        19.999921798706055
+      ],
+      "origin_sha256": "a338181ae6c735180adfd1216fee746511214fe2701ad8c6092c9fbe152003c8"
+    }
+  },
+  "scope": "Four-step synthetic-conditioning BF16 MPS/Metal denoiser trajectory and cache. No40-step, image quality, text encoder, or portability claim."
+}

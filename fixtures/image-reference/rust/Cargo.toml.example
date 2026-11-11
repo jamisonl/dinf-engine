@@ -1,0 +1,18 @@
+[package]
+name = "dinf-image-component-audit"
+version = "0.0.0"
+edition = "2024"
+publish = false
+[workspace]
+resolver = "3"
+[dependencies]
+dinf-engine = { path = "../../.." }
+anyhow = "=1.0.103"
+candle-core = "=0.11.0"
+candle-nn = "=0.11.0"
+serde_json = "=1.0.149"
+sha2 = "=0.10.9"
+[patch.crates-io]
+candle-metal-kernels = { path = "../../../third_party/candle-metal-kernels" }
+cudaforge = { path = "../../../third_party/cudaforge" }
+gemm-common = { path = "../../../third_party/gemm-common" }

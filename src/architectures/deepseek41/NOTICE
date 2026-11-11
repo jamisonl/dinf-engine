@@ -1,0 +1,63 @@
+Third-party notices for the native DeepSeek V4.1 Flash ("Maya") port
+
+ds4
+---
+Portions of this directory are derived from https://github.com/audreyt/ds4
+at revision 0dff39f91721bcf3472813c6d2bebf9353df2a1a, including ported parts of:
+  ds4.c: text graph, residual streams, attention, routing and precision boundaries
+  ds4_metal.m: projection dispatch, normalization and cache execution geometry
+  ds4_engram.c, ds4_engram.h, tests/test_engram.c: Engram and regression fixtures
+  metal/dsv41.metal: V4.1 native operations
+  metal/dsv4_kv.metal: KV quantize/dequantize and cache arithmetic
+  metal/dsv4_hc.metal: hyperconnections and residual-stream arithmetic
+  metal/norm.metal: RMS normalization arithmetic and reduction layout
+  metal/dense.metal: packed Q8 projection arithmetic and reduction layout,
+    including the rows_seq4 kernel (dense.metal:505-587, ds4_metal.m:20059-20162)
+  metal/get_rows.metal: F32 Q8 embedding decode
+  metal/argsort.metal: selection and tie ordering
+  metal/moe.metal, metal/iq1s_grid.metal: IQ1_S expert arithmetic and grid
+
+Copyright (c) 2026 The ds4.c authors
+Copyright (c) 2023-2026 The ggml authors
+Copyright (c) 2023 DeepSeek
+
+Licensed under the MIT License; the upstream license text, including all three
+copyright attributions, is reproduced in LICENSE-MIT in this directory.
+
+DeepSeek V4.1 tokenizer and chat template
+-----------------------------------------
+dinf-engine/src/tokenizer_deepseek41.rs is derived from encoding/encoding.py and
+the tokenizer definitions of deepseek-ai/DeepSeek-V4.1-Flash-1017 at revision
+1bae0e1088993b9b82de08f59de5be5a34e42170:
+  https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/tree/1bae0e1088993b9b82de08f59de5be5a34e42170
+Copyright (c) 2023 DeepSeek. MIT License; the full notice is retained in that
+source file.
+
+llama.cpp / ggml
+----------------
+The F32 SIMD-group matrix kernels in ../deepseek4_iq1_packets.metal and
+../deepseek4_q8_mma.metal adapt kernel_mul_mv_mma_gen and its lane/store
+mapping from llama.cpp at revision 7aca0d2ea8d92b56911233b822db01f9fbb1ae50:
+  https://github.com/ggml-org/llama.cpp/blob/7aca0d2ea8d92b56911233b822db01f9fbb1ae50/ggml/src/ggml-metal/kernels/mul_mv_mma.metal
+  https://github.com/ggml-org/llama.cpp/blob/7aca0d2ea8d92b56911233b822db01f9fbb1ae50/LICENSE
+
+The native prefill matmul in ../deepseek4_prefill_mm.rs and
+../deepseek4_prefill_mm.metal adapts the kernel_mul_mm/kernel_mul_mm_id loops,
+half dequantization, SIMD-group and Metal tensor layouts and scatter from
+llama.cpp at revision de5122d879d00d2895c36be7e0cee94105aeeabd:
+  ggml/src/ggml-metal/kernels/mul_mm.metal
+  ggml/src/ggml-metal/kernels/dequantize.h
+  ggml/src/ggml-metal/kernels/common.h
+  https://github.com/ggml-org/llama.cpp/tree/de5122d879d00d2895c36be7e0cee94105aeeabd
+
+Copyright (c) 2023-2026 The ggml authors. MIT License; the complete permission
+notice and disclaimer are retained in each adapted file.
+
+Supported model weights
+-----------------------
+The GSQ-RCO Coder model profile targets
+ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF at revision
+54229d38d588a66d1c6cff08af7b281b9326c656:
+  https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF
+The publisher identifies those weights and their DeepSeek-V4.1-Flash-1017 base
+as MIT licensed.

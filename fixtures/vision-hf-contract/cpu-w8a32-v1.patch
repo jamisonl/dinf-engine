@@ -1,0 +1,35 @@
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -245,7 +245,8 @@
+         n_mmproj_embd(clip_n_mmproj_embd(ctx)),
+         eps(hparams.eps),
+         kq_scale(1.0f / sqrtf((float)d_head)),
+-        flash_attn_type(ctx->flash_attn_type) {
++        flash_attn_type(ctx->flash_attn_type),
++        cpu_f32_dense(ggml_backend_dev_type(ggml_backend_get_device(ctx->backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+     struct ggml_init_params params = {
+         /*.mem_size   =*/ ctx->buf_compute_meta.size(),
+         /*.mem_buffer =*/ ctx->buf_compute_meta.data(),
+@@ -257,6 +258,12 @@
+ }
+ 
+ ggml_tensor * clip_graph::build_mm(ggml_tensor * w, ggml_tensor * x) const {
++    // This explicit CPU reference profile preserves original F32 activations.
++    // F16 and Q8_0 stored weights widen exactly; activations stay F32.
++    if (cpu_f32_dense && (w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_Q8_0) && x->type == GGML_TYPE_F32) {
++        GGML_ASSERT(ggml_nelements(w) <= 128*1024*1024/4); // per-projection wide-weight bound
++        w = ggml_cast(ctx0, w, GGML_TYPE_F32);
++    }
+     return ggml_mul_mat(ctx0, w, x);
+ }
+ 
+--- a/tools/mtmd/clip-graph.h
++++ b/tools/mtmd/clip-graph.h
+@@ -31,6 +31,7 @@
+     const float eps;
+     float kq_scale; // TODO: maybe move this to hparams
+     const clip_flash_attn_type flash_attn_type;
++    const bool cpu_f32_dense; // Explicit reference profile; Metal keeps its original graph.
+ 
+     ggml_context_ptr ctx0_ptr;
+     ggml_context * ctx0;

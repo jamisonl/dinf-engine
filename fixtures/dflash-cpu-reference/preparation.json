@@ -1,0 +1,65 @@
+{
+  "changes": "Documentation and metadata only; executable sources, patch, producers and license are identical to the tested build.",
+  "files": [
+    {
+      "path": "LICENSE-MIT",
+      "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+      "size_bytes": 1078
+    },
+    {
+      "path": "README.md",
+      "sha256": "e1083b8e7547ceee77d184de952e6f3f269cffc24078106e6cb4e042c1f03135",
+      "size_bytes": 6156
+    },
+    {
+      "path": "build.py",
+      "sha256": "52d44e494f488a5750b103212278cadcfb43e52cf5361f2c589516bd96705437",
+      "size_bytes": 7107
+    },
+    {
+      "path": "control-producer.cpp",
+      "sha256": "254d5feec34154c91e117798abe650c729ca9c056e6074f5325bb153ca506f9a",
+      "size_bytes": 12076
+    },
+    {
+      "path": "inputs.json",
+      "sha256": "f95231ef9a7e802a51ba1928603d2b6b327928ed17bdd10496783fd6f81fcd7f",
+      "size_bytes": 32817
+    },
+    {
+      "path": "precision_probe.cpp",
+      "sha256": "acc0221df059795c82658c35bf7d3e6ac4b449c68c3abd94b82ea379c2b44e3b",
+      "size_bytes": 6984
+    },
+    {
+      "path": "producer.cpp",
+      "sha256": "c7c57e4f4cfdad662f6a72de81d2fe9f2e3a67d2aa6cf47bfaf71b756aab0cae",
+      "size_bytes": 12331
+    },
+    {
+      "path": "reference-repair.patch",
+      "sha256": "ad2a034ec55f4d9f231846f68d5090b5db57ea1ee76cd0c1893ffb21e026356f",
+      "size_bytes": 4403
+    },
+    {
+      "path": "validation-summary.json",
+      "sha256": "cc15c77d69ae038a23991197d9a92fd6cbe23526facc2e52f8eaa3269df0710c",
+      "size_bytes": 2021
+    }
+  ],
+  "gpu_calls": 0,
+  "model_calls": 0,
+  "parent_package": {
+    "path": "cpu-reference-fixture-package-v2/preparation.json",
+    "sha256": "cf919f3f85533ef6dbcf2430470ef98bd08cc1a51af3ab2fcb9ffaf67bd74bf4"
+  },
+  "same_executable_sources_as_tested": {
+    "LICENSE-MIT": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+    "build.py": "52d44e494f488a5750b103212278cadcfb43e52cf5361f2c589516bd96705437",
+    "control-producer.cpp": "254d5feec34154c91e117798abe650c729ca9c056e6074f5325bb153ca506f9a",
+    "precision_probe.cpp": "acc0221df059795c82658c35bf7d3e6ac4b449c68c3abd94b82ea379c2b44e3b",
+    "producer.cpp": "c7c57e4f4cfdad662f6a72de81d2fe9f2e3a67d2aa6cf47bfaf71b756aab0cae",
+    "reference-repair.patch": "ad2a034ec55f4d9f231846f68d5090b5db57ea1ee76cd0c1893ffb21e026356f"
+  },
+  "scope": "Adopt tested CPU reference fixture; exact pinned prebuilt-library recipe, not full upstream rebuild."
+}

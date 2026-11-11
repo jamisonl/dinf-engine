@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "declared_before_model_runs": true,
+  "full_finite_and_shape_required": true,
+  "exact_input_bits_required": true,
+  "scheduler_max_abs": 1e-06,
+  "component": {
+    "relative_l2_max": 0.01,
+    "cosine_min": 0.9999
+  },
+  "same_runtime_cache": {
+    "relative_l2_max": 1e-05,
+    "cosine_min": 0.99999999
+  },
+  "notes": [
+    "Same-runtime cache threshold applies F32. No BF16 cache test is scheduled yet.",
+    "No gate change after real output. First failures remain.",
+    "F32 CPU oracle and engine CPU primary; optional Metal F32 checks same component gate.",
+    "VAE compares clamped F32 RGBA before PNG quantization, not semantic quality."
+  ]
+}

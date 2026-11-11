@@ -1,0 +1,16 @@
+The image_mpp_attention.metal MPP attention body and fragment operations adapt
+PyTorch commit d0f2af8b66b20da4baa50644c0cd3f887a2eae2e:
+aten/src/ATen/native/mps/kernels/MppAttention.h.
+The parameter structs, pointer trait, and row operators come from that revision's
+aten/src/ATen/native/mps/kernels/PrefillAttention.h; the NaN-propagating maximum
+comes from c10/metal/utils.h. Exact source hashes and changes appear in
+src/diffusion/image_mpp_SOURCE.json. PyTorch's BSD notice ships alongside this file.
+
+The upstream MPP header identifies its MLX origin. MLX is copyright
+2023 Apple Inc.; its MIT notice ships as MLX-MIT.txt. The retained Prefill header
+also records the metal-flash-sdpa/MLX adaptation chain.
+
+Only Apple10 BF16 with head width 128 and block sizes 64/32 has exported kernel names.
+One kernel consumes an additive causal mask built by the bounded host adapter;
+the other has no mask. The host declines other devices, types, widths and sizes.
+CPU/F32 and other declined paths retain the existing engine behavior.

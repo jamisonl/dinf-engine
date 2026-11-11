@@ -1,0 +1,12 @@
+--- a/ggml/src/ggml-cpu/vec.h
++++ b/ggml/src/ggml-cpu/vec.h
+@@ -14,7 +14,8 @@
+ // floating point type used to accumulate sums
+ typedef double ggml_float;
+ 
+-#define GGML_GELU_FP16
++// Preserve F32 inputs and outputs for the F32 tanh-GELU reference.
++// The F16 GELU operator keeps its existing lookup table.
+ #define GGML_GELU_QUICK_FP16
+ 
+ #define GGML_SOFT_MAX_UNROLL 4

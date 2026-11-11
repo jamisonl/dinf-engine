@@ -1,0 +1,15 @@
+{
+  "policy": "ggml-cpu-flash-f32-query-v4",
+  "extends": "ggml-cpu-flash-f32-v2",
+  "source_revision": "15fa3c493bfcd040b5f4dcb29e1c998a0846de16",
+  "scope": "Explicit GGML_PREC_F32 flash attention with original F32 query and F16 K/V. Keep F32 KQ/V accumulation from v2; DEFAULT and v2/v3 profiles unchanged. No model qualification implied.",
+  "patches": [
+    {
+      "file": "ggml-cpu-flash-f32-query-v4.patch",
+      "sha256": "2385c73bd1642d23c8f60582e9312bd3b3b5d56429056b622dafd544dfa36f71",
+      "source_file": "src/ggml-cpu/ops.cpp",
+      "original_sha256": "bbabc71e54365213922e982fb9d0904b770de48f708f879e7d12bd16eb87535e",
+      "patched_sha256": "989265d3e1b1d2752f84c692524b74b23a830f6dc78a76cfccc8e24988594697"
+    }
+  ]
+}

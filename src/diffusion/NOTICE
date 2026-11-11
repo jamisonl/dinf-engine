@@ -1,0 +1,27 @@
+Native Qwen Image implementation
+
+The algorithms and component layouts in this directory are adapted from:
+
+Hugging Face Diffusers (Apache License 2.0)
+Copyright 2026 Qwen-Image Team, The HuggingFace Team. All rights reserved.
+Copyright 2026 The Qwen Team and The HuggingFace Team. All rights reserved.
+Copyright 2025 Stability AI, Katherine Crowson and The HuggingFace Team. All rights reserved.
+https://github.com/huggingface/diffusers
+  src/diffusers/models/transformers/transformer_qwenimage21.py
+  src/diffusers/models/autoencoders/autoencoder_kl_qwenimage21.py
+  src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py
+  src/diffusers/schedulers/scheduling_flow_match_euler_discrete.py
+
+Hugging Face Candle (Apache License 2.0 or MIT)
+https://github.com/huggingface/candle
+  candle-transformers/src/models/qwen3_vl/text.rs
+  candle-transformers/src/models/qwen3_vl/config.rs
+
+Changes: native Rust/Candle implementation, staged tensor loading, precision
+guards, single-image VAE specialization, segmented Metal attention, local
+generation orchestration, cancellation, and tests. No Python runtime is used.
+The included Apache License applies to the adapted upstream implementation.
+
+Model weights are not distributed with this source. Qwen-Image-2.1 weights
+have a separate Qwen RESEARCH LICENSE AGREEMENT. The source-code license does
+not grant commercial rights to the model weights.

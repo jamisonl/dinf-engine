@@ -1,0 +1,25 @@
+{
+  "upstream_revision": "d0f2af8b66b20da4baa50644c0cd3f887a2eae2e",
+  "license": "BSD-3-Clause",
+  "copyright": "Copyright PyTorch contributors. Host dispatch: Copyright (c) 2022 Apple Inc.",
+  "sources": [
+    {
+      "path": "aten/src/ATen/native/mps/kernels/LayerNorm.metal",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/d0f2af8b66b20da4baa50644c0cd3f887a2eae2e/aten/src/ATen/native/mps/kernels/LayerNorm.metal",
+      "sha256": "256f69b1f6b6d13de5592339fe5b58b86deb850156db98208278230a255b5369"
+    },
+    {
+      "path": "aten/src/ATen/native/mps/operations/Normalization.mm",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/d0f2af8b66b20da4baa50644c0cd3f887a2eae2e/aten/src/ATen/native/mps/operations/Normalization.mm",
+      "sha256": "b4227b6625a897944efd309c20d276567c664770491f41a6268d5f07001dacb3"
+    },
+    {
+      "path": "c10/metal/reduction_utils.h",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/d0f2af8b66b20da4baa50644c0cd3f887a2eae2e/c10/metal/reduction_utils.h",
+      "sha256": "17fef9bb70a597ac47f5959daba605bdc37ed5cd2faae4a95fd4382b75aafa22"
+    }
+  ],
+  "scope": "Bounded non-affine BF16 Metal LayerNorm with width 1..4096 and <=16M values, macOS15+ Apple7 or newer, only native-compatible SIMD32 and complete thread count. CPU/F32/other inputs retain the existing path.",
+  "changes": "One native contiguous-four row kernel; explicit variance FMA matches observed native contraction; BF16 round before modulation; reuse existing storage/offset/output host checks. No affine parameters/stat outputs.",
+  "shader_sha256": "97d96c2cf9b10c2af814c2651bac797569841caf728fa54d0081e3d53cb56452"
+}

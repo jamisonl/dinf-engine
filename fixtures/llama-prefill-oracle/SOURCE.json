@@ -1,0 +1,25 @@
+{
+  "repository": "https://github.com/ggml-org/llama.cpp",
+  "revision": "de5122d879d00d2895c36be7e0cee94105aeeabd",
+  "archive_url": "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/de5122d879d00d2895c36be7e0cee94105aeeabd",
+  "archive_bytes": 38600274,
+  "archive_sha256": "3f1ea5f47c4dd8473853e7e696e0e172ff788964730ca8d8e6c5bf8cdeb92764",
+  "files": {
+    "mul_mm.metal": {
+      "upstream_path": "ggml/src/ggml-metal/kernels/mul_mm.metal",
+      "bytes": 58613,
+      "sha256": "c3653dbd858e6d68e2db73aa4e37fe914f389fe346f36e1c3b19e9be4bcf307f"
+    },
+    "dequantize.h": {
+      "upstream_path": "ggml/src/ggml-metal/kernels/dequantize.h",
+      "bytes": 28011,
+      "sha256": "b64da60146cad11863bae09873e542dce76897c787849d47abaa2a5837d5bf8f"
+    },
+    "LICENSE": {
+      "upstream_path": "LICENSE",
+      "bytes": 1078,
+      "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+    }
+  },
+  "modifications": "none"
+}

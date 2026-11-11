@@ -1,0 +1,73 @@
+--- a/tools/mtmd/models/qwen3vl.cpp
++++ b/tools/mtmd/models/qwen3vl.cpp
+@@ -44,7 +44,8 @@
+     }
+ 
+     // calculate absolute position embedding and apply
+-    ggml_tensor * learned_pos_embd = resize_position_embeddings();
++    ggml_tensor * learned_pos_embd = resize_position_embeddings(
++        GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS);
+     learned_pos_embd = ggml_cont_4d(
+         ctx0, learned_pos_embd,
+         n_embd * 2, n_patches_x / 2, n_patches_y, batch_size);
+@@ -180,7 +181,7 @@
+         model.mm_0_w, model.mm_0_b,
+         nullptr, nullptr,
+         model.mm_1_w, model.mm_1_b,
+-        ffn_op_type::FFN_GELU, -1);
++        ffn_op_type::FFN_GELU_ERF, -1);
+ 
+     if (deepstack_features) {
+         embeddings = ggml_concat(ctx0, embeddings, deepstack_features, 0);
+--- a/tools/mtmd/models/gemma4v.cpp
++++ b/tools/mtmd/models/gemma4v.cpp
+@@ -123,13 +123,12 @@
+         cb(cur, "std_scaled", -1);
+     }
+ 
+-    // Gemma4MultimodalEmbedder
++    // Gemma4MultimodalEmbedder: HF normalizes the vision-width features
++    // before projection and returns the projected language-width features.
++    cur = ggml_rms_norm(ctx0, cur, hparams.eps);
++    cb(cur, "pre_projection_normed", -1);
+     cur = build_mm(model.mm_input_proj_w, cur);
+     cb(cur, "projected", -1);
+-
+-    // embedding_post_projection_norm
+-    cur = ggml_rms_norm(ctx0, cur, hparams.eps);
+-    cb(cur, "projected_normed", -1);
+ 
+     ggml_build_forward_expand(gf, cur);
+     return gf;
+--- a/tools/mtmd/models/llama4.cpp
++++ b/tools/mtmd/models/llama4.cpp
+@@ -40,7 +40,7 @@
+     ggml_tensor * cur = build_vit(
+                             inp, n_pos,
+                             NORM_TYPE_NORMAL,
+-                            hparams.ffn_op,
++                            FFN_GELU_ERF,
+                             model.position_embeddings,
+                             add_pos);
+ 
+@@ -68,7 +68,7 @@
+             n_patches_x / scale_factor,
+             n_patches_y / scale_factor,
+             bsz);
+-        //cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
++        cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+         // flatten to 2D
+         cur = ggml_cont_2d(ctx0, cur,
+             n_embd * scale_factor * scale_factor,
+@@ -79,9 +79,9 @@
+     // based on Llama4VisionMLP2 (always uses GELU activation, no bias)
+     {
+         cur = build_mm(model.mm_model_mlp_1_w, cur);
+-        cur = ggml_gelu(ctx0, cur);
++        cur = ggml_gelu_erf(ctx0, cur);
+         cur = build_mm(model.mm_model_mlp_2_w, cur);
+-        cur = ggml_gelu(ctx0, cur);
++        cur = ggml_gelu_erf(ctx0, cur);
+         cb(cur, "adapter_mlp", -1);
+     }
+ 

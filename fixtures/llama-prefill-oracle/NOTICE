@@ -1,0 +1,14 @@
+Pinned llama.cpp Metal reference sources for component tests
+
+Source: https://github.com/ggml-org/llama.cpp
+Revision: de5122d879d00d2895c36be7e0cee94105aeeabd
+License: MIT; the exact upstream license is in LICENSE.
+
+mul_mm.metal and dequantize.h are unchanged upstream files. SOURCE.json
+records their upstream paths, sizes, SHA256 hashes, and source archive pin.
+Both files and LICENSE were checked byte for byte against that archive.
+
+The test-only calibration extracts the portable kernel and two dequantizers
+from these files. They are not a second inference backend. The checked source
+lines are fixed by the complete-file hashes; do not update the reference or
+numeric bounds merely to make a changed implementation pass.

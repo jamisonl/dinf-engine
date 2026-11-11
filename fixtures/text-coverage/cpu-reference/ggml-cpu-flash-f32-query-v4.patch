@@ -1,0 +1,28 @@
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8165,12 +8165,12 @@
+     }
+ }
+ 
+-// Keep the existing half-rounded Q/K inputs, but honor requested F32 dot accumulation.
+-static float ggml_flash_attn_ext_dot_f16_f32(
+-        int64_t n, const ggml_fp16_t * x, const ggml_fp16_t * y) {
++// Honor the original F32 query tensor as well as requested F32 dot accumulation.
++static float ggml_flash_attn_ext_dot_f16_f32q(
++        int64_t n, const ggml_fp16_t * x, const float * y) {
+     float sum = 0.0f;
+     for (int64_t i = 0; i < n; ++i) {
+-        sum += GGML_CPU_FP16_TO_FP32(x[i]) * GGML_CPU_FP16_TO_FP32(y[i]);
++        sum += GGML_CPU_FP16_TO_FP32(x[i]) * y[i];
+     }
+     return sum;
+ }
+@@ -8313,7 +8313,7 @@
+ 
+             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+             if (use_f32_kq_dot) {
+-                s = ggml_flash_attn_ext_dot_f16_f32(DK, (const ggml_fp16_t *) k_data, Q_q);
++                s = ggml_flash_attn_ext_dot_f16_f32q(DK, (const ggml_fp16_t *) k_data, pq);
+             } else {
+                 kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+             }
