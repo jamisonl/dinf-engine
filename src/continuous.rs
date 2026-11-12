@@ -321,10 +321,13 @@ impl GenerationSession {
     pub fn new_seeded(
         stage: &PipelineStage,
         prompt_tokens: Vec<u32>,
-        params: SamplingParams,
+        mut params: SamplingParams,
         stop_ids: Vec<u32>,
         seed: u64,
     ) -> Self {
+        // The seed must be visible to the exact-path guards, which keep a
+        // seeded request off approximate batched speculative verification.
+        params.seed = Some(seed);
         Self::with_cache_and_rng(
             stage.new_session_state(),
             prompt_tokens,
@@ -1724,7 +1727,24 @@ mod tests {
         assert!(calls.lock().unwrap().iter().all(|(_, _, all)| !all));
         reference.discard_cache(&mut plain);
         session.discard_cache(&mut drafted);
+
+        // An explicit `new_seeded` seed is exact too, even with no params seed.
+        let unseeded = SamplingParams { seed: None, ..params_for_seeded() };
+        let mut reference = GenerationSession::new_seeded(&plain, vec![2], unseeded.clone(), vec![], 42);
+        let mut session = GenerationSession::new_seeded(&drafted, vec![2], unseeded, vec![], 42);
+        session.set_speculative_decoding_enabled(true);
+        while !reference.is_finished() {
+            assert_eq!(reference.step(&mut plain)?, session.step(&mut drafted)?);
+        }
+        assert_eq!(session.speculative_stats().passes, 0);
+        assert!(session.speculative_stats().fell_back);
+        reference.discard_cache(&mut plain);
+        session.discard_cache(&mut drafted);
         Ok(())
+    }
+
+    fn params_for_seeded() -> SamplingParams {
+        SamplingParams { temperature: 2.5, top_k: 0, top_p: 1.0, max_tokens: 8, ..Default::default() }
     }
 
     #[test]
