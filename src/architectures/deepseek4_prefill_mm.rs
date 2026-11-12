@@ -114,6 +114,10 @@ struct Pipelines {
     route: ComputePipeline,
     map: ComputePipeline,
     combine: ComputePipeline,
+    /// Dense Coder formats: Q5_K, IQ1_M, IQ2_XXS, IQ2_XS.
+    packed: [ComputePipeline; 4],
+    /// Expert-indexed variants of `packed`, same order.
+    experts: [ComputePipeline; 4],
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "Records the selected backend for test evidence.")
@@ -219,6 +223,18 @@ fn pipeline_variant(device: &candle_core::MetalDevice, tensor: bool) -> Result<P
                 route: make("dinf_prefill_route", 512)?,
                 map: make("dinf_prefill_map", 128)?,
                 combine: make("dinf_prefill_combine", 128)?,
+                packed: [
+                    make("dinf_prefill_q5k_dense", 128)?,
+                    make("dinf_prefill_iq1m_dense", 128)?,
+                    make("dinf_prefill_iq2xxs_dense", 128)?,
+                    make("dinf_prefill_iq2xs_dense", 128)?,
+                ],
+                experts: [
+                    make("dinf_prefill_q5k_experts", 128)?,
+                    make("dinf_prefill_iq1m_experts", 128)?,
+                    make("dinf_prefill_iq2xxs_experts", 128)?,
+                    make("dinf_prefill_iq2xs_experts", 128)?,
+                ],
                 tensor,
             })
         })()
@@ -344,6 +360,210 @@ pub(crate) fn dense(weights: &Tensor, input: &Tensor, k: usize, m: usize) -> Res
     encode(e.as_ref(), &p.q8, &w, &x, &w, a, n);
     count(1);
     Ok(out)
+}
+/// Tiled prompt matmul for the packed V4.1 Coder formats. Returns `None`
+/// before enqueueing anything when the device, format or geometry is not
+/// supported, so callers keep their row path. Rows never interact: each
+/// output element sums K in one fixed order for any row count.
+pub(crate) fn dense_packed(
+    weights: &Tensor,
+    input: &Tensor,
+    dtype: DeepSeek4DType,
+    k: usize,
+    m: usize,
+) -> Result<Option<Tensor>> {
+    let Some(index) = packed_index(dtype) else {
+        return Ok(None);
+    };
+    if !packed_requested()
+        || !input.device().is_metal()
+        || input.rank() != 2
+        || input.dtype() != DType::F32
+        || !input.is_contiguous()
+        || input.dims()[1] != k
+        || !(1..=8192).contains(&input.dims()[0])
+        || k == 0
+        || !k.is_multiple_of(256)
+        || k > 65536
+        || m == 0
+        || m > 131072
+    {
+        return Ok(None);
+    }
+    let d = input.device().as_metal_device()?;
+    if !qualified_device(d) {
+        return Ok(None);
+    }
+    let Ok(p) = pipelines(d) else {
+        return Ok(None);
+    };
+    let row_bytes = weight_byte_len(dtype, 1, k)?;
+    let n = input.dims()[0];
+    let x = operand(input, d, DType::F32, n * k)?;
+    let w = operand(weights, d, DType::U8, m * row_bytes)?;
+    let out = private(d, (n, m), DType::F32)?;
+    let y = operand(&out, d, DType::F32, n * m)?;
+    let a = Args {
+        k: k as u32,
+        m: m as u32,
+        n: n as u32,
+        row_bytes: row_bytes as u32,
+        mode: 0,
+        expert: 0,
+        kind: 0,
+        stride: 0,
+    };
+    let e = d.command_encoder()?;
+    e.as_ref().set_output_buffer(2, Some(&y.0), y.1);
+    encode(e.as_ref(), &p.packed[index], &w, &x, &w, a, n);
+    Ok(Some(out))
+}
+/// Whether `dense_packed` and `experts_packed` can run on this device.
+pub(crate) fn packed_available(device: &Device) -> bool {
+    packed_requested()
+        && device
+            .as_metal_device()
+            .ok()
+            .is_some_and(|d| qualified_device(d) && pipelines(d).is_ok())
+}
+fn packed_index(dtype: DeepSeek4DType) -> Option<usize> {
+    match dtype {
+        DeepSeek4DType::Q5K => Some(0),
+        DeepSeek4DType::IQ1M => Some(1),
+        DeepSeek4DType::IQ2XXS => Some(2),
+        DeepSeek4DType::IQ2XS => Some(3),
+        _ => None,
+    }
+}
+/// One dispatch for several packed experts sharing a format and shape. Group
+/// `g` multiplies `weights[g]` by the `input` rows listed in `rows[g]`; output
+/// rows are the groups' rows concatenated in order. Each output row equals
+/// `dense_packed` of the same input row. Returns `None` before enqueueing
+/// anything when unsupported. The caller keeps every weight alive until the
+/// GPU finishes: the kernel reads them through a GPU address table, which the
+/// command encoder does not retain. Weights are CPU-written shared buffers in
+/// the device residency set, so no GPU write precedes these reads.
+pub(crate) fn experts_packed(
+    weights: &[&Tensor],
+    rows: &[Vec<u32>],
+    input: &Tensor,
+    dtype: DeepSeek4DType,
+    k: usize,
+    m: usize,
+) -> Result<Option<Tensor>> {
+    let Some(index) = packed_index(dtype) else {
+        return Ok(None);
+    };
+    let total: usize = rows.iter().map(Vec::len).sum();
+    if !packed_requested()
+        || weights.is_empty()
+        || weights.len() != rows.len()
+        || weights.len() > 65535
+        || rows.iter().any(Vec::is_empty)
+        || total > 65536
+        || !input.device().is_metal()
+        || input.rank() != 2
+        || input.dtype() != DType::F32
+        || !input.is_contiguous()
+        || input.dims()[1] != k
+        || rows
+            .iter()
+            .flatten()
+            .any(|&r| r as usize >= input.dims()[0])
+        || k == 0
+        || !k.is_multiple_of(256)
+        || k > 65536
+        || m == 0
+        || m > 131072
+    {
+        return Ok(None);
+    }
+    let d = input.device().as_metal_device()?;
+    if !qualified_device(d) {
+        return Ok(None);
+    }
+    let Ok(p) = pipelines(d) else {
+        return Ok(None);
+    };
+    let row_bytes = weight_byte_len(dtype, 1, k)?;
+    let x = operand(input, d, DType::F32, input.dims()[0] * k)?;
+    let mut addresses = Vec::with_capacity(weights.len());
+    for w in weights {
+        let (buffer, offset) = operand(w, d, DType::U8, m * row_bytes)?;
+        use objc2_metal::MTLBuffer as _;
+        addresses.push(buffer.as_ref().gpuAddress() + offset as u64);
+    }
+    let mut groups = Vec::with_capacity(2 * rows.len());
+    let mut flat = Vec::with_capacity(total);
+    for r in rows {
+        groups.extend([flat.len() as u32, r.len() as u32]);
+        flat.extend_from_slice(r);
+    }
+    let longest = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let pointers = d.new_buffer_with_data(&addresses)?;
+    let groups = d.new_buffer_with_data(&groups)?;
+    let flat = d.new_buffer_with_data(&flat)?;
+    let out = private(d, (total, m), DType::F32)?;
+    let y = operand(&out, d, DType::F32, total * m)?;
+    let a = Args {
+        k: k as u32,
+        m: m as u32,
+        n: total as u32,
+        row_bytes: row_bytes as u32,
+        mode: 0,
+        expert: 0,
+        kind: 0,
+        stride: 0,
+    };
+    let e = d.command_encoder()?;
+    let e = e.as_ref();
+    e.set_compute_pipeline_state(&p.experts[index]);
+    e.set_input_buffer(0, Some(&*pointers), 0);
+    e.set_input_buffer(1, Some(&x.0), x.1);
+    e.set_output_buffer(2, Some(&y.0), y.1);
+    e.set_input_buffer(3, Some(&*flat), 0);
+    e.set_bytes(4, &a);
+    e.set_input_buffer(5, Some(&*groups), 0);
+    e.dispatch_thread_groups(
+        MTLSize {
+            width: m.div_ceil(64),
+            height: longest.div_ceil(32),
+            depth: weights.len(),
+        },
+        MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(Some(out))
+}
+/// `DINF_DEEPSEEK41_PACKED_PREFILL_MM=0` keeps the Coder's row kernels.
+fn packed_requested() -> bool {
+    static REQUESTED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("DINF_DEEPSEEK41_PACKED_PREFILL_MM").is_none_or(|v| v != "0")
+    });
+    #[cfg(test)]
+    if PACKED_TEST_DISABLED.with(|v| v.get()) {
+        return false;
+    }
+    *REQUESTED
+}
+#[cfg(test)]
+thread_local! {
+    static PACKED_TEST_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Test-only: run `f` with the Coder's row kernels instead of tiled matmuls.
+#[cfg(test)]
+pub(crate) fn with_packed_disabled<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PACKED_TEST_DISABLED.with(|v| v.set(self.0));
+        }
+    }
+    let _restore = Restore(PACKED_TEST_DISABLED.with(|v| v.replace(true)));
+    f()
 }
 pub(crate) struct Routes {
     compact: Tensor,

@@ -207,3 +207,143 @@ kernel void dinf_prefill_combine(device const float *down [[buffer(0)]],
     }
     output[id.y*5120+id.x]=sum;
 }
+
+// Packed V4.1 Coder prompt projections. Same 64x32 tile, K32 steps, half
+// operands and F32 accumulators as dinf_prefill_mm. Every output element sums
+// K in one fixed order for any row count or expert grouping, so a prompt gives
+// identical rows however it is chunked.
+struct dinf_expert_ptr { device const uchar *w; };
+struct dinf_expert_group { uint offset, count; };
+template<typename block_q, short nl,
+    void (*dequantize)(device const block_q *, short, thread half4x4 &), bool INDEXED>
+inline void dinf_packed_tile(device const uchar *weights, device const float *input,
+    device float *output, device const uint *rows, constant dinf_mm_args &a,
+    uint offset, uint count, uint r0, uint r1, ushort tid, ushort sg,
+    threadgroup half *sa, threadgroup half *sb, threadgroup float *result) {
+    if(r0>=a.m || r1>=count) return;
+    const uint nr0 = min(64u,a.m-r0), nr1 = min(32u,count-r1);
+    const uint lr0 = min(uint(tid)/2,nr0-1), il0 = tid%2;
+    const uint lr1 = min(uint(tid)/4,nr1-1), iy = 8*(tid%4);
+    const uint source = INDEXED ? rows[offset+r1+lr1] : r1+lr1;
+    device const block_q *w=(device const block_q *)(weights+size_t(r0+lr0)*a.row_bytes);
+#ifdef DINF_PREFILL_TENSOR
+    auto tA=tensor<threadgroup half,dextents<int32_t,2>,tensor_inline>(sa,dextents<int32_t,2>(32,64));
+    auto tB0=tensor<threadgroup half,dextents<int32_t,2>,tensor_inline>(sb,dextents<int32_t,2>(32,16));
+    auto tB1=tensor<threadgroup half,dextents<int32_t,2>,tensor_inline>(sb+16*32,dextents<int32_t,2>(32,16));
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(16,64,32,false,true,false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+    auto cT0=mm.get_destination_cooperative_tensor<decltype(tA),decltype(tB0),float>();
+    auto cT1=mm.get_destination_cooperative_tensor<decltype(tA),decltype(tB1),float>();
+#else
+    simdgroup_half8x8 ma[4], mb[2];
+    simdgroup_float8x8 mc[8];
+    for (ushort i=0;i<8;++i) mc[i]=make_filled_simdgroup_matrix<float,8>(0.0f);
+#endif
+    for (uint kk=0;kk<a.k;kk+=32) {
+        half4x4 decoded;
+        const uint k16=(kk+16*il0)/16;
+        dequantize(w+k16/uint(nl),short(k16%uint(nl)),decoded);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (ushort i=0;i<16;++i) {
+#ifdef DINF_PREFILL_TENSOR
+            sa[(tid/2)*32+16*il0+i]=decoded[i/4][i%4];
+#else
+            const ushort sx=2*il0+i/8, sy=(tid/2)/8, lx=(tid/2)%8, ly=i%8;
+            sa[64*(8*sx+sy)+8*ly+lx]=decoded[i/4][i%4];
+#endif
+        }
+        for (ushort i=0;i<8;++i) {
+            const ushort sx=tid%4, sy=(tid/4)/8, ly=(tid/4)%8;
+#ifdef DINF_PREFILL_TENSOR
+            sb[(tid/4)*32+iy+i]=half(input[size_t(source)*a.k+kk+iy+i]);
+#else
+            sb[64*(4*sx+sy)+8*ly+i]=half(input[size_t(source)*a.k+kk+iy+i]);
+#endif
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#ifdef DINF_PREFILL_TENSOR
+        auto sA=tA.slice(0,0);
+        auto sB0=tB0.slice(0,0);
+        mm.run(sB0,sA,cT0);
+        if(nr1>16) {
+            auto sB1=tB1.slice(0,0);
+            mm.run(sB1,sA,cT1);
+        }
+#else
+        threadgroup const half *la=sa+4*64*(sg%2), *lb=sb+2*64*(sg/2);
+        for (ushort ik=0;ik<4;++ik) {
+            for (ushort i=0;i<4;++i) simdgroup_load(ma[i],la+64*i,8,0,false);
+            for (ushort i=0;i<2;++i) simdgroup_load(mb[i],lb+64*i,8,0,false);
+            for (ushort i=0;i<8;++i) simdgroup_multiply_accumulate(mc[i],mb[i/4],ma[i%4],mc[i]);
+            la+=8*64; lb+=4*64;
+        }
+#endif
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+#ifdef DINF_PREFILL_TENSOR
+    auto tC0=tensor<threadgroup float,dextents<int32_t,2>,tensor_inline>(result,dextents<int32_t,2>(64,16));
+    cT0.store(tC0);
+    if(nr1>16) {
+        auto tC1=tensor<threadgroup float,dextents<int32_t,2>,tensor_inline>(result+16*64,dextents<int32_t,2>(64,16));
+        cT1.store(tC1);
+    }
+#else
+    threadgroup float *dest=result+32*(sg&1)+16*(sg>>1)*64;
+    for (ushort i=0;i<8;++i) simdgroup_store(mc[i],dest+8*(i%4)+8*64*(i/4),64,0,false);
+#endif
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i=tid;i<nr1*64;i+=128) {
+        const uint j=i/64,col=i%64;
+        if (col>=nr0) continue;
+        output[size_t(offset+r1+j)*a.m+r0+col]=result[j*64+col];
+    }
+}
+template<typename block_q, short nl,
+    void (*dequantize)(device const block_q *, short, thread half4x4 &)>
+kernel void dinf_prefill_dense_mm(device const uchar *weights [[buffer(0)]],
+    device const float *input [[buffer(1)]], device float *output [[buffer(2)]],
+    constant dinf_mm_args &a [[buffer(4)]],
+    uint3 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half sa[2048];
+    threadgroup half sb[1024];
+    threadgroup float result[2048];
+    dinf_packed_tile<block_q, nl, dequantize, false>(weights, input, output, nullptr, a,
+        0, a.n, group.x*64, group.y*32, tid, sg, sa, sb, result);
+}
+// grid.z selects one expert: its weight address, input rows and output rows.
+template<typename block_q, short nl,
+    void (*dequantize)(device const block_q *, short, thread half4x4 &)>
+kernel void dinf_prefill_experts_mm(device const dinf_expert_ptr *ptrs [[buffer(0)]],
+    device const float *input [[buffer(1)]], device float *output [[buffer(2)]],
+    device const uint *rows [[buffer(3)]], constant dinf_mm_args &a [[buffer(4)]],
+    device const dinf_expert_group *groups [[buffer(5)]],
+    uint3 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half sa[2048];
+    threadgroup half sb[1024];
+    threadgroup float result[2048];
+    const dinf_expert_group g = groups[group.z];
+    dinf_packed_tile<block_q, nl, dequantize, true>(ptrs[group.z].w, input, output, rows, a,
+        g.offset, g.count, group.x*64, group.y*32, tid, sg, sa, sb, result);
+}
+typedef decltype(dinf_prefill_dense_mm<block_q5_K, 16, dequantize_q5_K>) dinf_prefill_dense_fn;
+typedef decltype(dinf_prefill_experts_mm<block_q5_K, 16, dequantize_q5_K>) dinf_prefill_experts_fn;
+template [[host_name("dinf_prefill_q5k_dense")]] kernel dinf_prefill_dense_fn
+    dinf_prefill_dense_mm<block_q5_K, 16, dequantize_q5_K>;
+template [[host_name("dinf_prefill_q5k_experts")]] kernel dinf_prefill_experts_fn
+    dinf_prefill_experts_mm<block_q5_K, 16, dequantize_q5_K>;
+template [[host_name("dinf_prefill_iq1m_dense")]] kernel dinf_prefill_dense_fn
+    dinf_prefill_dense_mm<block_iq1_m, 16, dequantize_iq1_m>;
+template [[host_name("dinf_prefill_iq1m_experts")]] kernel dinf_prefill_experts_fn
+    dinf_prefill_experts_mm<block_iq1_m, 16, dequantize_iq1_m>;
+template [[host_name("dinf_prefill_iq2xxs_dense")]] kernel dinf_prefill_dense_fn
+    dinf_prefill_dense_mm<block_iq2_xxs, 16, dequantize_iq2_xxs>;
+template [[host_name("dinf_prefill_iq2xxs_experts")]] kernel dinf_prefill_experts_fn
+    dinf_prefill_experts_mm<block_iq2_xxs, 16, dequantize_iq2_xxs>;
+template [[host_name("dinf_prefill_iq2xs_dense")]] kernel dinf_prefill_dense_fn
+    dinf_prefill_dense_mm<block_iq2_xs, 16, dequantize_iq2_xs>;
+template [[host_name("dinf_prefill_iq2xs_experts")]] kernel dinf_prefill_experts_fn
+    dinf_prefill_experts_mm<block_iq2_xs, 16, dequantize_iq2_xs>;

@@ -72,6 +72,15 @@ impl Prefix<'_> {
 /// private-copy path preserves their values/layout without another pool loan.
 /// CPU oracle tensors and already-bounded Metal buffers need no copy.
 pub(crate) fn retain_bounded(tensor: Tensor) -> Result<Tensor> {
+    if RELAXED_TILE_RETENTION.with(|v| v.get()) {
+        return Ok(tensor);
+    }
+    retain_cached(tensor)
+}
+
+/// Strict form of `retain_bounded` for tensors stored in the session cache,
+/// which outlive the tile and are charged by the cache ledger.
+pub(crate) fn retain_cached(tensor: Tensor) -> Result<Tensor> {
     #[cfg(target_os = "macos")]
     if tensor.device().is_metal()
         && super::super::state_storage_bytes(&tensor)?
@@ -80,6 +89,30 @@ pub(crate) fn retain_bounded(tensor: Tensor) -> Result<Tensor> {
         return super::super::copy_persistent_tensor(&tensor);
     }
     Ok(tensor)
+}
+
+thread_local! {
+    static RELAXED_TILE_RETENTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Within this scope `retain_bounded` keeps tile transients in their pooled
+/// buffers instead of copying oversized ones. The Coder's tiled prompt path
+/// uses it: a tile retains at most a few hundred KiB per row, so pool
+/// rounding costs tens of MiB against the 1.5 GiB request reserve, while the
+/// copies cost a dispatch each. Session-cache tensors use `retain_cached`.
+pub(crate) struct RelaxedTileRetention(bool, std::marker::PhantomData<std::rc::Rc<()>>);
+impl RelaxedTileRetention {
+    pub(crate) fn enter(enabled: bool) -> Self {
+        Self(
+            RELAXED_TILE_RETENTION.with(|v| v.replace(enabled)),
+            std::marker::PhantomData,
+        )
+    }
+}
+impl Drop for RelaxedTileRetention {
+    fn drop(&mut self) {
+        RELAXED_TILE_RETENTION.with(|v| v.set(self.0));
+    }
 }
 
 /// Candidate sources cannot hide an arbitrarily oversized pool loan behind an
@@ -236,10 +269,10 @@ impl Rows {
             "Maya cache append requires one F32 row"
         );
         if self.len.is_multiple_of(self.page_rows) {
-            self.chunks.push(retain_bounded(row)?);
+            self.chunks.push(retain_cached(row)?);
         } else {
             let last = self.chunks.last_mut().expect("nonempty chunk");
-            *last = retain_bounded(Tensor::cat(&[&*last, &row], 0)?)?;
+            *last = retain_cached(Tensor::cat(&[&*last, &row], 0)?)?;
         }
         self.len += 1;
         Ok(())
@@ -279,14 +312,14 @@ impl Rows {
             let joined = join_rows(&previous, &rows.narrow(0, 0, take)?, pins)?;
             pins.push(joined.clone());
             require_bounded_loan(&joined)?;
-            let replacement = retain_bounded(joined)?;
+            let replacement = retain_cached(joined)?;
             pins.push(replacement.clone());
             *chunks.last_mut().unwrap() = replacement;
             offset = take;
         }
         while offset < count {
             let take = (count - offset).min(self.page_rows);
-            let page = retain_bounded(rows.narrow(0, offset, take)?)?;
+            let page = retain_cached(rows.narrow(0, offset, take)?)?;
             pins.push(page.clone());
             chunks.push(page);
             offset += take;
@@ -408,7 +441,7 @@ impl DeepSeek41Cache {
                 Tensor::cat(&[&retained, &row], 0)?
             }
         };
-        self.raw[layer] = Some(retain_bounded(next)?);
+        self.raw[layer] = Some(retain_cached(next)?);
         Ok(self.raw[layer].as_ref().unwrap())
     }
 

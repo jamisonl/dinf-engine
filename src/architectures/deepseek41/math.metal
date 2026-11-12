@@ -13,6 +13,8 @@ struct Args {
     uint width, rows, mode, position, inverse, round_all;
     float eps;
     float frequencies[32];
+    // RoPE only: row r uses position + (r / rows_per_position) * position_step.
+    uint rows_per_position, position_step;
 };
 
 static inline float bf16(float x) {
@@ -141,7 +143,9 @@ kernel void v41_rope(
     const ulong offset = ulong(row) * args.width;
     for (uint i = lane; i < args.width - 64u; i += 32u)
         y[offset + i] = args.round_all ? bf16(a[offset + i]) : a[offset + i];
-    const float theta = float(args.position) * args.frequencies[lane];
+    const uint position = args.position +
+        (args.rows_per_position ? row / args.rows_per_position : 0u) * args.position_step;
+    const float theta = float(position) * args.frequencies[lane];
     const float co = precise::cos(theta);
     const float si = args.inverse ? -precise::sin(theta) : precise::sin(theta);
     const ulong i = offset + args.width - 64u + 2u * lane;
@@ -157,8 +161,12 @@ kernel void v41_hc_split(
         device const float *base [[buffer(2)]],
         device float *y [[buffer(3)]],
         constant Args &args [[buffer(4)]],
+        uint group [[threadgroup_position_in_grid]],
         uint lane [[thread_index_in_simdgroup]]) {
     if (lane != 0u) return;
+    // One row per threadgroup; a single-row call keeps the original offsets.
+    mix += 24u * group;
+    y += 24u * group;
     constexpr float eps = 1.0e-6f;
     for (uint i = 0; i < 4; ++i) {
         const float pre_z = fma(mix[i], scale[0], base[i]);
@@ -201,12 +209,16 @@ kernel void v41_collapse(
         device const float *c [[buffer(2)]],
         device float *y [[buffer(3)]],
         constant Args &args [[buffer(4)]],
-        uint i [[thread_position_in_grid]]) {
-    if (i >= args.width) return;
+        uint gid [[thread_position_in_grid]]) {
+    // Rows of [4,width] residuals; mode is the pre stride (0 means 4).
+    if (gid >= args.width * args.rows) return;
+    const uint row = gid / args.width, i = gid % args.width;
+    const uint stride = args.mode ? args.mode : 4u;
+    device const float *r = residual + ulong(row) * 4u * args.width;
     float sum = 0.0f;
     for (uint stream = 0; stream < 4; ++stream)
-        sum = fma(residual[stream * args.width + i], pre[stream], sum);
-    y[i] = bf16(sum);
+        sum = fma(r[stream * args.width + i], pre[row * stride + stream], sum);
+    y[gid] = bf16(sum);
 }
 
 kernel void v41_expand(
@@ -215,14 +227,37 @@ kernel void v41_expand(
         device const float *split [[buffer(2)]],
         device float *y [[buffer(3)]],
         constant Args &args [[buffer(4)]],
-        uint i [[thread_position_in_grid]]) {
-    if (i >= args.width) return;
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.width * args.rows) return;
+    const uint row = gid / args.width, i = gid % args.width;
+    const ulong r = ulong(row) * 4u * args.width;
+    device const float *sp = split + 24u * row;
     for (uint dest = 0; dest < 4; ++dest) {
-        float sum = block[i] * split[4 + dest];
+        float sum = block[ulong(row) * args.width + i] * sp[4 + dest];
         // Split's contiguous rows are source streams (GGML ne0=destination).
         for (uint src = 0; src < 4; ++src)
-            sum = fma(split[8 + 4 * src + dest], residual[src * args.width + i], sum);
-        y[dest * args.width + i] = bf16(sum);
+            sum = fma(sp[8 + 4 * src + dest], residual[r + src * args.width + i], sum);
+        y[r + dest * args.width + i] = bf16(sum);
+    }
+}
+
+// HC mix for rows of normalized [4*width] residuals: y[row, o] = a[row] . fc[o].
+kernel void v41_hc_mix(
+        device const float *a [[buffer(0)]],
+        device const float *fc [[buffer(1)]],
+        device const float *c [[buffer(2)]],
+        device float *y [[buffer(3)]],
+        constant Args &args [[buffer(4)]],
+        uint row [[threadgroup_position_in_grid]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const ulong offset = ulong(row) * args.width;
+    for (uint o = sg; o < 24u; o += 8u) {
+        float sum = 0.0f;
+        for (uint i = lane; i < args.width; i += 32u)
+            sum = fma(a[offset + i], fc[ulong(o) * args.width + i], sum);
+        sum = simd_sum(sum);
+        if (lane == 0) y[24u * row + o] = sum;
     }
 }
 
@@ -232,15 +267,18 @@ kernel void v41_engram(
         device const float *weight [[buffer(2)]],
         device float *y [[buffer(3)]],
         constant Args &args [[buffer(4)]],
-        uint stream [[threadgroup_position_in_grid]],
+        uint group [[threadgroup_position_in_grid]],
         uint lane [[thread_index_in_simdgroup]]) {
-    const ulong offset = ulong(stream) * args.width;
+    // Groups are (row, stream) for rows of [4,width] residuals and [5,width] kv.
+    const uint row = group / 4u, stream = group % 4u;
+    const ulong offset = ulong(group) * args.width;
+    kv += ulong(row) * 5u * args.width;
     float h2 = 0.0f, k2 = 0.0f, dot = 0.0f;
     for (uint i = lane; i < args.width; i += 32u) {
-        const float h = residual[offset + i], k = bf16(kv[offset + i]);
+        const float h = residual[offset + i], k = bf16(kv[stream * args.width + i]);
         h2 += h * h;
         k2 += k * k;
-        dot += (h * weight[offset + i]) * k;
+        dot += (h * weight[stream * args.width + i]) * k;
     }
     h2 = simd_sum(h2);
     k2 = simd_sum(k2);

@@ -217,6 +217,40 @@ impl Rope {
         op.args.frequencies = self.frequencies;
         op.apply(x, x, x)
     }
+
+    /// `apply` for a tile: row `r` of `x` uses position
+    /// `first + (r / rows_per_position) * step`, with the same bits a
+    /// single-position call gives for that row.
+    pub fn apply_rows(
+        &self,
+        x: &Tensor,
+        first: u32,
+        rows_per_position: usize,
+        step: u32,
+        inverse: bool,
+        round_all: bool,
+    ) -> Result<Tensor> {
+        let (rows, width) = rows_width(x)?;
+        let last = (rows.saturating_sub(1) / rows_per_position.max(1)) as u64 * u64::from(step)
+            + u64::from(first);
+        if !matches!(width, 128 | 512)
+            || rows_per_position == 0
+            || !rows.is_multiple_of(rows_per_position)
+            || last >= 1_048_576
+        {
+            candle_core::bail!(
+                "Maya-XS tile RoPE requires width 128/512, whole positions and positions < 1048576"
+            );
+        }
+        let mut op = Op::new(Kind::Rope, width, rows, x.shape().clone());
+        op.args.position = first;
+        op.args.inverse = u32::from(inverse);
+        op.args.round_all = u32::from(round_all);
+        op.args.frequencies = self.frequencies;
+        op.args.rows_per_position = rows_per_position as u32;
+        op.args.position_step = step;
+        op.apply(x, x, x)
+    }
 }
 
 /// Current sublayer gates. Keep pre for the *next* sublayer; collapse must use
@@ -319,7 +353,7 @@ pub fn hc_expand(block: &Tensor, residual: &Tensor, current: &HcSplit) -> Result
     shape(block, &[width])?;
     same_device(residual, block)?;
     same_device(residual, &current.packed)?;
-    Op::new(Kind::Expand, width, 4, residual.shape().clone()).apply(
+    Op::new(Kind::Expand, width, 1, residual.shape().clone()).apply(
         block,
         residual,
         &current.packed,
@@ -353,6 +387,91 @@ pub fn engram_add(
     let mut op = Op::new(Kind::Engram, width, 4, residual.shape().clone());
     op.args.eps = epsilon;
     op.apply(residual, projected_kv, &weight)
+}
+
+/// Tile HC split: residuals `[T,4,width]` to packed splits `[T,24]` (pre,
+/// post, comb per row, as `HcSplit::backing`). Each row uses the same RMS and
+/// split arithmetic as `hc_split`; the 24-way mix is one fixed-order dot per
+/// output, independent of the row count.
+pub fn hc_split_rows(
+    residual: &Tensor,
+    fc: &Tensor,
+    scale: &Tensor,
+    base: &Tensor,
+) -> Result<Tensor> {
+    let (rows, streams, width) = residual.dims3()?;
+    checked(residual)?;
+    if streams != 4 || rows == 0 {
+        candle_core::bail!("HC tile requires rows of four residual streams");
+    }
+    shape(fc, &[24, 4 * width])?;
+    shape(scale, &[3])?;
+    shape(base, &[24])?;
+    for x in [fc, scale, base] {
+        same_device(residual, x)?;
+    }
+    let flat = residual.reshape((rows, 4 * width))?;
+    let mut norm = Op::new(Kind::Rms, 4 * width, rows, flat.shape().clone());
+    norm.args.eps = RMS_EPS;
+    let normalized = norm.apply(&flat, &flat, &flat)?;
+    let mix = Op::new(Kind::HcMix, 4 * width, rows, Shape::from((rows, 24))).apply(
+        &normalized,
+        fc,
+        fc,
+    )?;
+    Op::new(Kind::HcSplit, 24, rows, Shape::from((rows, 24))).apply(&mix, scale, base)
+}
+
+/// Tile collapse: residuals `[T,4,width]` with each row's pre gates taken
+/// from `pre` at row stride `stride` (4 for `[T,4]`, 24 for packed splits).
+pub fn hc_collapse_rows(residual: &Tensor, pre: &Tensor, stride: usize) -> Result<Tensor> {
+    let (rows, streams, width) = residual.dims3()?;
+    checked(residual)?;
+    if streams != 4 || !(stride == 4 || stride == 24) || pre.elem_count() != rows * stride {
+        candle_core::bail!("HC tile collapse geometry");
+    }
+    same_device(residual, pre)?;
+    let mut op = Op::new(Kind::Collapse, width, rows, Shape::from((rows, width)));
+    op.args.mode = stride as u32;
+    op.apply(residual, pre, residual)
+}
+
+/// Tile expand: blocks `[T,width]` into residuals `[T,4,width]` with packed
+/// splits `[T,24]`, row by row as `hc_expand`.
+pub fn hc_expand_rows(block: &Tensor, residual: &Tensor, splits: &Tensor) -> Result<Tensor> {
+    let (rows, streams, width) = residual.dims3()?;
+    checked(residual)?;
+    if streams != 4 {
+        candle_core::bail!("HC tile requires four residual streams");
+    }
+    shape(block, &[rows, width])?;
+    shape(splits, &[rows, 24])?;
+    same_device(residual, block)?;
+    same_device(residual, splits)?;
+    Op::new(Kind::Expand, width, rows, residual.shape().clone()).apply(block, residual, splits)
+}
+
+/// Tile Engram gate: residuals `[T,4,width]`, projected kv `[T,5,width]`,
+/// `weight = qnorm * knorm` `[4,width]`, row by row as `engram_add`.
+pub fn engram_add_rows(
+    residual: &Tensor,
+    projected_kv: &Tensor,
+    weight: &Tensor,
+    epsilon: f32,
+) -> Result<Tensor> {
+    let (rows, streams, width) = residual.dims3()?;
+    checked(residual)?;
+    if streams != 4 {
+        candle_core::bail!("Engram tile requires four residual streams");
+    }
+    shape(projected_kv, &[rows, 5, width])?;
+    shape(weight, &[4, width])?;
+    same_device(residual, projected_kv)?;
+    same_device(residual, weight)?;
+    validate_epsilon(epsilon)?;
+    let mut op = Op::new(Kind::Engram, width, 4 * rows, residual.shape().clone());
+    op.args.eps = epsilon;
+    op.apply(residual, projected_kv, weight)
 }
 
 /// Six selected expert IDs and unbiased, normalized routing weights.
@@ -508,6 +627,7 @@ fn quant_scale(amax: f32, mode: u32) -> f32 {
 
 #[derive(Clone, Copy)]
 enum Kind {
+    HcMix,
     Bf16,
     Rms,
     Quantize,
@@ -529,6 +649,8 @@ struct Args {
     round_all: u32,
     eps: f32,
     frequencies: [f32; 32],
+    rows_per_position: u32,
+    position_step: u32,
 }
 
 struct Op {
@@ -550,6 +672,8 @@ impl Op {
                 round_all: 0,
                 eps: 0.0,
                 frequencies: [0.0; 32],
+                rows_per_position: 0,
+                position_step: 0,
             },
             output,
         }
@@ -643,8 +767,13 @@ impl CustomOp3 for Op {
                     }
                 }
                 for row in 0..rows {
+                    let position = self.args.position
+                        + (row as u32)
+                            .checked_div(self.args.rows_per_position)
+                            .unwrap_or(0)
+                            * self.args.position_step;
                     for pair in 0..32 {
-                        let theta = self.args.position as f32 * self.args.frequencies[pair];
+                        let theta = position as f32 * self.args.frequencies[pair];
                         let cos = theta.cos();
                         let sin = if self.args.inverse != 0 {
                             -theta.sin()
@@ -660,37 +789,65 @@ impl CustomOp3 for Op {
                     }
                 }
             }
-            Kind::HcSplit => hc_split_scalar(a, b, c, &mut y),
-            Kind::Collapse => {
-                for i in 0..width {
-                    let mut sum = 0.0;
-                    for stream in 0..4 {
-                        sum = a[stream * width + i].mul_add(b[stream], sum);
+            Kind::HcSplit => {
+                for row in 0..rows {
+                    hc_split_scalar(&a[24 * row..], b, c, &mut y[24 * row..24 * row + 24]);
+                }
+            }
+            Kind::HcMix => {
+                for row in 0..rows {
+                    for o in 0..24 {
+                        let mut sum = 0.0f32;
+                        for i in 0..width {
+                            sum = a[row * width + i].mul_add(b[o * width + i], sum);
+                        }
+                        y[24 * row + o] = sum;
                     }
-                    y[i] = bf16_scalar(sum);
+                }
+            }
+            Kind::Collapse => {
+                let stride = if self.args.mode == 0 {
+                    4
+                } else {
+                    self.args.mode as usize
+                };
+                for row in 0..rows {
+                    let r = &a[row * 4 * width..];
+                    for i in 0..width {
+                        let mut sum = 0.0;
+                        for stream in 0..4 {
+                            sum = r[stream * width + i].mul_add(b[row * stride + stream], sum);
+                        }
+                        y[row * width + i] = bf16_scalar(sum);
+                    }
                 }
             }
             Kind::Expand => {
-                for dest in 0..4 {
-                    for i in 0..width {
-                        let mut sum = a[i] * c[4 + dest];
-                        for src in 0..4 {
-                            sum = c[8 + src * 4 + dest].mul_add(b[src * width + i], sum);
+                for row in 0..rows {
+                    let (r, sp) = (row * 4 * width, &c[24 * row..]);
+                    for dest in 0..4 {
+                        for i in 0..width {
+                            let mut sum = a[row * width + i] * sp[4 + dest];
+                            for src in 0..4 {
+                                sum = sp[8 + src * 4 + dest].mul_add(b[r + src * width + i], sum);
+                            }
+                            y[r + dest * width + i] = bf16_scalar(sum);
                         }
-                        y[dest * width + i] = bf16_scalar(sum);
                     }
                 }
             }
             Kind::Engram => {
-                for stream in 0..4 {
-                    let offset = stream * width;
+                for group in 0..rows {
+                    let (row, stream) = (group / 4, group % 4);
+                    let offset = group * width;
+                    let b = &b[row * 5 * width..];
                     let (mut h2, mut k2, mut dot) = (0.0, 0.0, 0.0);
                     for i in 0..width {
                         let h = a[offset + i];
-                        let k = bf16_scalar(b[offset + i]);
+                        let k = bf16_scalar(b[stream * width + i]);
                         h2 += h * h;
                         k2 += k * k;
-                        dot += (h * c[offset + i]) * k;
+                        dot += (h * c[stream * width + i]) * k;
                     }
                     dot = dot
                         * (1.0 / (h2 / width as f32 + self.args.eps).sqrt())
@@ -856,6 +1013,7 @@ mod metal {
             Kind::Collapse => "v41_collapse",
             Kind::Expand => "v41_expand",
             Kind::Engram => "v41_engram",
+            Kind::HcMix => "v41_hc_mix",
         };
         let pipeline = pipeline(device, name)?;
         if pipeline.as_ref().threadExecutionWidth() != 32
@@ -893,16 +1051,15 @@ mod metal {
         let width = op.args.width as usize;
         let rows = op.args.rows as usize;
         let groups = match op.kind {
-            Kind::Rms | Kind::Rope | Kind::Engram => rows,
+            Kind::Rms | Kind::Rope | Kind::Engram | Kind::HcSplit | Kind::HcMix => rows,
             Kind::Quantize => rows * width.div_ceil(if op.args.mode == 3 { 16 } else { 32 }),
-            Kind::HcSplit => 1,
-            Kind::Expand => width.div_ceil(32),
+            Kind::Expand => (rows * width).div_ceil(32),
             _ => elements.div_ceil(32),
         };
-        let threads = if matches!(op.kind, Kind::Rms) {
-            super::rms_threads(width)
-        } else {
-            32
+        let threads = match op.kind {
+            Kind::Rms => super::rms_threads(width),
+            Kind::HcMix => 256,
+            _ => 32,
         };
         if threads > pipeline.max_total_threads_per_threadgroup() {
             candle_core::bail!("V4.1 RMS pipeline cannot support source thread count {threads}");

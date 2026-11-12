@@ -1454,9 +1454,9 @@ fn native_tile_cpu_router_row_order_exact_top6_and_union_dedup() -> Result<()> {
     );
     assert!(
         tile_routes(
-            &vec![0.; (profile::MAX_PREFILL_TILE + 1) * 384],
+            &vec![0.; (CODER_TILE_ROWS + 1) * 384],
             &bias,
-            profile::MAX_PREFILL_TILE + 1
+            CODER_TILE_ROWS + 1
         )
         .is_err()
     );

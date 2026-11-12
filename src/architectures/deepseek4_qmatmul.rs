@@ -233,7 +233,7 @@ impl DeepSeek4QMatMul {
                 | DeepSeek4DType::IQ2XXS
                 | DeepSeek4DType::IQ2XS
         ) {
-            self.forward_decode_rows(input)
+            self.forward_prefill_rows(input)
         } else {
             self.forward(input)
         }
@@ -289,7 +289,7 @@ impl DeepSeek4QMatMul {
                 | DeepSeek4DType::IQ2XXS
                 | DeepSeek4DType::IQ2XS
         ) {
-            self.forward_decode_rows(input)
+            self.forward_prefill_rows(input)
         } else {
             self.forward(input)
         }
@@ -309,6 +309,111 @@ impl DeepSeek4QMatMul {
             self.in_dim,
             self.out_dim,
         )?)
+    }
+
+    /// Project prompt rows of a packed Coder format. On qualified Metal 4
+    /// devices this is one tiled matmul whose rows do not depend on the batch
+    /// size; elsewhere, or for other formats, it keeps the decode-row kernels.
+    pub(crate) fn forward_prefill_rows(&self, input: &Tensor) -> Result<Tensor> {
+        #[cfg(target_os = "macos")]
+        if let Some(output) = prefill_mm::dense_packed(
+            self.weights.bytes(),
+            input,
+            self.dtype(),
+            self.in_dim,
+            self.out_dim,
+        )? {
+            return Ok(output);
+        }
+        self.forward_decode_rows(input)
+    }
+
+    /// Project several packed experts' prompt rows in one dispatch: matrix
+    /// `g` multiplies the `input` rows listed in `rows[g]`, and output rows are
+    /// the groups' rows in order. Each row matches `forward_prefill_rows`.
+    /// Returns `None` when the matrices differ in format or shape, or the
+    /// tiled path is unavailable; nothing is enqueued then.
+    pub(crate) fn forward_experts_prefill(
+        matrices: &[&Self],
+        rows: &[Vec<u32>],
+        input: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        let Some(first) = matrices.first() else {
+            return Ok(None);
+        };
+        if matrices.iter().any(|m| {
+            m.dtype() != first.dtype() || m.in_dim != first.in_dim || m.out_dim != first.out_dim
+        }) {
+            return Ok(None);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let weights = matrices
+                .iter()
+                .map(|m| m.weights.bytes())
+                .collect::<Vec<_>>();
+            prefill_mm::experts_packed(
+                &weights,
+                rows,
+                input,
+                first.dtype(),
+                first.in_dim,
+                first.out_dim,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (rows, input);
+            Ok(None)
+        }
+    }
+
+    /// Grouped prompt projection for packed formats: `input` is
+    /// `[tokens * groups, in_dim]` where row `t * groups + g` feeds group `g`,
+    /// which owns `out_dim / groups` consecutive weight rows. Returns
+    /// `[tokens, out_dim]`, each row matching `forward_grouped_packed` up to
+    /// the tiled kernel's half operands. `None` when unavailable.
+    pub(crate) fn forward_grouped_prefill(
+        &self,
+        input: &Tensor,
+        groups: usize,
+        tokens: usize,
+    ) -> Result<Option<Tensor>> {
+        if self.v41_q8
+            || groups == 0
+            || tokens == 0
+            || !self.out_dim.is_multiple_of(groups)
+            || input.dims() != [tokens * groups, self.in_dim]
+        {
+            return Ok(None);
+        }
+        let rows = self.out_dim / groups;
+        let matrices = (0..groups)
+            .map(|g| -> Result<Self> {
+                Ok(Self {
+                    weights: Arc::new(self.weights.slice_rows(g * rows, rows)?),
+                    dense_weights: None,
+                    out_dim: rows,
+                    in_dim: self.in_dim,
+                    v41_q8: false,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let lists = (0..groups)
+            .map(|g| (0..tokens).map(|t| (t * groups + g) as u32).collect())
+            .collect::<Vec<_>>();
+        let refs = matrices.iter().collect::<Vec<_>>();
+        let Some(output) = Self::forward_experts_prefill(&refs, &lists, input)? else {
+            return Ok(None);
+        };
+        // Group-major [groups, tokens, rows] to [tokens, groups * rows].
+        Ok(Some(
+            output
+                .reshape((groups, tokens, rows))?
+                .transpose(0, 1)?
+                .contiguous()?
+                .reshape((tokens, self.out_dim))?,
+        ))
     }
 
     /// Project independent decode rows with the single-token reduction order.
@@ -502,9 +607,24 @@ impl DeepSeek4QMatMul {
                 Some(weight) => weight.clone(),
                 None => dense_f32(&self.weights, input.device())?,
             };
+            if decode_rows && input.elem_count() > self.in_dim && input.device().is_metal() {
+                // Router scores choose experts. Keep their single-row
+                // reduction order even when packed projections batch on the
+                // GPU: a batch of one-row products against a stride-0
+                // broadcast weight runs the same GEMV per row in one dispatch.
+                let rows = input.elem_count() / self.in_dim;
+                let flat = input.reshape((rows, 1, self.in_dim))?;
+                let weight =
+                    weight
+                        .t()?
+                        .unsqueeze(0)?
+                        .broadcast_as((rows, self.in_dim, self.out_dim))?;
+                let mut shape = input.dims().to_vec();
+                *shape.last_mut().unwrap() = self.out_dim;
+                return Ok(flat.matmul(&weight)?.reshape(shape)?);
+            }
             if decode_rows && input.elem_count() > self.in_dim {
-                // Router scores choose experts. Keep their scalar reduction
-                // order even when packed shared projections batch on the GPU.
+                // CPU's batched GEMM does not keep single-row bits; stay per row.
                 let rows = input.elem_count() / self.in_dim;
                 let flat = input.reshape((rows, self.in_dim))?;
                 let outputs = (0..rows)

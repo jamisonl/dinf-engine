@@ -462,3 +462,138 @@ fn native_llama_prefill_components_portable() -> Result<()> {
     let _restore = Restore(PORTABLE_TEST.with(|v| v.replace(true)));
     native_llama_prefill_components()
 }
+
+/// Synthetic packed matrix whose half scales are finite: each format's scale
+/// field is overwritten with a small constant after random filling.
+fn packed_fixture(
+    device: &Device,
+    dtype: DeepSeek4DType,
+    out: usize,
+    k: usize,
+    seed: u64,
+) -> Result<DeepSeek4QMatMul> {
+    let (block, scale_fixup): (usize, fn(&mut [u8])) = match dtype {
+        DeepSeek4DType::Q5K => (176, |b| {
+            b[0..2].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+            b[2..4].copy_from_slice(&half::f16::from_f32(0.003).to_le_bytes());
+        }),
+        DeepSeek4DType::IQ1M => (56, |b| {
+            // The f16 scale is the top nibble of each of four u16 scales.
+            b[49] &= 0x0f;
+            b[51] &= 0x0f;
+            b[53] = (b[53] & 0x0f) | 0xc0;
+            b[55] = (b[55] & 0x0f) | 0x20;
+        }),
+        DeepSeek4DType::IQ2XXS => (66, |b| {
+            b[0..2].copy_from_slice(&half::f16::from_f32(0.02).to_le_bytes());
+        }),
+        DeepSeek4DType::IQ2XS => (74, |b| {
+            b[0..2].copy_from_slice(&half::f16::from_f32(0.02).to_le_bytes());
+        }),
+        _ => anyhow::bail!("not a packed Coder format"),
+    };
+    anyhow::ensure!(weight_byte_len(dtype, out, k)? == out * k / 256 * block);
+    let mut state = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let mut bytes = (0..out * k / 256 * block)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 56) as u8
+        })
+        .collect::<Vec<_>>();
+    for b in bytes.chunks_exact_mut(block) {
+        scale_fixup(b);
+    }
+    let len = bytes.len();
+    DeepSeek4QMatMul::new(Arc::new(RawTensor::new(
+        vec![out, k],
+        dtype,
+        Tensor::from_vec(bytes, len, device)?,
+    )?))
+}
+
+fn rows(device: &Device, count: usize, k: usize, seed: usize) -> Result<Tensor> {
+    let values = (0..count * k)
+        .map(|i| (((i * 7919 + seed * 104729) % 2003) as f32 / 1001.0 - 1.0) * 0.75)
+        .collect::<Vec<_>>();
+    Ok(Tensor::from_vec(values, (count, k), device)?)
+}
+
+#[test]
+fn packed_coder_prefill_matches_row_kernels_and_ignores_chunking() -> Result<()> {
+    let Some(device) = crate::test_metal_device() else {
+        return Ok(());
+    };
+    if !qualified_device(device.as_metal_device()?) {
+        return Ok(());
+    }
+    pipelines(device.as_metal_device()?)?;
+    let (out, k, count) = (200usize, 1024usize, 37usize);
+    for (index, dtype) in [
+        DeepSeek4DType::Q5K,
+        DeepSeek4DType::IQ1M,
+        DeepSeek4DType::IQ2XXS,
+        DeepSeek4DType::IQ2XS,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let matrix = packed_fixture(&device, dtype, out, k, index as u64)?;
+        let input = rows(&device, count, k, index)?;
+        let reference = matrix.forward_decode_rows(&input)?;
+        let tiled = matrix.forward_prefill_rows(&input)?;
+        let diff = (&tiled - &reference)?
+            .sqr()?
+            .sum_all()?
+            .to_scalar::<f32>()?;
+        let energy = reference.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        anyhow::ensure!(energy > 0.0, "{dtype:?} reference is all zeros");
+        anyhow::ensure!(
+            diff / energy <= 1e-5,
+            "{dtype:?} tiled NMSE {} exceeds half-operand bound",
+            diff / energy
+        );
+        // Rows do not depend on how many share a dispatch.
+        let whole = tiled.flatten_all()?.to_vec1::<f32>()?;
+        for chunk in [1usize, 5, 16, 33] {
+            let mut start = 0;
+            while start < count {
+                let len = chunk.min(count - start);
+                let part = matrix
+                    .forward_prefill_rows(&input.narrow(0, start, len)?.contiguous()?)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                anyhow::ensure!(
+                    part == whole[start * out..(start + len) * out],
+                    "{dtype:?} rows changed with chunk {chunk}"
+                );
+                start += len;
+            }
+        }
+        // Several experts in one dispatch match their separate projections.
+        let other = packed_fixture(&device, dtype, out, k, 100 + index as u64)?;
+        let lists = vec![vec![3u32, 0, 36, 7], vec![1u32], vec![5u32, 6]];
+        let matrices = [&matrix, &other, &matrix];
+        let grouped = DeepSeek4QMatMul::forward_experts_prefill(&matrices, &lists, &input)?
+            .context("expert dispatch unavailable")?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let mut offset = 0;
+        for (m, list) in matrices.iter().zip(&lists) {
+            let ids = Tensor::new(list.as_slice(), &device)?;
+            let separate = m
+                .forward_prefill_rows(&input.index_select(&ids, 0)?)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            anyhow::ensure!(
+                separate == grouped[offset..offset + separate.len()],
+                "{dtype:?} grouped experts differ from separate projections"
+            );
+            offset += separate.len();
+        }
+    }
+    Ok(())
+}

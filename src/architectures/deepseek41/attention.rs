@@ -331,6 +331,30 @@ impl Attention {
         published: bool,
         scores: Option<&Tensor>,
     ) -> Result<Tensor> {
+        self.attend_mode(
+            x, qa, kv, q, layer, pos, cache, selection, tiled, published, scores, true,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep the borrowed GPU inputs and independent publication controls explicit."
+    )]
+    fn attend_mode(
+        &self,
+        x: &Tensor,
+        qa: &Tensor,
+        kv: &Tensor,
+        q: &Tensor,
+        layer: usize,
+        pos: usize,
+        cache: &mut DeepSeek41Cache,
+        selection: &mut Selection,
+        tiled: bool,
+        published: bool,
+        scores: Option<&Tensor>,
+        project: bool,
+    ) -> Result<Tensor> {
         let q = self
             .rope
             .apply(&q.reshape((64, 512))?, pos as u32, false, false)?;
@@ -375,11 +399,218 @@ impl Attention {
         }
         let heads = heads(&q, &values, &self.sinks)?;
         let heads = self.rope.apply(&heads, pos as u32, true, true)?;
+        if !project {
+            return Ok(heads.reshape((8, 4096))?);
+        }
         Ok(math::bf16(
             &self
                 .output_a
                 .forward_grouped_packed(&heads.reshape((8, 4096))?, 8)?,
         )?)
+    }
+
+    /// Unprojected `[8, 4096]` heads of one tile row, for `project_heads`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Same borrowed inputs and publication controls as attend_prepared_mode."
+    )]
+    pub(super) fn attend_heads(
+        &self,
+        x: &Tensor,
+        qa: &Tensor,
+        kv: &Tensor,
+        q: &Tensor,
+        layer: usize,
+        pos: usize,
+        cache: &mut DeepSeek41Cache,
+        selection: &mut Selection,
+        scores: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        self.attend_mode(
+            x,
+            qa,
+            kv,
+            q,
+            layer,
+            pos,
+            cache,
+            selection,
+            true,
+            scores.is_some(),
+            scores,
+            false,
+        )
+    }
+
+    /// Whole-tile attention for rows at positions `base..base + T`, returning
+    /// unprojected heads `[T * 8, 4096]` for `project_heads`. Publishes the
+    /// tile's raw rows and compressed pairs, then lets each row see exactly
+    /// what the row loop would: the 128 raw rows ending at its position and
+    /// the compressed prefix visible at its position. Refresh layers select
+    /// each row's compressed rows and store them in `tile_selection[owner]`
+    /// for the owner's later layers in this tile.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep tile inputs, cache and per-row selections borrowed across dispatch."
+    )]
+    pub(super) fn attend_tile(
+        &self,
+        x: &Tensor,
+        qa: &Tensor,
+        kv: &Tensor,
+        q: &Tensor,
+        layer: usize,
+        base: usize,
+        cache: &mut DeepSeek41Cache,
+        selections: &mut [&mut Selection],
+        tile_selection: &mut [Option<super::tile_attention::TileSelection>; 4],
+        pins: &mut Vec<Tensor>,
+    ) -> Result<Tensor> {
+        use super::tile_attention::{self, MAX_SELECTED, RAW_WINDOW, TileSelection};
+        let t = x.dim(0)?;
+        anyhow::ensure!(
+            t > 0 && selections.len() == t && kv.dims() == [t, 512],
+            "Maya tile attention shape"
+        );
+        let first = u32::try_from(base).context("Maya tile position")?;
+        let q = self
+            .rope
+            .apply_rows(&q.reshape((t * 64, 512))?, first, 64, 1, false, false)?;
+        let raw_new = math::quantize_dequantize(
+            &self.rope.apply_rows(kv, first, 1, 1, false, false)?,
+            CacheFormat::RawKvFp8E8M0,
+        )?;
+        // Extended window: up to 127 earlier rows, then the tile's rows.
+        let (window, raw_prev) = match &cache.raw[layer] {
+            None => (raw_new, 0),
+            Some(previous) => {
+                let n = previous.dim(0)?;
+                let keep = n.min(RAW_WINDOW - 1);
+                let tail = previous.narrow(0, n - keep, keep)?;
+                (Tensor::cat(&[&tail, &raw_new], 0)?, keep)
+            }
+        };
+        let len = window.dim(0)?;
+        let ring = window.narrow(0, len - len.min(RAW_WINDOW), len.min(RAW_WINDOW))?;
+        cache.raw[layer] = Some(cache::retain_cached(ring.contiguous()?)?);
+        let mut compressed_rows = None;
+        let mut selection = None;
+        if let Some(owner) = cache::owner(layer) {
+            let ratio = if owner == 3 { 1 } else { 2 };
+            if let Some(compressor) = &self.compressor {
+                let published = &mut cache.compressed[owner];
+                anyhow::ensure!(
+                    published.kv.len() == base / ratio,
+                    "Maya tile duplicate publication"
+                );
+                compressor.publish_many(x, base, &self.rope, published, pins)?;
+            }
+            let visible: Vec<usize> = (0..t)
+                .map(|r| cache::visible_rows(owner, base + r))
+                .collect();
+            let last = visible[t - 1];
+            if last > 0 {
+                let compressed = &cache.compressed[owner];
+                if let Some(indexer) = &self.indexer {
+                    let iq = keep(pins, math::bf16(&indexer.q.forward_prefill_matrix(qa)?)?)?;
+                    let iq = self.rope.apply_rows(
+                        &iq.reshape((t * 32, 128))?,
+                        first,
+                        32,
+                        1,
+                        false,
+                        false,
+                    )?;
+                    let iq = pin(
+                        pins,
+                        math::quantize_dequantize(&iq, CacheFormat::IndexQkFp4E8M0)?
+                            .reshape((t, 32, 128))?,
+                    )?;
+                    let weights = keep(pins, indexer.weights.forward_prefill_matrix(x)?)?;
+                    let weights = keep(pins, math::bf16(&weights)?.reshape((t, 32))?)?;
+                    let pages = compressed
+                        .index
+                        .prefix(last)?
+                        .chunks()
+                        .collect::<candle_core::Result<Vec<_>>>()?;
+                    let mut ids = Vec::with_capacity(t);
+                    let mut rows = Vec::with_capacity(2 * t);
+                    let mut offset = 0u32;
+                    let step = super::profile::ATTENTION_V2_MAX_ROWS;
+                    for start in (0..t).step_by(step) {
+                        let n = step.min(t - start);
+                        let scores = ops::index_scores_many(
+                            &iq.narrow(0, start, n)?,
+                            &weights.narrow(0, start, n)?,
+                            &pages,
+                            &visible[start..start + n],
+                            pins,
+                        )?;
+                        for r in 0..n {
+                            let v = visible[start + r];
+                            if v == 0 {
+                                rows.extend([offset, 0]);
+                                continue;
+                            }
+                            let row = scores.narrow(0, r, 1)?.narrow(1, 0, v)?.contiguous()?;
+                            let id =
+                                select_scores(&row.flatten_all()?, layer, selections[start + r])?;
+                            let count = v.min(MAX_SELECTED) as u32;
+                            anyhow::ensure!(
+                                id.elem_count() == count as usize,
+                                "Maya tile topk count"
+                            );
+                            rows.extend([offset, count]);
+                            offset += count;
+                            ids.push(id);
+                        }
+                    }
+                    let ids = if ids.is_empty() {
+                        None
+                    } else {
+                        Some(keep(pins, Tensor::cat(&ids, 0)?)?)
+                    };
+                    tile_selection[owner] = Some(TileSelection { ids, rows });
+                }
+                selection = Some(
+                    tile_selection[owner]
+                        .clone()
+                        .context("Maya tile owner selection missing")?,
+                );
+                let chunks = compressed
+                    .kv
+                    .prefix(last)?
+                    .chunks()
+                    .collect::<candle_core::Result<Vec<_>>>()?;
+                compressed_rows = Some(keep(pins, Tensor::cat(&chunks, 0)?.contiguous()?)?);
+            }
+        }
+        let window = keep(pins, window.contiguous()?)?;
+        let heads = tile_attention::forward(
+            &q,
+            &window,
+            raw_prev,
+            compressed_rows.as_ref(),
+            selection.as_ref(),
+            &self.sinks,
+        )?;
+        let heads = self.rope.apply_rows(&heads, first, 64, 1, true, true)?;
+        Ok(heads.reshape((t * 8, 4096))?)
+    }
+
+    /// Row-path output-A projection of one row's `[8, 4096]` heads, `[1, 8192]`.
+    pub(super) fn project_heads_row(&self, heads: &Tensor) -> Result<Tensor> {
+        Ok(math::bf16(&self.output_a.forward_grouped_packed(heads, 8)?)?.reshape((1, 8192))?)
+    }
+
+    /// Output-A projection of a tile's stacked heads `[T * 8, 4096]` (row
+    /// `t * 8 + g` is group `g` of row `t`), as `[T, 8192]` with the same BF16
+    /// rounding as the row path. `None` when the tiled kernel is unavailable.
+    pub(super) fn project_heads(&self, heads: &Tensor, tokens: usize) -> Result<Option<Tensor>> {
+        let Some(low) = self.output_a.forward_grouped_prefill(heads, 8, tokens)? else {
+            return Ok(None);
+        };
+        Ok(Some(math::bf16(&low)?))
     }
 }
 
@@ -407,7 +638,7 @@ pub(crate) fn pool_projected(
         return Ok(Some((math::bf16(&kv)?, pos)));
     };
     if pos.is_multiple_of(2) {
-        cache.pending = Some((cache::retain_bounded(kv)?, cache::retain_bounded(score)?));
+        cache.pending = Some((cache::retain_cached(kv)?, cache::retain_cached(score)?));
         return Ok(None);
     }
     let (previous, previous_score) = cache
@@ -418,6 +649,12 @@ pub(crate) fn pool_projected(
         pool_pair(&previous, &previous_score, &kv, &score)?,
         pos - 1,
     )))
+}
+
+/// Own a tile transient until the caller's fence, without a loan-size check.
+fn keep(pins: &mut Vec<Tensor>, tensor: Tensor) -> Result<Tensor> {
+    pins.push(tensor.clone());
+    Ok(tensor)
 }
 
 #[track_caller]

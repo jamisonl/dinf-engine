@@ -63,6 +63,7 @@ pub mod math;
 mod ops;
 pub mod profile;
 mod route_combine;
+mod tile_attention;
 mod weights;
 
 pub use cache::DeepSeek41Cache;
@@ -599,9 +600,13 @@ fn route_union(routes: &[math::RouterSelection]) -> Vec<usize> {
     union
 }
 
+/// Largest tile for the Coder's tile-level layers (one lone-request prompt
+/// chunk). Activations stay a few hundred MiB at this size.
+const CODER_TILE_ROWS: usize = 512;
+
 fn tile_routes(values: &[f32], bias: &[f32], rows: usize) -> Result<Vec<math::RouterSelection>> {
     ensure!(
-        (1..=profile::MAX_PREFILL_TILE).contains(&rows)
+        (1..=CODER_TILE_ROWS.max(profile::MAX_PREFILL_TILE)).contains(&rows)
             && matches!(bias.len(), 192 | 384)
             && values.len() == rows * bias.len(),
         "Maya tile router row mismatch"
@@ -634,14 +639,28 @@ impl Drop for CoderBatchScope {
         CODER_BATCH_ACTIVE.with(|v| v.set(self.1));
     }
 }
+/// The Coder's whole-tile attention runs on Metal unless
+/// `DINF_DEEPSEEK41_TILE_ATTENTION=0` keeps the row loop.
+fn tile_attention_enabled(device: &Device) -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("DINF_DEEPSEEK41_TILE_ATTENTION").is_none_or(|v| v != "0")
+    });
+    device.is_metal() && *ENABLED
+}
 fn coder_routed_batch_enabled() -> bool {
     CODER_BATCH_ACTIVE.with(|v| v.get())
 }
+/// The Coder's tiled expert kernels read each expert once per tile, so it
+/// requests the largest tile unless an operator chose a size. The planner
+/// still shrinks it near the fixed scratch reserve.
 fn coder_prefill_tile() -> usize {
     if profile::scalar_prefill_opt_out_enabled() {
         return 1;
     }
-    profile::prefill_tile()
+    match profile::prefill_tile() {
+        profile::DEFAULT_PREFILL_TILE => profile::MAX_PREFILL_TILE,
+        requested => requested,
+    }
 }
 
 struct Hc {
@@ -962,7 +981,18 @@ impl DeepSeek41Stage {
         } else {
             profile::prefill_tile()
         };
-        let tile_plan = profile::prefill_tile_plan(requested, start, seq_len)?;
+        let mut tile_plan = profile::prefill_tile_plan(requested, start, seq_len)?;
+        // Tile-level Coder layers read every routed expert once per tile, so
+        // larger tiles cut expert traffic per token. They keep their own cap,
+        // separate from the row path's planner bound; a planner-reduced or
+        // operator-chosen tile is left as is.
+        if self.coder_tile_enabled(seq_len)
+            && requested == profile::MAX_PREFILL_TILE
+            && tile_plan.effective == requested.min(seq_len)
+        {
+            tile_plan.effective = CODER_TILE_ROWS.min(seq_len);
+            tile_plan.reason = "coder_tile_layers";
+        }
         let mut experts = self
             .expert_cache
             .lock()
@@ -1085,6 +1115,216 @@ impl DeepSeek41Stage {
         Ok(StageOutput::Logits(output))
     }
 
+    /// Tile-level Coder layers apply on qualified Metal devices for
+    /// multi-row tiles, unless tile validation is on or
+    /// `DINF_DEEPSEEK41_TILE_LAYERS=0` keeps the row loop.
+    fn coder_tile_enabled(&self, tokens: usize) -> bool {
+        static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("DINF_DEEPSEEK41_TILE_LAYERS").is_none_or(|v| v != "0")
+        });
+        #[cfg(target_os = "macos")]
+        {
+            self.coder
+                && tokens > 1
+                && *ENABLED
+                && tile_attention_enabled(&self.device)
+                && !profile::prefill_validation_enabled()
+                && !attention_v2_enabled()
+                && !engram_v2_enabled()
+                && batched_shared_enabled()
+                && prefill_mm::packed_available(&self.device)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (tokens, &*ENABLED);
+            false
+        }
+    }
+
+    /// One Coder prompt tile through every layer with tile-level tensors:
+    /// residual streams `[T,4,5120]`, HC splits `[T,24]`, and one dispatch per
+    /// step instead of one per row. Each row computes what the row loop
+    /// computes, with the tiled kernels' summation order, and rows never mix,
+    /// so results do not depend on how a prompt is split into tiles. Leaves
+    /// each row's final residual and pre gates in `rows` for the output head.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn coder_tile(
+        &self,
+        tokens: &[u32],
+        base: usize,
+        hash: &engram::HashBatch,
+        mut engram_rows: Option<[Vec<Vec<[f32; engram::DIM]>>; 2]>,
+        candidate: &mut DeepSeek41Cache,
+        experts: &mut ExpertCache,
+        leases: &mut MoeLeases,
+        rows: &mut Vec<TileRow>,
+    ) -> Result<()> {
+        let t = tokens.len();
+        let device = &self.device;
+        let initial = tokens
+            .iter()
+            .map(|&token| self.initial_residual(token as usize))
+            .collect::<Result<Vec<_>>>()?;
+        let mut residual = Tensor::stack(&initial, 0)?;
+        let mut previous = initial_pre(device)?.broadcast_as((t, 4))?.contiguous()?;
+        let mut stride = 4;
+        let mut selections = (0..t).map(|_| Selection::default()).collect::<Vec<_>>();
+        let mut tile_selection: [Option<tile_attention::TileSelection>; 4] =
+            std::array::from_fn(|_| None);
+        for (l, layer) in self.layers.iter().enumerate() {
+            if let Some(engram) = &layer.engram {
+                let table = usize::from(l == 14);
+                let mut flat = Vec::with_capacity(t * 6144);
+                for r in 0..t {
+                    let values = match &mut engram_rows {
+                        Some(rows) => std::mem::take(&mut rows[table][r]),
+                        None => engram.table.read_rows(&hash.rows[r][table])?,
+                    };
+                    flat.extend(values.into_iter().flatten());
+                }
+                let input = Tensor::from_vec(flat, (t, 6144), device)?;
+                let kv = engram
+                    .kv
+                    .forward_prefill_matrix(&input)?
+                    .reshape((t, 5, 5120))?;
+                let weight = engram.qnorm.mul(&engram.knorm)?;
+                residual = math::engram_add_rows(&residual, &kv, &weight, RMS_EPS)?;
+            }
+            let hc = &layer.attn_hc;
+            let attn_split = math::hc_split_rows(&residual, &hc.fc, &hc.scale, &hc.base)?;
+            let x = math::hc_collapse_rows(&residual, &previous, stride)?;
+            let x = math::rms_norm(&x, &layer.attn_norm, RMS_EPS)?;
+            let attention = &layer.attention;
+            let qa = attention.prepare_qa(&x)?;
+            let kv = attention.prepare_kv(&x)?;
+            let q = attention.prepare_q(&qa)?;
+            let mut pins = Vec::new();
+            let mut refs = selections.iter_mut().collect::<Vec<_>>();
+            let heads = bounded_prefill_producer(device, true, || {
+                attention.attend_tile(
+                    &x,
+                    &qa,
+                    &kv,
+                    &q,
+                    l,
+                    base,
+                    candidate,
+                    &mut refs,
+                    &mut tile_selection,
+                    &mut pins,
+                )
+            })?;
+            let low = match attention.project_heads(&heads, t)? {
+                Some(low) => low,
+                None => Tensor::cat(
+                    &(0..t)
+                        .map(|r| attention.project_heads_row(&heads.narrow(0, r * 8, 8)?))
+                        .collect::<Result<Vec<_>>>()?,
+                    0,
+                )?,
+            };
+            let out = attention.project_output(&low)?;
+            residual = math::hc_expand_rows(&out, &residual, &attn_split)?;
+            let hc = &layer.ffn_hc;
+            let ffn_split = math::hc_split_rows(&residual, &hc.fc, &hc.scale, &hc.base)?;
+            // FFN collapses with this layer's attention pre, as the row loop does.
+            let x = math::hc_collapse_rows(&residual, &attn_split, 24)?;
+            let x = math::rms_norm(&x, &layer.ffn_norm, RMS_EPS)?;
+            let out = layer.moe_coder_tile(&x, l, experts, leases)?;
+            residual = math::hc_expand_rows(&out, &residual, &ffn_split)?;
+            previous = ffn_split;
+            stride = 24;
+        }
+        let previous = previous.narrow(1, 0, 4)?.contiguous()?;
+        rows.clear();
+        for r in 0..t {
+            rows.push(TileRow::new(
+                residual.get(r)?.contiguous()?,
+                previous.get(r)?.contiguous()?,
+            )?);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[allow(clippy::too_many_arguments)]
+    fn coder_tile(
+        &self,
+        _: &[u32],
+        _: usize,
+        _: &engram::HashBatch,
+        _: Option<[Vec<Vec<[f32; engram::DIM]>>; 2]>,
+        _: &mut DeepSeek41Cache,
+        _: &mut ExpertCache,
+        _: &mut MoeLeases,
+        _: &mut Vec<TileRow>,
+    ) -> Result<()> {
+        anyhow::bail!("Coder tile layers require Metal")
+    }
+
+    /// Read every Engram row a tile needs, for both Engram layers, across
+    /// several threads before the layer loop. The table bypasses the page
+    /// cache, so each row is an SSD read; issuing them concurrently instead of
+    /// one at a time per token hides most of the latency. Bytes and decoding
+    /// are those of `Table::read_rows`. `None` keeps per-row reads (one-token
+    /// tiles, or `DINF_DEEPSEEK41_ENGRAM_PREFETCH=0`).
+    #[allow(clippy::type_complexity)]
+    fn prefetch_engram(
+        &self,
+        hash: &engram::HashBatch,
+    ) -> Result<Option<[Vec<Vec<[f32; engram::DIM]>>; 2]>> {
+        static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("DINF_DEEPSEEK41_ENGRAM_PREFETCH").is_none_or(|v| v != "0")
+        });
+        let tokens = hash.rows.len();
+        if !*ENABLED || tokens < 2 {
+            return Ok(None);
+        }
+        let mut tables = [None, None];
+        for (l, layer) in self.layers.iter().enumerate() {
+            if let Some(engram) = &layer.engram {
+                tables[usize::from(l == 14)] = Some(&engram.table);
+            }
+        }
+        let [Some(first), Some(second)] = tables else {
+            return Ok(None);
+        };
+        const THREADS: usize = 16;
+        let per = tokens.div_ceil(THREADS);
+        let parts = std::thread::scope(|scope| {
+            let handles = (0..tokens)
+                .step_by(per)
+                .map(|start| {
+                    let end = (start + per).min(tokens);
+                    scope.spawn(move || -> Result<Vec<[Vec<[f32; engram::DIM]>; 2]>> {
+                        (start..end)
+                            .map(|r| {
+                                Ok([
+                                    first.read_rows(&hash.rows[r][0])?,
+                                    second.read_rows(&hash.rows[r][1])?,
+                                ])
+                            })
+                            .collect()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .map_err(|_| anyhow::anyhow!("Engram prefetch thread panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let mut out = [Vec::with_capacity(tokens), Vec::with_capacity(tokens)];
+        for [a, b] in parts.into_iter().flatten() {
+            out[0].push(a);
+            out[1].push(b);
+        }
+        Ok(Some(out))
+    }
+
     // Keep each cache and owner borrow explicit through the outer GPU fence.
     #[allow(clippy::too_many_arguments)]
     fn run_tiled(
@@ -1100,12 +1340,44 @@ impl DeepSeek41Stage {
         grouped_iq1: bool,
     ) -> Result<Tensor> {
         let tile = plan.effective;
+        let _relaxed = cache::RelaxedTileRetention::enter(
+            self.coder && !profile::prefill_validation_enabled(),
+        );
         for (tile_index, tokens) in tokens.chunks(tile).enumerate() {
             let base = start + tile_index * tile;
             // Hash exactly in input order, with duplicates and original source
             // identity checks left in Table::read_rows. Caller state is untouched.
             let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-            let hash = self.layout.hash(&candidate.history, &ids, None)?;
+            // The hasher takes at most MAX_BATCH_TOKENS; its history rolls
+            // token by token, so pieces carrying it give the same rows.
+            let mut hash = self.layout.hash(
+                &candidate.history,
+                &ids[..ids.len().min(engram::MAX_BATCH_TOKENS)],
+                None,
+            )?;
+            for piece in
+                ids[ids.len().min(engram::MAX_BATCH_TOKENS)..].chunks(engram::MAX_BATCH_TOKENS)
+            {
+                let next = self.layout.hash(&hash.next_history, piece, None)?;
+                hash.rows.extend(next.rows);
+                hash.next_history = next.next_history;
+            }
+            let mut engram_rows = self.prefetch_engram(&hash)?;
+            if self.coder_tile_enabled(tokens.len()) {
+                self.coder_tile(
+                    tokens,
+                    base,
+                    &hash,
+                    engram_rows,
+                    candidate,
+                    experts,
+                    leases,
+                    rows,
+                )?;
+                candidate.history = hash.next_history;
+                candidate.position = base + tokens.len();
+                continue;
+            }
             rows.clear();
             for &token in tokens {
                 let stamp = profile::start(&self.device, Region::Embedding)?;
@@ -1116,6 +1388,10 @@ impl DeepSeek41Stage {
                 observe_tile_owners(rows, leases, plan)?;
                 profile::finish(&self.device, stamp)?;
             }
+            // Each owner's per-row compressed selection, set by its refresh
+            // layer and reused by its later layers within this tile.
+            let mut tile_selection: [Option<tile_attention::TileSelection>; 4] =
+                std::array::from_fn(|_| None);
             for (l, layer) in self.layers.iter().enumerate() {
                 let phased = phased_attention_enabled() && tokens.len() > 1;
                 // Each layer's raw ring and each owner's odd-pair carry advance
@@ -1162,7 +1438,10 @@ impl DeepSeek41Stage {
                         let kv = if let Some(kv) = &batched_engram {
                             kv.narrow(0, r, 1)?.reshape((5, 5120))?
                         } else {
-                            let values = engram.table.read_rows(&hash.rows[r][table_index])?;
+                            let values = match &mut engram_rows {
+                                Some(rows) => std::mem::take(&mut rows[table_index][r]),
+                                None => engram.table.read_rows(&hash.rows[r][table_index])?,
+                            };
                             let projection = profile::detail(profile::Detail::EngramProjection);
                             let flat: Vec<f32> = values.into_iter().flatten().collect();
                             let input = Tensor::from_vec(flat, (1, 6144), &self.device)?;
@@ -1254,8 +1533,54 @@ impl DeepSeek41Stage {
                         None
                     };
                     observe_tile_owners(rows, leases, plan)?;
+                    // The Coder projects every row's heads in one output-A
+                    // dispatch after the row-ordered attention loop.
+                    let batch_heads = self.coder && !v2 && !engram_v2_enabled();
+                    if batch_heads && tile_attention_enabled(&self.device) {
+                        let a = &mut leases.attention;
+                        let mut selections = rows
+                            .iter_mut()
+                            .map(|r| &mut r.selection)
+                            .collect::<Vec<_>>();
+                        let heads = bounded_prefill_producer(&self.device, true, || {
+                            layer.attention.attend_tile(
+                                &a.carriers[x],
+                                &a.carriers[qa],
+                                &a.carriers[kv],
+                                &a.carriers[q],
+                                l,
+                                base,
+                                candidate,
+                                &mut selections,
+                                &mut tile_selection,
+                                &mut a.batch,
+                            )
+                        })?;
+                        a.lows.push(cache::retain_bounded(heads)?);
+                        observe_tile_owners(rows, leases, plan)?;
+                    }
                     for r in 0..rows.len() {
                         let a = &mut leases.attention;
+                        if batch_heads && tile_attention_enabled(&self.device) {
+                            break;
+                        }
+                        if batch_heads {
+                            let heads = layer.attention.attend_heads(
+                                &a.carriers[x].narrow(0, r, 1)?,
+                                &a.carriers[qa].narrow(0, r, 1)?,
+                                &a.carriers[kv].narrow(0, r, 1)?,
+                                &a.carriers[q].narrow(0, r, 1)?,
+                                l,
+                                base + r,
+                                candidate,
+                                &mut rows[r].selection,
+                                None,
+                            )?;
+                            a.lows.push(cache::retain_bounded(heads)?);
+                            rows[r].selection.retain_bounded()?;
+                            observe_tile_owners(rows, leases, plan)?;
+                            continue;
+                        }
                         let score = scores.as_ref().map(|s| s.narrow(0, r, 1)).transpose()?;
                         let low = if v2 {
                             layer.attention.attend_published(
@@ -1287,12 +1612,36 @@ impl DeepSeek41Stage {
                         observe_tile_owners(rows, leases, plan)?;
                     }
                     let a = &mut leases.attention;
-                    let joined = if attention_v2_enabled() || engram_v2_enabled() {
-                        cache::cat_rows(&a.lows, &mut a.batch)?
+                    let low = if batch_heads {
+                        let heads = a.pin(Tensor::cat(&a.lows, 0)?)?;
+                        let low = match layer
+                            .attention
+                            .project_heads(&a.carriers[heads], rows.len())?
+                        {
+                            Some(low) => low,
+                            None => {
+                                let all = &a.carriers[heads];
+                                let lows = (0..rows.len())
+                                    .map(|t| {
+                                        layer.attention.project_heads_row(&all.narrow(
+                                            0,
+                                            t * 8,
+                                            8,
+                                        )?)
+                                    })
+                                    .collect::<Result<Vec<_>>>()?;
+                                Tensor::cat(&lows, 0)?
+                            }
+                        };
+                        a.pin(low)?
                     } else {
-                        Tensor::cat(&a.lows, 0)?
+                        let joined = if attention_v2_enabled() || engram_v2_enabled() {
+                            cache::cat_rows(&a.lows, &mut a.batch)?
+                        } else {
+                            Tensor::cat(&a.lows, 0)?
+                        };
+                        a.pin(joined)?
                     };
-                    let low = a.pin(joined)?;
                     let output = a.pin(bounded_prefill_producer(
                         &self.device,
                         attention_v2_enabled() || engram_v2_enabled(),
@@ -1578,6 +1927,52 @@ impl Layer {
         Ok(())
     }
 
+    /// Coder MoE for a whole tile `x` `[T,5120]`: one router readback, one
+    /// expert-cache preparation, three expert dispatches, the shared expert,
+    /// and one ordered combine. Returns BF16 `routed + shared` `[T,5120]`.
+    /// The previous interval's leases retire at this readback, as in
+    /// `moe_tile`; this interval's leases stay in `leases`.
+    #[cfg(target_os = "macos")]
+    fn moe_coder_tile(
+        &self,
+        x: &Tensor,
+        layer: usize,
+        cache: &mut ExpertCache,
+        leases: &mut MoeLeases,
+    ) -> Result<Tensor> {
+        let t = x.dim(0)?;
+        // Router scores choose experts; keep decode's per-row reduction.
+        let logits = self.router.forward_decode_rows(x)?;
+        let routes = tile_routes(&logits.flatten_all()?.to_vec1::<f32>()?, &self.bias, t)?;
+        *leases = MoeLeases::default();
+        leases.selected = Some(cache.prepare(layer, &route_union(&routes))?);
+        leases.shared_input = Some(x.clone());
+        let shared = self.shared_batch(x)?;
+        leases.shared_output = Some(shared.clone());
+        let mut groups: [Vec<(usize, usize)>; 192] = std::array::from_fn(|_| Vec::new());
+        for (token, route) in routes.iter().enumerate() {
+            let mut seen = [false; 192];
+            for (slot, &id) in route.indices.iter().enumerate() {
+                ensure!(id < 192 && !seen[id], "invalid Coder expert route");
+                seen[id] = true;
+                groups[id].push((token, slot));
+            }
+        }
+        let down = Self::coder_experts_tiled(&groups, leases)?
+            .context("Coder tiled experts unavailable")?;
+        let mut map = vec![0u32; 6 * t];
+        let mut offset = 0;
+        for group in groups.iter().filter(|g| !g.is_empty()) {
+            for (r, &(token, slot)) in group.iter().enumerate() {
+                map[6 * token + slot] = (offset + r) as u32;
+            }
+            offset += group.len();
+        }
+        let weights = routes.iter().flat_map(|r| r.weights).collect::<Vec<_>>();
+        let routed = route_combine::ordered_rows(&down, &map, &weights)?;
+        Ok(math::bf16(&routed.add(&shared)?)?)
+    }
+
     // Group only inputs that name the same packed Coder expert. Each projection
     // keeps its scalar sum order; each token keeps its original six route slots.
     // All carriers and packed weights survive the next readback or error fence.
@@ -1601,11 +1996,25 @@ impl Layer {
                 groups[id].push((t, slot));
             }
         }
-        let selected = leases.selected.as_ref().context("Coder selected experts")?;
         let mut downs: Vec<[Option<Tensor>; 6]> = (0..rows.len())
             .map(|_| std::array::from_fn(|_| None))
             .collect();
-        for (id, group) in groups.iter().enumerate().filter(|(_, v)| !v.is_empty()) {
+        let tiled = Self::coder_experts_tiled(&groups, leases)?;
+        if let Some(down) = &tiled {
+            let mut offset = 0;
+            for group in groups.iter().filter(|v| !v.is_empty()) {
+                for (r, &(t, slot)) in group.iter().enumerate() {
+                    downs[t][slot] = Some(down.narrow(0, offset + r, 1)?);
+                }
+                offset += group.len();
+            }
+        }
+        let selected = leases.selected.as_ref().context("Coder selected experts")?;
+        for (id, group) in groups
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| tiled.is_none() && !v.is_empty())
+        {
             let expert = selected.get(id).context("missing Coder expert")?;
             let inputs = group
                 .iter()
@@ -1614,14 +2023,14 @@ impl Layer {
             let input = leases.routed_post.pin(Tensor::cat(&inputs, 0)?)?;
             let gate = leases
                 .routed_post
-                .pin(expert.gate().forward_decode_rows(&input)?)?;
+                .pin(expert.gate().forward_prefill_rows(&input)?)?;
             let up = leases
                 .routed_post
-                .pin(expert.up().forward_decode_rows(&input)?)?;
+                .pin(expert.up().forward_prefill_rows(&input)?)?;
             let mid = leases.routed_post.pin(swiglu(&gate, &up)?)?;
             let down = leases
                 .routed_post
-                .pin(expert.down().forward_decode_rows(&mid)?)?;
+                .pin(expert.down().forward_prefill_rows(&mid)?)?;
             for (r, &(t, slot)) in group.iter().enumerate() {
                 downs[t][slot] = Some(down.narrow(0, r, 1)?);
             }
@@ -1638,6 +2047,54 @@ impl Layer {
             row.finish_ffn(&out)?;
         }
         observe_tile_owners(rows, leases, plan)
+    }
+
+    /// Every routed expert of a Coder tile in three dispatches (gate, up,
+    /// down). Returns down rows grouped by expert in ID order, or `None` when
+    /// the tiled kernels are unavailable; nothing is enqueued in that case.
+    fn coder_experts_tiled(
+        groups: &[Vec<(usize, usize)>; 192],
+        leases: &mut MoeLeases,
+    ) -> Result<Option<Tensor>> {
+        let Some(input) = leases.shared_input.clone() else {
+            return Ok(None);
+        };
+        let selected = leases.selected.as_ref().context("Coder selected experts")?;
+        let mut experts = Vec::new();
+        let mut token_rows = Vec::new();
+        let mut mid_rows = Vec::new();
+        let mut offset = 0u32;
+        for (id, group) in groups.iter().enumerate().filter(|(_, v)| !v.is_empty()) {
+            experts.push(selected.get(id).context("missing Coder expert")?.clone());
+            token_rows.push(group.iter().map(|&(t, _)| t as u32).collect::<Vec<_>>());
+            mid_rows.push((offset..offset + group.len() as u32).collect::<Vec<_>>());
+            offset += group.len() as u32;
+        }
+        let gates = experts.iter().map(|e| e.gate()).collect::<Vec<_>>();
+        let ups = experts.iter().map(|e| e.up()).collect::<Vec<_>>();
+        let downs = experts.iter().map(|e| e.down()).collect::<Vec<_>>();
+        // Check all three before enqueueing any of them.
+        let uniform = |m: &[&Linear]| {
+            m.iter().all(|x| {
+                x.dtype() == m[0].dtype()
+                    && x.in_dim() == m[0].in_dim()
+                    && x.out_dim() == m[0].out_dim()
+            })
+        };
+        if !(uniform(&gates) && uniform(&ups) && uniform(&downs)) {
+            return Ok(None);
+        }
+        let Some(gate) = Linear::forward_experts_prefill(&gates, &token_rows, &input)? else {
+            return Ok(None);
+        };
+        let gate = leases.routed_post.pin(gate)?;
+        let up = Linear::forward_experts_prefill(&ups, &token_rows, &input)?
+            .context("Coder tiled up projection unavailable after gate")?;
+        let up = leases.routed_post.pin(up)?;
+        let mid = leases.routed_post.pin(swiglu(&gate, &up)?)?;
+        let down = Linear::forward_experts_prefill(&downs, &mid_rows, &mid)?
+            .context("Coder tiled down projection unavailable after gate")?;
+        Ok(Some(leases.routed_post.pin(down)?))
     }
 
     #[cfg(target_os = "macos")]

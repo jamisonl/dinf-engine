@@ -1453,15 +1453,20 @@ mod metal {
                                 | DeepSeek4DType::IQ2XXS
                                 | DeepSeek4DType::IQ2XS
                         ) {
+                            // The row kernels keep decode's sums; tiled
+                            // prompt matmuls are checked in prefill_mm tests.
                             let expected = Tensor::cat(&expected, 0)?.to_vec2::<f32>()?;
-                            assert_eq!(
-                                matmul.forward_prefill_matrix(&input)?.to_vec2::<f32>()?,
-                                expected
-                            );
-                            assert_eq!(
-                                matmul.forward_attention_prefill(&input)?.to_vec2::<f32>()?,
-                                expected
-                            );
+                            prefill_mm::with_packed_disabled(|| -> Result<()> {
+                                assert_eq!(
+                                    matmul.forward_prefill_matrix(&input)?.to_vec2::<f32>()?,
+                                    expected
+                                );
+                                assert_eq!(
+                                    matmul.forward_attention_prefill(&input)?.to_vec2::<f32>()?,
+                                    expected
+                                );
+                                Ok(())
+                            })?;
                         }
                         // Both reduction choices preserve row order with interleaving.
                         for kind in [KernelKind::Serial, KernelKind::Simd] {
@@ -1555,8 +1560,10 @@ mod metal {
                                 .all(|(a, b)| a.to_bits() == b.to_bits()),
                             "{dtype:?} width={width} rows={rows}"
                         );
-                        let scoped = super::super::with_packed_reuse4_enabled(true, || {
-                            matmul.forward_prefill_matrix(&input)
+                        let scoped = prefill_mm::with_packed_disabled(|| {
+                            super::super::with_packed_reuse4_enabled(true, || {
+                                matmul.forward_prefill_matrix(&input)
+                            })
                         })?
                         .flatten_all()?
                         .to_vec1::<f32>()?;
@@ -2500,5 +2507,49 @@ fn v41_q8_rows_seq4_exact_production_shapes_offsets_and_tails() -> Result<()> {
             &serde_json::json!({"finite_exact_comparisons":comparisons,"offsets":true,"partial_output_rows":7,"rows":[1,2,3,7,8,9,26,27,28,31,32],"timings":timings,"scope":"public synthetic packed Q8 and wide finite F32 cancellation; per-call fences in component timing only"})
         )?
     );
+    Ok(())
+}
+
+/// Router scores choose experts, so batched dense decode rows must keep each
+/// row's single-row GEMV bits.
+#[test]
+fn dense_decode_rows_match_single_row_calls_bitwise() -> Result<()> {
+    let Some(device) = crate::test_metal_device() else {
+        return Ok(());
+    };
+    let (rows, k, n) = (37usize, 5120usize, 192usize);
+    let bytes = (0..n * k)
+        .flat_map(|i| {
+            half::bf16::from_f32(((i * 104_729 % 1999) as f32 / 999.0 - 1.0) * 0.01).to_le_bytes()
+        })
+        .collect::<Vec<_>>();
+    let matmul = DeepSeek4QMatMul::new_on_device(
+        raw(vec![n, k], DeepSeek4DType::BF16, bytes, &device)?,
+        &device,
+    )?;
+    let x = Tensor::from_vec(
+        (0..rows * k)
+            .map(|i| (i * 7919 % 2003) as f32 / 1001.0 - 1.0)
+            .collect::<Vec<_>>(),
+        (rows, k),
+        &device,
+    )?;
+    let batched = matmul
+        .forward_decode_rows(&x)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    for r in 0..rows {
+        let single = matmul
+            .forward(&x.narrow(0, r, 1)?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert!(
+            single
+                .iter()
+                .zip(&batched[r * n..(r + 1) * n])
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "row {r} differs from its single-row GEMV"
+        );
+    }
     Ok(())
 }

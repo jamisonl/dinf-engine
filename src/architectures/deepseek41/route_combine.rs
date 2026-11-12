@@ -30,6 +30,12 @@ pub(super) fn ordered(downs: &[Tensor; ROUTES], weights: &[f32; ROUTES]) -> Resu
     })
 }
 
+/// Tile combine over expert-grouped down rows; see `metal::forward_rows`.
+#[cfg(target_os = "macos")]
+pub(super) fn ordered_rows(down: &Tensor, rows: &[u32], weights: &[f32]) -> Result<Tensor> {
+    metal::forward_rows(down, rows, weights)
+}
+
 struct Ordered<'a> {
     #[cfg_attr(
         not(target_os = "macos"),
@@ -81,14 +87,20 @@ mod metal {
     // Match Candle affine/binary compile policy, including its exact env parser.
     // Volatile F32 intermediates and clang controls below restore the store
     // boundaries that existed between those separately compiled dispatches.
+    type Key = (candle_core::metal_backend::DeviceId, &'static str);
     fn pipeline(device: &candle_core::MetalDevice) -> Result<ComputePipeline> {
-        static PIPELINES: LazyLock<
-            Mutex<HashMap<candle_core::metal_backend::DeviceId, ComputePipeline>>,
-        > = LazyLock::new(|| Mutex::new(HashMap::new()));
+        named_pipeline(device, "maya_ordered_route_combine")
+    }
+    fn named_pipeline(
+        device: &candle_core::MetalDevice,
+        name: &'static str,
+    ) -> Result<ComputePipeline> {
+        static PIPELINES: LazyLock<Mutex<HashMap<Key, ComputePipeline>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
         let mut cache = PIPELINES.lock().map_err(|_| {
             candle_core::Error::Msg("Maya route combine pipeline lock poisoned".into())
         })?;
-        if let Some(p) = cache.get(&device.id()) {
+        if let Some(p) = cache.get(&(device.id(), name)) {
             return Ok(p.clone());
         }
         let options = MTLCompileOptions::new();
@@ -110,14 +122,78 @@ mod metal {
             .new_library_with_source(SOURCE, Some(&options))
             .map_err(candle_core::Error::wrap)?;
         let function = library
-            .get_function("maya_ordered_route_combine", None)
+            .get_function(name, None)
             .map_err(candle_core::Error::wrap)?;
         let p = device
             .metal_device()
             .new_compute_pipeline_state_with_function(&function)
             .map_err(candle_core::Error::wrap)?;
-        cache.insert(device.id(), p.clone());
+        cache.insert((device.id(), name), p.clone());
         Ok(p)
+    }
+
+    /// Tile form of `forward`: `out[t] = ordered sum of weights[6t+s] *
+    /// down[rows[6t+s]]` with the same per-element F32 store boundaries.
+    pub(super) fn forward_rows(
+        down: &candle_core::Tensor,
+        rows: &[u32],
+        weights: &[f32],
+    ) -> Result<candle_core::Tensor> {
+        let tokens = rows.len() / ROUTES;
+        if rows.len() != tokens * ROUTES
+            || weights.len() != rows.len()
+            || tokens == 0
+            || down.dtype() != DType::F32
+            || !down.is_contiguous()
+            || down.rank() != 2
+            || down.dims()[1] != WIDTH
+            || rows.iter().any(|&r| r as usize >= down.dims()[0])
+        {
+            candle_core::bail!("invalid Maya tile route combine");
+        }
+        let (storage, layout) = down.storage_and_layout();
+        let Storage::Metal(storage) = &*storage else {
+            candle_core::bail!("Maya tile route combine requires Metal storage");
+        };
+        let device = storage.device();
+        let offset = layout.start_offset() * 4;
+        let p = named_pipeline(device, "maya_ordered_route_combine_rows")?;
+        let threads = p.max_total_threads_per_threadgroup().min(256);
+        let rows = device.new_buffer_with_data(rows)?;
+        let weights = device.new_buffer_with_data(weights)?;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(tokens * WIDTH, DType::F32)
+            .with_label("maya-ordered-route-combine-rows")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&p);
+        encoder.set_input_buffer(0, Some(storage.buffer()), offset);
+        encoder.set_input_buffer(1, Some(&*rows), 0);
+        encoder.set_input_buffer(2, Some(&*weights), 0);
+        encoder.set_output_buffer(3, Some(&output), 0);
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: WIDTH.div_ceil(threads),
+                height: tokens,
+                depth: 1,
+            },
+            MTLSize {
+                width: threads,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(candle_core::Tensor::from((
+            Storage::Metal(MetalStorage::new(
+                output,
+                device.clone(),
+                tokens * WIDTH,
+                DType::F32,
+            )),
+            Shape::from((tokens, WIDTH)),
+        )))
     }
 
     fn span(layout: &Layout, buffer_bytes: usize) -> Result<usize> {
@@ -200,6 +276,32 @@ mod metal {
 using namespace metal;
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
+kernel void maya_ordered_route_combine_rows(
+    device const float *down [[buffer(0)]],
+    device const uint *rows [[buffer(1)]],
+    device const float *weights [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    const uint i = gid.x, t = gid.y;
+    if (i >= 5120) return;
+    device const uint *r = rows + 6u * t;
+    device const float *w = weights + 6u * t;
+    volatile float sum = 0.0f;
+    volatile float weighted = fma(down[ulong(r[0]) * 5120u + i], w[0], 0.0f);
+    sum = sum + weighted;
+    weighted = fma(down[ulong(r[1]) * 5120u + i], w[1], 0.0f);
+    sum = sum + weighted;
+    weighted = fma(down[ulong(r[2]) * 5120u + i], w[2], 0.0f);
+    sum = sum + weighted;
+    weighted = fma(down[ulong(r[3]) * 5120u + i], w[3], 0.0f);
+    sum = sum + weighted;
+    weighted = fma(down[ulong(r[4]) * 5120u + i], w[4], 0.0f);
+    sum = sum + weighted;
+    weighted = fma(down[ulong(r[5]) * 5120u + i], w[5], 0.0f);
+    sum = sum + weighted;
+    out[ulong(t) * 5120u + i] = sum;
+}
+
 kernel void maya_ordered_route_combine(
     device const float *d0 [[buffer(0)]],
     device const float *d1 [[buffer(1)]],
