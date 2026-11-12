@@ -486,6 +486,7 @@ pub struct RawGgufContent {
     pub tensor_infos: HashMap<String, RawTensorInfo>,
     pub tensor_data_offset: u64,
     file_size: u64,
+    header_stats: crate::gguf_limits::GgufHeaderStats,
 }
 
 /// Maximum allocation/read for a lazy disk request (one Maya expert is ~2.3 MiB).
@@ -1027,7 +1028,7 @@ impl RawGgufContent {
         // Run the bounded aggregate scan first.  This also covers
         // callers that enter the DeepSeek/raw path directly rather than via
         // the standard GGUF loader preflight.
-        validate_gguf_header_budget(file)?;
+        let header_stats = validate_gguf_header_budget(file)?;
         let file_size = file.metadata()?.len();
         file.seek(SeekFrom::Start(0))?;
         let version = Version::read(file)?;
@@ -1162,7 +1163,13 @@ impl RawGgufContent {
             tensor_infos,
             tensor_data_offset,
             file_size,
+            header_stats,
         })
+    }
+
+    /// Header bytes plus parsed metadata memory, for split-model budgets.
+    pub(crate) fn parsed_header_bytes(&self) -> u64 {
+        self.header_stats.parsed_bytes(self.tensor_data_offset)
     }
 
     pub fn load_tensor(&self, file: &mut File, name: &str, device: &Device) -> Result<RawTensor> {

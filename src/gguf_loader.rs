@@ -702,12 +702,21 @@ fn md_get_str(md: &HashMap<String, gguf_file::Value>, key: &str) -> Result<Strin
 /// This includes the metadata values, tensor table, and alignment padding, so
 /// a header with individually acceptable counts cannot exceed the aggregate
 /// application budget.
+#[cfg(test)]
 fn validate_gguf_header_counts(path: &Path) -> Result<()> {
+    open_validated_gguf(path).map(|_| ())
+}
+
+/// Open and validate a GGUF, returning the same descriptor for parsing so a
+/// file replaced at the path after validation is never handed to Candle.
+fn open_validated_gguf(
+    path: &Path,
+) -> Result<(std::fs::File, crate::gguf_limits::GgufHeaderStats)> {
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open GGUF file: {}", path.display()))?;
-    validate_gguf_header_budget(&mut file)
+    let stats = validate_gguf_header_budget(&mut file)
         .map_err(|error| anyhow::anyhow!("invalid GGUF header {}: {error}", path.display()))?;
-    Ok(())
+    Ok((file, stats))
 }
 
 fn account_split_header_bytes(total: &mut u64, header_bytes: u64) -> Result<()> {
@@ -723,9 +732,7 @@ fn account_split_header_bytes(total: &mut u64, header_bytes: u64) -> Result<()> 
 
 /// Split GGUF files may keep model metadata only in the first shard.
 fn read_model_architecture(first_shard: &Path) -> Result<String> {
-    validate_gguf_header_counts(first_shard)?;
-    let mut file = std::fs::File::open(first_shard)
-        .with_context(|| format!("Failed to open GGUF file: {}", first_shard.display()))?;
+    let (mut file, _) = open_validated_gguf(first_shard)?;
     match gguf_file::Content::read(&mut file) {
         Ok(content) => md_get_str(&content.metadata, "general.architecture"),
         Err(candle_error) => deepseek4_gguf::read_architecture(first_shard).with_context(|| {
@@ -1791,9 +1798,7 @@ pub fn read_gguf_metadata(path: &Path) -> Result<GgufMetadata> {
             .with_context(|| format!("Failed to parse DeepSeek V4 GGUF: {}", path.display()))?;
         return parse_gguf_metadata(&content.metadata);
     }
-    validate_gguf_header_counts(path)?;
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("Failed to open GGUF: {}", path.display()))?;
+    let (mut file, _) = open_validated_gguf(path)?;
     let content = gguf_file::Content::read(&mut file)
         .with_context(|| format!("Failed to parse GGUF header: {}", path.display()))?;
     parse_gguf_metadata(&content.metadata)
@@ -1802,14 +1807,12 @@ pub fn read_gguf_metadata(path: &Path) -> Result<GgufMetadata> {
 /// Read the GGUF metadata map, including files whose tensor table uses a
 /// quant type that Candle does not know yet.
 pub fn read_gguf_metadata_map(path: &Path) -> Result<HashMap<String, gguf_file::Value>> {
-    validate_gguf_header_counts(path)?;
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("Failed to open GGUF: {}", path.display()))?;
+    let (mut file, _) = open_validated_gguf(path)?;
     match gguf_file::Content::read(&mut file) {
         Ok(content) => Ok(content.metadata),
         Err(candle_error) => {
-            let mut raw_file = std::fs::File::open(path)
-                .with_context(|| format!("Failed to reopen GGUF: {}", path.display()))?;
+            // Re-read the validated descriptor, not a fresh open of the path.
+            let mut raw_file = file;
             RawGgufContent::read(&mut raw_file)
                 .map(|content| content.metadata)
                 .with_context(|| {
@@ -2196,12 +2199,13 @@ pub fn load_stage_tensors(
     let mut tensor_owners = HashMap::new();
     let mut shard_metadata = ShardMetadata::new(shard_paths.len());
     for (shard_index, path) in shard_paths.iter().enumerate() {
-        validate_gguf_header_counts(path)?;
-        let mut f = std::fs::File::open(path)
-            .with_context(|| format!("Failed to open shard: {}", path.display()))?;
+        let (mut f, stats) = open_validated_gguf(path)?;
         let content = gguf_file::Content::read(&mut f)
             .with_context(|| format!("Failed to parse shard header: {}", path.display()))?;
-        account_split_header_bytes(&mut aggregate_header_bytes, content.tensor_data_offset)?;
+        account_split_header_bytes(
+            &mut aggregate_header_bytes,
+            stats.parsed_bytes(content.tensor_data_offset),
+        )?;
         register_shard_tensors(&mut tensor_owners, shard_index, content.tensor_infos.keys())?;
         shard_metadata.record(shard_index, &content.metadata, content.tensor_infos.len())?;
         shard_files.push((f, content));
@@ -2307,12 +2311,13 @@ impl StageTensorLoader {
         let mut tensor_owners = HashMap::new();
         let mut shard_metadata = ShardMetadata::new(shard_paths.len());
         for (shard_index, path) in shard_paths.iter().enumerate() {
-            validate_gguf_header_counts(path)?;
-            let mut file = std::fs::File::open(path)
-                .with_context(|| format!("Failed to open shard: {}", path.display()))?;
+            let (mut file, stats) = open_validated_gguf(path)?;
             let content = gguf_file::Content::read(&mut file)
                 .with_context(|| format!("Failed to parse GGUF header: {}", path.display()))?;
-            account_split_header_bytes(&mut aggregate_header_bytes, content.tensor_data_offset)?;
+            account_split_header_bytes(
+                &mut aggregate_header_bytes,
+                stats.parsed_bytes(content.tensor_data_offset),
+            )?;
             register_shard_tensors(&mut tensor_owners, shard_index, content.tensor_infos.keys())?;
             shard_metadata.record(shard_index, &content.metadata, content.tensor_infos.len())?;
             shard_files.push((file, content));
@@ -2790,7 +2795,7 @@ fn load_stage_tensors_deepseek4(
             .with_context(|| format!("Failed to open shard: {}", path.display()))?;
         let content = RawGgufContent::read(&mut file)
             .with_context(|| format!("Failed to parse DeepSeek V4 shard: {}", path.display()))?;
-        account_split_header_bytes(&mut aggregate_header_bytes, content.tensor_data_offset)?;
+        account_split_header_bytes(&mut aggregate_header_bytes, content.parsed_header_bytes())?;
         register_shard_tensors(&mut tensor_owners, shard_index, content.tensor_infos.keys())?;
         shard_metadata.record(shard_index, &content.metadata, content.tensor_infos.len())?;
         shard_files.push((file, content));
@@ -2862,9 +2867,7 @@ fn load_stage_tensors_single(
     range: LayerRange,
     device: &Device,
 ) -> Result<StageTensors> {
-    validate_gguf_header_counts(gguf_path)?;
-    let mut file = std::fs::File::open(gguf_path)
-        .with_context(|| format!("Failed to open GGUF file: {}", gguf_path.display()))?;
+    let (mut file, _) = open_validated_gguf(gguf_path)?;
 
     let content =
         gguf_file::Content::read(&mut file).with_context(|| "Failed to parse GGUF file header")?;
@@ -3179,12 +3182,13 @@ pub fn estimate_stage_memory_profile(
     let mut shard_metadata = ShardMetadata::new(shard_paths.len());
 
     for (shard_index, path) in shard_paths.iter().enumerate() {
-        validate_gguf_header_counts(path)?;
-        let mut file = std::fs::File::open(path)
-            .with_context(|| format!("Failed to open GGUF file: {}", path.display()))?;
+        let (mut file, stats) = open_validated_gguf(path)?;
         let content = gguf_file::Content::read(&mut file)
             .with_context(|| format!("Failed to parse GGUF header: {}", path.display()))?;
-        account_split_header_bytes(&mut aggregate_header_bytes, content.tensor_data_offset)?;
+        account_split_header_bytes(
+            &mut aggregate_header_bytes,
+            stats.parsed_bytes(content.tensor_data_offset),
+        )?;
         register_shard_tensors(&mut tensor_owners, shard_index, content.tensor_infos.keys())?;
         shard_metadata.record(shard_index, &content.metadata, content.tensor_infos.len())?;
 
@@ -3588,7 +3592,7 @@ fn estimate_stage_memory_profile_deepseek4(
             .with_context(|| format!("Failed to open GGUF file: {}", path.display()))?;
         let content = RawGgufContent::read(&mut file)
             .with_context(|| format!("Failed to parse DeepSeek V4 header: {}", path.display()))?;
-        account_split_header_bytes(&mut aggregate_header_bytes, content.tensor_data_offset)?;
+        account_split_header_bytes(&mut aggregate_header_bytes, content.parsed_header_bytes())?;
         register_shard_tensors(&mut tensor_owners, shard_index, content.tensor_infos.keys())?;
         shard_metadata.record(shard_index, &content.metadata, content.tensor_infos.len())?;
         if let Some(info) = content.tensor_infos.get("token_embd.weight") {
@@ -7345,6 +7349,48 @@ mod tests {
 
         let error = validate_gguf_header_counts(&path).unwrap_err().to_string();
         assert!(error.contains("tensor count"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn preflight_budgets_parsed_metadata_values_not_only_disk_bytes() {
+        fn byte_arrays(path: &std::path::Path, arrays: u64) {
+            let mut file = std::fs::File::create(path).unwrap();
+            file.write_all(b"GGUF").unwrap();
+            file.write_all(&3u32.to_le_bytes()).unwrap();
+            file.write_all(&0u64.to_le_bytes()).unwrap(); // tensors
+            file.write_all(&arrays.to_le_bytes()).unwrap(); // metadata records
+            for index in 0..arrays {
+                let key = format!("k{index}");
+                file.write_all(&(key.len() as u64).to_le_bytes()).unwrap();
+                file.write_all(key.as_bytes()).unwrap();
+                file.write_all(&9u32.to_le_bytes()).unwrap(); // array
+                file.write_all(&0u32.to_le_bytes()).unwrap(); // of u8
+                file.write_all(&crate::gguf_limits::MAX_GGUF_ARRAY_ELEMENTS.to_le_bytes())
+                    .unwrap();
+                file.write_all(&vec![0u8; crate::gguf_limits::MAX_GGUF_ARRAY_ELEMENTS as usize])
+                    .unwrap();
+            }
+            // Pad to the default 32-byte alignment where tensor data starts.
+            let length = file.metadata().unwrap().len();
+            file.set_len(length.div_ceil(32) * 32).unwrap();
+        }
+        let path = std::env::temp_dir().join(format!(
+            "dinf-gguf-value-budget-{}-{}.gguf",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test").replace(':', "_")
+        ));
+        // ~9 MiB on disk, but ~300 MiB once every byte becomes a Value.
+        byte_arrays(&path, 9);
+        let error = validate_gguf_header_counts(&path).unwrap_err().to_string();
+        assert!(error.contains("metadata values"), "{error}");
+
+        byte_arrays(&path, 7);
+        let (_, stats) = open_validated_gguf(&path).unwrap();
+        let elements = crate::gguf_limits::MAX_GGUF_ARRAY_ELEMENTS;
+        assert_eq!(stats.metadata_values, 7 * elements + 7);
+        let disk = std::fs::metadata(&path).unwrap().len();
+        assert!(stats.parsed_bytes(disk) > 16 * disk, "split budgets must see parsed size");
         std::fs::remove_file(path).unwrap();
     }
 

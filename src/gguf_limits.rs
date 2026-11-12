@@ -21,6 +21,11 @@ pub(crate) const MAX_GGUF_METADATA_COUNT: u64 = (MAX_MODEL_LAYERS as u64) * 64;
 /// Maximum values in one metadata array.  This accommodates large token
 /// vocabularies while bounding `Vec<Value>` allocations in the raw reader.
 pub(crate) const MAX_GGUF_ARRAY_ELEMENTS: u64 = (MAX_MODEL_LAYERS as u64) * 256;
+/// Maximum parsed metadata values (array elements included) in one header.
+/// Every value becomes a `gguf_file::Value` of `size_of::<Value>()` bytes in
+/// memory, so the on-disk byte budget alone admits ~32x amplification from
+/// one-byte array elements. Real tokenizers use a few million at most.
+pub(crate) const MAX_GGUF_METADATA_VALUES: u64 = 8 * 1024 * 1024;
 /// Maximum header budget considered by application-level preflight checks.
 pub(crate) const MAX_GGUF_HEADER_BYTES: u64 = 256 * 1024 * 1024;
 /// Maximum number of split shards accepted by the loader.
@@ -89,8 +94,37 @@ impl GgufVersion {
 /// matches are verified byte-for-byte so a fingerprint collision cannot turn
 /// two distinct names into a false duplicate.  The file cursor is restored on
 /// both success and failure.
-pub(crate) fn validate_gguf_header_budget(file: &mut File) -> Result<()> {
+/// What a validated header will cost once parsed, beyond its disk bytes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GgufHeaderStats {
+    pub(crate) metadata_values: u64,
+}
+
+impl GgufHeaderStats {
+    /// Disk header bytes plus the parsed metadata values' in-memory size.
+    pub(crate) fn parsed_bytes(&self, header_bytes: u64) -> u64 {
+        let value_bytes = std::mem::size_of::<candle_core::quantized::gguf_file::Value>() as u64;
+        header_bytes.saturating_add(self.metadata_values.saturating_mul(value_bytes))
+    }
+}
+
+struct ValueBudget(u64);
+
+impl ValueBudget {
+    fn charge(&mut self, values: u64) -> Result<()> {
+        self.0 = self.0.checked_add(values).context("GGUF metadata value count overflow")?;
+        anyhow::ensure!(
+            self.0 <= MAX_GGUF_METADATA_VALUES,
+            "GGUF metadata values ({}) exceed application limit ({MAX_GGUF_METADATA_VALUES})",
+            self.0
+        );
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_gguf_header_budget(file: &mut File) -> Result<GgufHeaderStats> {
     let original_position = file.stream_position()?;
+    let mut values = ValueBudget(0);
     let result = (|| {
         file.seek(SeekFrom::Start(0))?;
         let file_size = file.metadata()?.len();
@@ -151,6 +185,7 @@ pub(crate) fn validate_gguf_header_budget(file: &mut File) -> Result<()> {
         let (mut split_no, mut split_count, mut split_tensors) = (None, None, None);
         let mut metadata_keys = DuplicateStringIndex::default();
         for _ in 0..metadata_count {
+            values.charge(1)?;
             let key = read_string_scan(file, version, file_size)?;
             metadata_keys.record(file, file_size, key, "metadata key")?;
             let value_type = read_u32(file, file_size)?;
@@ -163,7 +198,7 @@ pub(crate) fn validate_gguf_header_budget(file: &mut File) -> Result<()> {
                     matches!(value_type, 0..=5),
                     "GGUF general.alignment must use an 8-, 16-, or 32-bit integer"
                 );
-                alignment = skip_scalar_u64(file, version, file_size, value_type)?
+                alignment = skip_scalar_u64(file, version, file_size, value_type, &mut values)?
                     .context("GGUF general.alignment must be a non-negative integer")?;
                 anyhow::ensure!(
                     alignment.is_power_of_two() && alignment <= 1024 * 1024,
@@ -173,7 +208,7 @@ pub(crate) fn validate_gguf_header_budget(file: &mut File) -> Result<()> {
                 || key.matches(b"split.count")
                 || key.matches(b"split.tensors.count")
             {
-                let value = skip_scalar_u64(file, version, file_size, value_type)?;
+                let value = skip_scalar_u64(file, version, file_size, value_type, &mut values)?;
                 if key.matches(b"split.no") {
                     split_no = value;
                 } else if key.matches(b"split.count") {
@@ -192,7 +227,7 @@ pub(crate) fn validate_gguf_header_budget(file: &mut File) -> Result<()> {
                     engram_encoding = value.matches(b"e4m3_e8m0_32_row264");
                 }
             } else {
-                skip_value(file, version, file_size, value_type, 0)?;
+                skip_value(file, version, file_size, value_type, 0, &mut values)?;
             }
         }
         let mut maximum_tensor_end = 0u64;
@@ -317,7 +352,7 @@ pub(crate) fn validate_gguf_header_budget(file: &mut File) -> Result<()> {
     match (result, restore) {
         (Err(error), _) => Err(error),
         (Ok(()), Err(error)) => Err(error.into()),
-        (Ok(()), Ok(_)) => Ok(()),
+        (Ok(()), Ok(_)) => Ok(GgufHeaderStats { metadata_values: values.0 }),
     }
 }
 
@@ -589,6 +624,7 @@ fn skip_scalar_u64(
     version: GgufVersion,
     file_size: u64,
     value_type: u32,
+    values: &mut ValueBudget,
 ) -> Result<Option<u64>> {
     Ok(match value_type {
         0 => Some(read_u8(file, file_size)? as u64),
@@ -612,7 +648,7 @@ fn skip_scalar_u64(
             (value >= 0).then_some(value as u64)
         }
         _ => {
-            skip_value(file, version, file_size, value_type, 0)?;
+            skip_value(file, version, file_size, value_type, 0, values)?;
             None
         }
     })
@@ -624,6 +660,7 @@ fn skip_value(
     file_size: u64,
     value_type: u32,
     depth: usize,
+    values: &mut ValueBudget,
 ) -> Result<()> {
     anyhow::ensure!(
         depth <= MAX_GGUF_VALUE_DEPTH,
@@ -641,6 +678,7 @@ fn skip_value(
                 count <= MAX_GGUF_ARRAY_ELEMENTS,
                 "GGUF array element count ({count}) exceeds application limit ({MAX_GGUF_ARRAY_ELEMENTS})"
             );
+            values.charge(count)?;
             let minimum = count
                 .checked_mul(min_value_disk_bytes(version, element_type)?)
                 .context("GGUF array minimum size overflow")?;
@@ -677,7 +715,7 @@ fn skip_value(
                 }
                 9 => {
                     for _ in 0..count {
-                        skip_value(file, version, file_size, 9, depth + 1)?;
+                        skip_value(file, version, file_size, 9, depth + 1, values)?;
                     }
                 }
                 _ => unreachable!("array element type validated by min_value_disk_bytes"),
