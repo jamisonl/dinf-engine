@@ -2102,16 +2102,22 @@ impl PipelineStage {
         inputs.extend_from_slice(&proposed);
         let target_started = Instant::now();
         let checkpoint = self.checkpoint_session_state(state)?;
-        let result = self.forward_with_session_pass(
-            state,
-            StageInput::Tokens(inputs.clone()),
-            inputs.len(),
-            start_pos,
-            ForwardPass::Standard {
-                layer_ids: &layer_ids,
-                all_logits: true,
-            },
-        );
+        let verify = || {
+            self.forward_with_session_pass(
+                state,
+                StageInput::Tokens(inputs.clone()),
+                inputs.len(),
+                start_pos,
+                ForwardPass::Standard {
+                    layer_ids: &layer_ids,
+                    all_logits: true,
+                },
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let result = crate::architectures::with_speculative_verify(verify);
+        #[cfg(not(target_os = "macos"))]
+        let result = verify();
         let (output, captures) = match result {
             Ok(result) => result,
             Err(error) => {

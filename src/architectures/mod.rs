@@ -30,6 +30,8 @@ mod dflash2_selector_metal;
 #[cfg(target_os = "macos")]
 mod dflash2_topk_metal;
 #[cfg(target_os = "macos")]
+mod flash_attention_metal;
+#[cfg(target_os = "macos")]
 mod fused_norm_metal;
 #[cfg(target_os = "macos")]
 mod fused_route_metal;
@@ -99,6 +101,8 @@ mod residual_norm_cuda;
 pub(crate) mod sdpa_f16kv_metal;
 #[cfg(target_os = "macos")]
 mod tensor_qmatmul_metal;
+#[cfg(target_os = "macos")]
+pub(crate) use tensor_qmatmul_metal::with_speculative_verify;
 
 use std::sync::Arc;
 
@@ -2257,6 +2261,17 @@ fn try_metal_f16_sdpa_native_inner(
         v.pad_with_zeros(3, 0, geometry.qk_dim - geometry.v_dim)?
             .contiguous()?
     };
+    // Metal 4 tensor kernels compute causal and window masks themselves.
+    #[cfg(target_os = "macos")]
+    if geometry.q_seq > 1
+        && geometry.v_dim == geometry.qk_dim
+        && (causal || window.is_some())
+        && let Some(output) =
+            flash_attention_metal::try_flash_attention(&q, &k, &v, window.unwrap_or(0), scale)?
+    {
+        return Ok(Some(output));
+    }
+
     // The vendored kernel's causal path is bottom-right aligned (query offset
     // kv_seq - q_seq), as cached chunked prefill needs, and skips key blocks
     // past the diagonal. A left window that reaches the first key of the
@@ -2753,6 +2768,62 @@ mod tests {
                 .all(|value| value.to_f32().is_finite() && (value.to_f32() - 4096.0).abs() <= 2.0)
         );
         device.synchronize()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn flash_rows_do_not_depend_on_prompt_chunking() -> Result<()> {
+        let Some(device) = crate::test_metal_device() else {
+            return Ok(());
+        };
+        // Gemma 4 geometry: sliding layers 32/16 heads at 256, global 32/4 at
+        // 512. A 26-token prompt in one pass, then in chunks of 8, 8, 8, 2.
+        for (dim, heads, kv_heads) in [(256usize, 32usize, 16usize), (512, 32, 4)] {
+            let prompt = 26usize;
+            let value = |i: usize, salt: usize| ((i * 31 + salt) % 97) as f32 / 97.0 - 0.5;
+            let tensor = |h: usize, salt: usize| -> Result<Tensor> {
+                Ok(Tensor::from_vec(
+                    (0..h * prompt * dim)
+                        .map(|i| value(i, salt))
+                        .collect::<Vec<_>>(),
+                    (1, h, prompt, dim),
+                    &device,
+                )?
+                .to_dtype(DType::F16)?)
+            };
+            let (q, k, v) = (
+                tensor(heads, 3)?,
+                tensor(kv_heads, 7)?,
+                tensor(kv_heads, 11)?,
+            );
+            for window in [None, Some(1024)] {
+                let run = |q: &Tensor, keys: usize| -> Result<Tensor> {
+                    let (k, v) = (k.narrow(2, 0, keys)?, v.narrow(2, 0, keys)?);
+                    Ok(match window {
+                        None => try_metal_f16_sdpa_native(q, &k, &v, true, 1.0)?,
+                        Some(w) => try_metal_f16_sdpa_windowed_native(q, &k, &v, w, 1.0)?,
+                    }
+                    .expect("supported"))
+                };
+                let all = run(&q, prompt)?.flatten_all()?.to_vec1::<f16>()?;
+                let mut start = 0;
+                for len in [8usize, 8, 8, 2] {
+                    let chunk = run(&q.narrow(2, start, len)?.contiguous()?, start + len)?;
+                    for head in 0..heads {
+                        let got = chunk.narrow(1, head, 1)?.flatten_all()?.to_vec1::<f16>()?;
+                        let base = (head * prompt + start) * dim;
+                        let want = &all[base..base + len * dim];
+                        let differing = got.iter().zip(want).filter(|(a, b)| a != b).count();
+                        assert_eq!(
+                            differing, 0,
+                            "d{dim} window {window:?} chunk at {start} head {head}: {differing} values differ"
+                        );
+                    }
+                    start += len;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3415,10 +3486,14 @@ mod tests {
                     .expect("supported geometry");
                 // The shared helper uses a strict `< tolerance` check. F16
                 // values cannot differ by less than this positive F32 limit.
+                // Head dims 256 and 512 run the Metal 4 flash kernel, which
+                // rounds differently from Steel; dim 64 keeps the exact check.
+                let flash = matches!(dim, 256 | 512)
+                    && super::tensor_qmatmul_metal::supports_tensor_batch_attention(&device)?;
                 assert_close(
                     &actual,
                     &expected,
-                    f32::MIN_POSITIVE,
+                    if flash { 2e-3 } else { f32::MIN_POSITIVE },
                     "trimmed vs full window",
                 )?;
             }

@@ -1442,6 +1442,11 @@ template [[host_name("dinf_tensor_qmatmul_q6k_t128")]] kernel q6k_t128_fn dinf_t
 typedef decltype(dinf_tensor_qmatmul_half_input<block_q8_0, 2, 64, dequantize_q8_0>) q8_0_h64_fn;
 typedef decltype(dinf_tensor_qmatmul_half_input<block_q8_0, 2, 128, dequantize_q8_0>) q8_0_h128_fn;
 template [[host_name("dinf_tensor_qmatmul_q8_0_h64")]] kernel q8_0_h64_fn dinf_tensor_qmatmul_half_input<block_q8_0, 2, 64, dequantize_q8_0>;
+// Narrow tiles of the same kernel: per-row results match the wide tiles, so
+// prompt batches of any size agree (see dispatch_tensor_qmatmul).
+template [[host_name("dinf_tensor_qmatmul_q8_0_h8")]] kernel decltype(dinf_tensor_qmatmul_half_input<block_q8_0, 2, 8, dequantize_q8_0>) dinf_tensor_qmatmul_half_input<block_q8_0, 2, 8, dequantize_q8_0>;
+template [[host_name("dinf_tensor_qmatmul_q8_0_h16")]] kernel decltype(dinf_tensor_qmatmul_half_input<block_q8_0, 2, 16, dequantize_q8_0>) dinf_tensor_qmatmul_half_input<block_q8_0, 2, 16, dequantize_q8_0>;
+template [[host_name("dinf_tensor_qmatmul_q8_0_h32")]] kernel decltype(dinf_tensor_qmatmul_half_input<block_q8_0, 2, 32, dequantize_q8_0>) dinf_tensor_qmatmul_half_input<block_q8_0, 2, 32, dequantize_q8_0>;
 template [[host_name("dinf_tensor_qmatmul_q8_0_h128")]] kernel q8_0_h128_fn dinf_tensor_qmatmul_half_input<block_q8_0, 2, 128, dequantize_q8_0>;
 "#;
 
@@ -1755,6 +1760,13 @@ fn supports_metal_tensor(device: &Device) -> Result<bool> {
         .metal_device()
         .as_ref()
         .supportsFamily(MTLGPUFamily::Metal4))
+}
+
+/// Tensor-operation attention pays off only with the per-core Neural
+/// Accelerators introduced with M5.
+pub(crate) fn supports_tensor_batch_attention(device: &Device) -> Result<bool> {
+    Ok(supports_metal_tensor(device)?
+        && metal_tensor_profile(device)? == MetalTensorProfile::Default)
 }
 
 pub(crate) fn supports_metal_tensor_qmatmul(device: &Device) -> Result<bool> {
@@ -2821,6 +2833,24 @@ impl CustomOp2 for TensorQMatMul {
     }
 }
 
+thread_local! {
+    static SPECULATIVE_VERIFY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` as a speculative target verification pass. Its Q8_0 batches keep
+/// the verification kernels (K-split for eight-token blocks) rather than the
+/// prompt-consistent half-activation path, which is slower for them.
+pub(crate) fn with_speculative_verify<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SPECULATIVE_VERIFY.set(self.0);
+        }
+    }
+    let _restore = Restore(SPECULATIVE_VERIFY.replace(true));
+    f()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_tensor_qmatmul(
     dtype: GgmlDType,
@@ -2858,6 +2888,35 @@ fn dispatch_tensor_qmatmul(
     } else {
         tokens
     };
+    // Q8_0 prompt batches use the half-activation kernel at every size, so a
+    // prompt gives the same per-row results however it is chunked; the narrow
+    // float and K-split kernels round differently. Explicit tiles (DFlash
+    // verification) keep their kernels, and single tokens keep decode's.
+    if dtype == GgmlDType::Q8_0
+        && preferred_tile_tokens.is_none()
+        && !SPECULATIVE_VERIFY.get()
+        && output_groups.is_none()
+        && profile == MetalTensorProfile::Default
+        && tokens >= 2
+        && std::env::var_os("DINF_DISABLE_METAL4_Q8_CONSISTENT_PREFILL").is_none()
+        && dispatch_tensor_pipeline(
+            dtype,
+            in_dim,
+            out_dim,
+            batch,
+            tokens,
+            tile_tokens(tokens),
+            relu_squared_epilogue,
+            false,
+            true,
+            weights,
+            input,
+            input_layout,
+            output,
+        )?
+    {
+        return Ok(true);
+    }
     if dtype == GgmlDType::Q4K
         && (MIN_Q4K_VERIFY_TOKENS..=q4k_verify_max_tokens()).contains(&tokens)
         && out_dim >= q4k_verify_min_out()
@@ -3060,6 +3119,7 @@ fn dispatch_tensor_qmatmul(
         tile_tokens,
         relu_squared_epilogue,
         prefill_weight_reuse,
+        false,
         weights,
         input,
         input_layout,
@@ -3077,6 +3137,7 @@ fn dispatch_tensor_pipeline(
     tile_tokens: usize,
     relu_squared_epilogue: bool,
     prefill_weight_reuse: bool,
+    narrow_half_tiles: bool,
     weights: &MetalStorage,
     input: &MetalStorage,
     input_layout: &Layout,
@@ -3090,7 +3151,7 @@ fn dispatch_tensor_pipeline(
         None
     };
     let half_input = if staged.is_none() {
-        half_input_pipeline(device, dtype, tile_tokens)?
+        half_input_pipeline(device, dtype, tile_tokens, narrow_half_tiles)?
     } else {
         None
     };
@@ -3202,11 +3263,15 @@ fn half_input_pipeline(
     device: &candle_core::MetalDevice,
     dtype: GgmlDType,
     tile_tokens: usize,
+    narrow_tiles: bool,
 ) -> Result<Option<ComputePipeline>> {
     if std::env::var_os("DINF_DISABLE_METAL4_HALF_INPUT_QMM").is_some() {
         return Ok(None);
     }
     let name = match (dtype, tile_tokens) {
+        (GgmlDType::Q8_0, VERIFY_TILE_TOKENS) if narrow_tiles => "dinf_tensor_qmatmul_q8_0_h8",
+        (GgmlDType::Q8_0, TINY_TILE_TOKENS) if narrow_tiles => "dinf_tensor_qmatmul_q8_0_h16",
+        (GgmlDType::Q8_0, SMALL_TILE_TOKENS) if narrow_tiles => "dinf_tensor_qmatmul_q8_0_h32",
         (GgmlDType::Q8_0, MEDIUM_TILE_TOKENS) => "dinf_tensor_qmatmul_q8_0_h64",
         (GgmlDType::Q8_0, LARGE_TILE_TOKENS) => "dinf_tensor_qmatmul_q8_0_h128",
         _ => return Ok(None),
@@ -4025,6 +4090,58 @@ mod tests {
         Ok(())
     }
 
+    /// Q8_0 prompt batches of any size give the same per-row results, so a
+    /// prompt's output does not depend on how it is chunked.
+    #[test]
+    fn q8_0_prompt_rows_do_not_depend_on_batch_size() -> Result<()> {
+        let Some(device) = crate::test_metal_device() else {
+            return Ok(());
+        };
+        if !supports_metal_tensor(&device)?
+            || metal_tensor_profile(&device)? != MetalTensorProfile::Default
+        {
+            return Ok(());
+        }
+        let (width, in_dim, tokens) = (520usize, 512usize, 150usize);
+        let source = Tensor::from_vec(
+            (0..width * in_dim)
+                .map(|i| (i as f32 * 0.0137).sin() * 0.2)
+                .collect::<Vec<_>>(),
+            (width, in_dim),
+            &Device::Cpu,
+        )?;
+        let packed = Arc::new(QTensor::quantize(&source, GgmlDType::Q8_0)?);
+        let projection = MetalTensorQMatMul::try_from_qtensor(packed, &device)?.unwrap();
+        let input = Tensor::from_vec(
+            (0..tokens * in_dim)
+                .map(|i| (i as f32 * 0.021).cos() * 0.4)
+                .collect::<Vec<_>>(),
+            (1, tokens, in_dim),
+            &device,
+        )?;
+        let whole = projection
+            .forward(&input)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for chunk in [2usize, 7, 8, 9, 16, 31, 33, 64, 100] {
+            let mut start = 0;
+            while start < tokens {
+                let len = chunk.min(tokens - start);
+                let part = projection
+                    .forward(&input.narrow(1, start, len)?)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                assert_eq!(
+                    part.as_slice(),
+                    &whole[start * width..(start + len) * width],
+                    "chunk {chunk} at token {start}"
+                );
+                start += len;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn shared_verification_tiles_match_separate_blocks() -> Result<()> {
         let Some(device) = crate::test_metal_device() else {
@@ -4105,6 +4222,10 @@ mod tests {
                 // reduction paths (and is what made the old assertion fail on
                 // M1). The fallback has its own parity coverage below.
                 projection.profile = MetalTensorProfile::Default;
+                // Each block is verified on its own with the same explicit
+                // tile. Ordinary Q8_0 prompt batches use the half-activation
+                // kernel instead, so they agree with each other at every
+                // size rather than with verification blocks.
                 for lanes in [2, 3, 4] {
                     let input = input.narrow(1, 1, lanes * 8)?;
                     let shared = projection.forward_with_tile(&input, Some(8))?;
@@ -4112,7 +4233,7 @@ mod tests {
                     let mut separate_values = Vec::with_capacity(shared_values.len());
                     for lane in 0..lanes {
                         let separate = projection
-                            .forward(&input.narrow(1, lane * 8, 8)?)?
+                            .forward_with_tile(&input.narrow(1, lane * 8, 8)?, Some(8))?
                             .flatten_all()?
                             .to_vec1::<f32>()?;
                         let shared = shared
