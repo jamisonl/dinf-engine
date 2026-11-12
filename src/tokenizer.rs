@@ -11,7 +11,7 @@
 //! atomic encoding does not make them stop tokens or discard their decoded text.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
 use std::sync::LazyLock;
@@ -549,27 +549,48 @@ pub struct GgufTokenizer {
 enum QwenPretokenizer {
     V2,
     V35,
+    /// Llama 3's split: Qwen2's pattern with digits grouped `\p{N}{1,3}`.
+    Llama3,
 }
 
 const QWEN_XHIGH_REASONING_INSTRUCTION: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
 const QWEN_DEFAULT_SYSTEM: &str =
     "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
 
+/// Whether `switch` appears as a whole whitespace-delimited word, so URLs,
+/// paths and words such as `/thinkpad` never toggle or lose text.
+fn has_thinking_switch(content: &str, switch: &str) -> bool {
+    content.split_whitespace().any(|word| word == switch)
+}
+
 fn thinking_control_value(style: ChatStyle, content: &str) -> Option<bool> {
+    let no_think = has_thinking_switch(content, "/no_think");
+    let think = has_thinking_switch(content, "/think");
     match style {
-        ChatStyle::Qwen3 if content.contains("/no_think") => Some(false),
-        ChatStyle::Qwen3 | ChatStyle::Nemotron if content.contains("/think") => Some(true),
-        ChatStyle::Nemotron if content.contains("/no_think") => Some(false),
+        ChatStyle::Qwen3 if no_think => Some(false),
+        ChatStyle::Qwen3 | ChatStyle::Nemotron if think => Some(true),
+        ChatStyle::Nemotron if no_think => Some(false),
         _ => None,
     }
 }
 
+/// Remove standalone `/think` and `/no_think` words, keeping all other text
+/// (including its whitespace) byte for byte.
 fn strip_thinking_controls(content: &str) -> String {
-    content
-        .replace("/no_think", "")
-        .replace("/think", "")
-        .trim()
-        .to_string()
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while !rest.is_empty() {
+        let word_start = rest.find(|c: char| !c.is_whitespace()).unwrap_or(rest.len());
+        out.push_str(&rest[..word_start]);
+        rest = &rest[word_start..];
+        let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..word_end];
+        if word != "/think" && word != "/no_think" {
+            out.push_str(word);
+        }
+        rest = &rest[word_end..];
+    }
+    out.trim().to_string()
 }
 
 /// Conservatively recognize the Qwen3-family generation-prompt branch that
@@ -902,10 +923,11 @@ impl GgufTokenizer {
             let merges_arr = merges_val
                 .to_vec()
                 .context("tokenizer.ggml.merges must be an array")?;
+            let vocab_hashes = MergeVocabHashes::new(vocab_to_id.keys());
             for (rank, merge_val) in merges_arr.iter().enumerate() {
                 let merge_str = gguf_string_value(merge_val)
                     .context("tokenizer.ggml.merges entries must be strings")?;
-                if let Some((left, right)) = parse_merge_pair(&merge_str, &vocab_to_id) {
+                if let Some((left, right)) = parse_merge_pair(&merge_str, &vocab_to_id, &vocab_hashes) {
                     merge_ranks.insert((left, right), rank as u32);
                 }
             }
@@ -1168,6 +1190,7 @@ impl GgufTokenizer {
             qwen_pretokenizer: match tokenizer_pre.as_str() {
                 "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" => Some(QwenPretokenizer::V2),
                 "qwen35" => Some(QwenPretokenizer::V35),
+                "llama3" | "llama-v3" | "llama-bpe" => Some(QwenPretokenizer::Llama3),
                 _ => None,
             },
             special_tokens,
@@ -1689,8 +1712,12 @@ impl GgufTokenizer {
                 out
             }
             ChatStyle::DeepSeekV4 => {
-                let thinking = messages.iter().any(|(role, content)| {
-                    (role == "user" || role == "system") && content.contains("/think")
+                // The tool path reads the switch before wrapping tool data;
+                // plain chats need a standalone `/think` from the user/system.
+                let thinking = thinking_state.unwrap_or_else(|| {
+                    messages.iter().any(|(role, content)| {
+                        (role == "user" || role == "system") && has_thinking_switch(content, "/think")
+                    })
                 });
                 let mut out = if self.add_bos {
                     String::new()
@@ -1710,12 +1737,13 @@ impl GgufTokenizer {
                         }
                         "assistant" => {
                             out.push_str("<｜Assistant｜>");
-                            if content.starts_with("<think>") {
-                                out.push_str(content);
-                            } else {
-                                out.push_str(if thinking { "<think>" } else { "</think>" });
-                                out.push_str(content);
+                            // A past answer is finished text: close the think
+                            // block before it in either mode, as DeepSeek's
+                            // templates do, instead of reopening reasoning.
+                            if !content.starts_with("<think>") {
+                                out.push_str("</think>");
                             }
+                            out.push_str(content);
                             out.push_str("<｜end▁of▁sentence｜>");
                         }
                         _ => out.push_str(content),
@@ -3054,6 +3082,14 @@ fn normalize_tool_messages(
             }
         }
     }
+    if chat_style == ChatStyle::DeepSeekV4 {
+        // Decide before tool definitions join the system prompt and tool
+        // results become user turns; their text must not enable thinking.
+        thinking_state = Some(source.iter().any(|message| {
+            matches!(message.role.as_str(), "system" | "user")
+                && has_thinking_switch(&message.content, "/think")
+        }));
+    }
     let has_instruction =
         !options.tools.is_empty() || !matches!(options.tool_choice, ChatTemplateToolChoice::None);
     if has_instruction {
@@ -3624,13 +3660,65 @@ fn looks_like_special_token(token: &str) -> bool {
         && (token.contains('|') || token.contains('｜')))
 }
 
-fn parse_merge_pair(merge: &str, vocab_to_id: &HashMap<String, u32>) -> Option<(String, String)> {
+const MERGE_HASH_MODULUS: u64 = (1 << 61) - 1;
+
+fn merge_hash_mul(a: u64, b: u64) -> u64 {
+    (u128::from(a) * u128::from(b) % u128::from(MERGE_HASH_MODULUS)) as u64
+}
+
+/// Polynomial hashes (mod 2^61-1, random per-process base) of every
+/// vocabulary entry. Merge splitting tests each candidate half in O(1), so an
+/// untrusted merge full of spaces costs linear rather than quadratic time.
+struct MergeVocabHashes {
+    base: u64,
+    hashes: HashSet<u64>,
+}
+
+impl MergeVocabHashes {
+    fn new<'a>(vocab: impl IntoIterator<Item = &'a String>) -> Self {
+        use std::hash::BuildHasher;
+        let seed = std::collections::hash_map::RandomState::new().hash_one(0_u64);
+        let base = 257 + seed % (MERGE_HASH_MODULUS - 257);
+        let mut hashes = HashSet::new();
+        for token in vocab {
+            let mut hash = 0;
+            for &byte in token.as_bytes() {
+                hash = (merge_hash_mul(hash, base) + u64::from(byte) + 1) % MERGE_HASH_MODULUS;
+            }
+            hashes.insert(hash);
+        }
+        Self { base, hashes }
+    }
+}
+
+fn parse_merge_pair(
+    merge: &str,
+    vocab_to_id: &HashMap<String, u32>,
+    vocab_hashes: &MergeVocabHashes,
+) -> Option<(String, String)> {
+    let bytes = merge.as_bytes();
+    let mut prefix = Vec::with_capacity(bytes.len() + 1);
+    let mut power = Vec::with_capacity(bytes.len() + 1);
+    prefix.push(0_u64);
+    power.push(1_u64);
+    for &byte in bytes {
+        let previous = *prefix.last().unwrap();
+        prefix.push((merge_hash_mul(previous, vocab_hashes.base) + u64::from(byte) + 1) % MERGE_HASH_MODULUS);
+        power.push(merge_hash_mul(*power.last().unwrap(), vocab_hashes.base));
+    }
+    let end = bytes.len();
     for (idx, ch) in merge.char_indices() {
         if ch != ' ' || idx == 0 {
             continue;
         }
         let right_start = idx + ch.len_utf8();
-        if right_start >= merge.len() {
+        if right_start >= end {
+            continue;
+        }
+        let right_hash = (prefix[end] + MERGE_HASH_MODULUS
+            - merge_hash_mul(prefix[right_start], power[end - right_start]))
+            % MERGE_HASH_MODULUS;
+        if !vocab_hashes.hashes.contains(&prefix[idx]) || !vocab_hashes.hashes.contains(&right_hash) {
             continue;
         }
         let left = &merge[..idx];
@@ -3690,11 +3778,20 @@ fn pretokenize_qwen(text: &str, preset: QwenPretokenizer) -> Vec<String> {
         ))
         .expect("valid Qwen3.5 pretokenizer regex")
     });
+    static LLAMA3: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
+            r"|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}",
+            r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|(?P<space>\s+)"
+        ))
+        .expect("valid Llama 3 pretokenizer regex")
+    });
     pretokenize_regex(
         text,
         match preset {
             QwenPretokenizer::V2 => &V2,
             QwenPretokenizer::V35 => &V35,
+            QwenPretokenizer::Llama3 => &LLAMA3,
         },
     )
 }
@@ -4624,6 +4721,24 @@ mod tests {
             formatted,
             "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
+    }
+
+    #[test]
+    fn qwen3_thinking_switches_are_whole_words_only() {
+        let mut tok = test_tokenizer_sp();
+        tok.chat_style = ChatStyle::Qwen3;
+        // A URL containing the switch text neither toggles nor loses bytes.
+        let url = "Summarize https://example.com/thinkpad-review and /no_thinking";
+        assert_eq!(
+            tok.format_chat(&[("user".to_string(), url.to_string())]),
+            format!("<|im_start|>user\n{url}<|im_end|>\n<|im_start|>assistant\n")
+        );
+        // A standalone switch still toggles and is removed, spacing intact.
+        assert_eq!(
+            tok.format_chat(&[("user".to_string(), "Plan  the\ttrip /no_think".to_string())]),
+            "<|im_start|>user\nPlan  the\ttrip<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        assert_eq!(strip_thinking_controls("/think\nHello /thinkpad"), "Hello /thinkpad");
     }
 
     #[test]
@@ -5647,14 +5762,50 @@ mod tests {
     }
 
     #[test]
+    fn llama3_presets_split_like_the_reference_regex() {
+        // Expected splits from Llama 3's tokenizer regex, including the
+        // `\s+(?!\S)` branch that leaves a space for the next word.
+        for (text, expected) in [
+            ("    return x", &["   ", " return", " x"][..]),
+            ("\tfoo", &["\tfoo"][..]),
+            (" (see", &[" (", "see"][..]),
+            (" 2026", &[" ", "202", "6"][..]),
+            ("Hello world!\n\n", &["Hello", " world", "!\n\n"][..]),
+            ("it's 12345", &["it", "'s", " ", "123", "45"][..]),
+        ] {
+            let actual = pretokenize_qwen(text, QwenPretokenizer::Llama3);
+            assert_eq!(actual, expected, "{text:?}");
+            assert_eq!(actual.concat(), text);
+        }
+    }
+
+    #[test]
     fn test_parse_merge_pair_with_leading_space_token() {
         let mut vocab_to_id = HashMap::new();
         vocab_to_id.insert(" ".to_string(), 0);
         vocab_to_id.insert("w".to_string(), 1);
         vocab_to_id.insert(" w".to_string(), 2);
 
-        let pair = parse_merge_pair("  w", &vocab_to_id);
+        let hashes = MergeVocabHashes::new(vocab_to_id.keys());
+        let pair = parse_merge_pair("  w", &vocab_to_id, &hashes);
         assert_eq!(pair, Some((" ".to_string(), "w".to_string())));
+    }
+
+    #[test]
+    fn merge_pair_splitting_is_linear_in_untrusted_spaces() {
+        let vocab_to_id: HashMap<String, u32> =
+            [("a".to_string(), 0), ("b c".to_string(), 1), ("ab".to_string(), 2)].into();
+        let hashes = MergeVocabHashes::new(vocab_to_id.keys());
+        // The first space whose halves are both tokens wins, as before.
+        assert_eq!(
+            parse_merge_pair("a b c", &vocab_to_id, &hashes),
+            Some(("a".to_string(), "b c".to_string()))
+        );
+        assert_eq!(parse_merge_pair("ab x", &vocab_to_id, &hashes), None);
+        // 8 MiB of spaces used to hash every prefix (about 3e13 bytes).
+        let started = std::time::Instant::now();
+        assert_eq!(parse_merge_pair(&" ".repeat(8 << 20), &vocab_to_id, &hashes), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]
@@ -5961,6 +6112,52 @@ mod tests {
                 assert!(prompt.ends_with("<think>\n\n</think>\n\n"));
             }
         }
+    }
+
+    #[test]
+    fn deepseek_v4_thinking_closes_past_answers_and_ignores_tool_text() {
+        let mut tokenizer = test_tokenizer_sp();
+        tokenizer.chat_style = ChatStyle::DeepSeekV4;
+        tokenizer.add_bos = true;
+        // A replayed visible answer is finished text in thinking mode too.
+        let plain = tokenizer.format_chat(&[
+            ("user".to_string(), "/think hi".to_string()),
+            ("assistant".to_string(), "Hello".to_string()),
+            ("user".to_string(), "/think more".to_string()),
+        ]);
+        assert_eq!(
+            plain,
+            "<｜User｜>/think hi<｜Assistant｜></think>Hello<｜end▁of▁sentence｜>\
+             <｜User｜>/think more<｜Assistant｜><think>"
+        );
+        // Words merely containing the switch do not enable thinking.
+        assert!(tokenizer
+            .format_chat(&[("user".to_string(), "see https://x.test/thinking".to_string())])
+            .ends_with("<｜Assistant｜></think>"));
+
+        // Tool definitions and results containing "/think" are data.
+        let prompt = tokenizer
+            .format_chat_with_tool_options(
+                &[
+                    ChatTemplateMessage::new("user", "Find the guide."),
+                    ChatTemplateMessage::new("assistant", "")
+                        .with_tool_calls([ChatTemplateToolCall::new("fetch", "{}").with_id("c1")]),
+                    ChatTemplateMessage::new("tool", "moved to /think and /thinking-guide")
+                        .with_tool_call_id("c1"),
+                ],
+                &ChatTemplateOptions::new([
+                    ChatTemplateTool::new("fetch").with_description("Fetch /think pages")
+                ]),
+            )
+            .unwrap();
+        assert!(prompt.ends_with("<｜Assistant｜></think>"), "{prompt}");
+        let thinking = tokenizer
+            .format_chat_with_tool_options(
+                &[ChatTemplateMessage::new("user", "/think Find the guide.")],
+                &ChatTemplateOptions::new([ChatTemplateTool::new("fetch")]),
+            )
+            .unwrap();
+        assert!(thinking.ends_with("<｜Assistant｜><think>"), "{thinking}");
     }
 
     #[test]
