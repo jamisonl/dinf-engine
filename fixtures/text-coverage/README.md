@@ -13,14 +13,13 @@ limits.
 | `corpus.json` | 24 cases: prose, Rust, arithmetic, JSON, extraction, multilingual text, conversation and retrieval at 512, 2048 and 4096-token budgets. |
 | `corpus-smoke-6.json` | The six-case subset used by the smoke profiles. |
 | `corpus-phi3-boundary-4096.json` | A Phi-3 case that fills the full 4096-token window. |
-| `basic-coverage.json` | Every supported checkpoint with its pinned files and recorded request-state results. |
 | `llama_matrix_reference.cpp` | The llama.cpp reference producer. |
 | `fetch_models.py` | Downloads pinned artifacts and verifies size and hash. |
 | `prepare_bf16.py` | Prepares the Qwen2.5-Coder BF16 file (chat-template metadata only; tensor bytes unchanged). |
 | `build_engine.py`, `build_reference.py` | Build and pin the engine and reference binaries. |
 | `run.py` | Runs one artifact on one backend and keeps all evidence. |
 | `verify_results.py` | Independently recomputes every metric from the saved raw logits. |
-| `run_basic.py` | Runs the short request-state check across `basic-coverage.json`. |
+| `run_basic.py` | Runs the short request-state check across a registry of local model files that you supply. |
 | `compare_tiers.py`, `summarize.py`, `archive_rows.py` | Reporting and archival helpers. |
 | `cpu-reference/` | A repaired llama.cpp CPU attention plugin (see below). |
 
@@ -97,11 +96,13 @@ once its full-precision, Q8_0 and Q4_K_M cells all pass.
 ## Request-state sweep
 
 `run_basic.py` runs the short `basic-v1` check (`qualify_text --smoke`) for
-every artifact in `basic-coverage.json`, verifying each file's hash first and
-enforcing memory and time limits:
+every artifact in a registry file you supply, verifying each file's hash first
+and enforcing memory and time limits. The registry is not part of this
+repository; it lists your local artifacts, their hashes and the backends to
+run:
 
 ```sh
-python3 fixtures/text-coverage/run_basic.py --paths paths.json \
+python3 fixtures/text-coverage/run_basic.py --registry registry.json --paths paths.json \
   --binary target/release/examples/qualify_text --output RESULTS \
   --checksum-cache checksums.json
 ```

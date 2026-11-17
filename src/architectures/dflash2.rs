@@ -93,12 +93,10 @@ enum DraftQMatMul {
 impl DraftQMatMul {
     fn from_qtensor(qt: Arc<QTensor>, _device: &Device) -> Result<Self> {
         #[cfg(target_os = "macos")]
-        if std::env::var_os("DINF_DISABLE_METAL4_QMM").is_none()
-            && let Some(matmul) = super::tensor_qmatmul_metal::MetalTensorQMatMul::try_from_qtensor(
-                Arc::clone(&qt),
-                _device,
-            )?
-        {
+        if let Some(matmul) = super::tensor_qmatmul_metal::MetalTensorQMatMul::try_from_qtensor(
+            Arc::clone(&qt),
+            _device,
+        )? {
             return Ok(Self::MetalTensor(matmul));
         }
         Ok(Self::Candle(QMatMul::from_arc(qt)?))
@@ -222,16 +220,14 @@ impl DynamicConv {
         anyhow::ensure!(side < 2, "DFlash conv side must be zero or one");
         let groups = hidden_size / self.group_size;
         #[cfg(target_os = "macos")]
-        if std::env::var_os("DINF_DISABLE_DFLASH_CONV_METAL").is_none()
-            && let Some(output) = super::dflash2_conv_metal::try_dynamic_conv(
-                input,
-                coefficients,
-                &self.base,
-                side,
-                self.kernel_size,
-                self.group_size,
-            )?
-        {
+        if let Some(output) = super::dflash2_conv_metal::try_dynamic_conv(
+            input,
+            coefficients,
+            &self.base,
+            side,
+            self.kernel_size,
+            self.group_size,
+        )? {
             return Ok(output);
         }
         let coefficients = coefficients.reshape((batch, seq_len, 2, self.kernel_size, groups))?;
@@ -923,9 +919,7 @@ impl DFlash2Draft {
             "DFlash output row count changed"
         );
         #[cfg(target_os = "macos")]
-        let metal_top_k = if self.device.is_metal()
-            && std::env::var_os("DINF_DISABLE_DFLASH_TOPK_METAL").is_none()
-        {
+        let metal_top_k = if self.device.is_metal() {
             // The validity check is deferred to the candidate read below,
             // which the CPU selector tables need anyway: one GPU round trip.
             super::dflash2_topk_metal::try_top_k_deferred(
@@ -972,10 +966,7 @@ impl DFlash2Draft {
         let candidate_rows = candidates.to_vec2::<u32>()?;
         check_candidate_ids(&candidate_rows, logits.dims2()?.1)?;
         #[cfg(target_os = "macos")]
-        if self.device.is_metal()
-            && self.selector_top_k <= 16
-            && std::env::var_os("DINF_DISABLE_DFLASH_SELECTOR_METAL").is_none()
-        {
+        if self.device.is_metal() && self.selector_top_k <= 16 {
             let host_ids = |rows: std::ops::Range<usize>| {
                 candidate_rows[rows]
                     .iter()

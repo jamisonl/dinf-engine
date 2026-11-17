@@ -278,7 +278,7 @@ fn native_tile_cpu_public_prefix_baseline_survives_tail_and_error_reset() -> Res
     let scope = "public-synthetic-prefix-baseline-cpu";
     let mut prefix = GenerationSession::new(&s, prompt[..8192].to_vec(), params.clone(), vec![]);
     prefix.enable_prompt_cache(scope.into());
-    prefix.set_speculative_decoding_enabled(false);
+    prefix.set_speculative_decoding_enabled(&s, false);
     while !prefix.is_finished() {
         prefix.step_with_prefill_budget(&mut s, 128)?;
     }
@@ -303,7 +303,7 @@ fn native_tile_cpu_public_prefix_baseline_survives_tail_and_error_reset() -> Res
     assert!(baseline.1 >= fixed);
     for inject_error in [false, true] {
         let mut arm = GenerationSession::new(&s, prompt.clone(), params.clone(), vec![]);
-        arm.set_speculative_decoding_enabled(false);
+        arm.set_speculative_decoding_enabled(&s, false);
         arm.enable_prompt_cache(scope.into());
         assert!(arm.step_with_prefill_budget(&mut s, 1)?.is_none());
         assert_eq!(arm.reused_prompt_tokens(), 8192);
@@ -776,7 +776,7 @@ fn deepseek41_metal_cancelled_input_native_forks_match_cold_and_revoke() -> Resu
     };
     let mut stopped = GenerationSession::new(&s, prompt.clone(), params.clone(), vec![]);
     stopped.enable_prompt_cache(scope.into());
-    stopped.set_speculative_decoding_enabled(false);
+    stopped.set_speculative_decoding_enabled(&s, false);
     assert!(stopped.step_with_prefill_budget(&mut s, 128)?.is_none());
     assert_eq!(stopped.next_position(&s), 128);
     let charge = s.total_kv_cache_allocation_tokens();
@@ -879,10 +879,10 @@ fn deepseek41_metal_cancelled_input_native_forks_match_cold_and_revoke() -> Resu
     drop(unchanged);
     let mut resumed = GenerationSession::new(&s, prompt.clone(), params.clone(), vec![]);
     resumed.enable_prompt_cache(scope.into());
-    resumed.set_speculative_decoding_enabled(false);
+    resumed.set_speculative_decoding_enabled(&s, false);
     resumed.step_with_prefill_budget(&mut s, 128)?;
     let mut cold = GenerationSession::new(&s, prompt, params, vec![]);
-    cold.set_speculative_decoding_enabled(false);
+    cold.set_speculative_decoding_enabled(&s, false);
     while !cold.is_finished() {
         cold.step_with_prefill_budget(&mut s, 128)?;
     }

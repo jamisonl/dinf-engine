@@ -120,7 +120,7 @@ fn ptx() -> candle_core::Result<&'static str> {
 }
 
 pub(super) fn precompile(device: &candle_core::Device) -> anyhow::Result<()> {
-    if !device.is_cuda() || std::env::var_os("DINF_DISABLE_DEEPSEEK_FUSED_MLA_CUDA").is_some() {
+    if !device.is_cuda() {
         return Ok(());
     }
     device
@@ -314,8 +314,7 @@ pub(super) fn try_fused_mla_layout(
     kv_rank: usize,
     start_pos: usize,
 ) -> candle_core::Result<Option<(Tensor, Tensor, Tensor)>> {
-    if std::env::var_os("DINF_DISABLE_DEEPSEEK_FUSED_MLA_CUDA").is_some()
-        || !q.device().is_cuda()
+    if !q.device().is_cuda()
         || q.dtype() != DType::F32
         || kv.dtype() != DType::F32
         || kv_mixed.dtype() != DType::F32

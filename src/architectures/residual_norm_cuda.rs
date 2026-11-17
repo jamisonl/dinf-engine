@@ -3,7 +3,10 @@
 //! Pre-norm transformer blocks repeatedly add a residual and immediately
 //! normalize the result. Returning the rounded residual and its normalized
 //! view from one kernel removes one launch and one allocation at each norm
-//! boundary while preserving Candle's f32 reduction order.
+//! boundary while preserving Candle's f32 reduction order. The kernel also
+//! writes the normalized row's Q8_1 form, which the quantized products of
+//! that row then use instead of launching their own quantization (see
+//! `q8_1_epilogue_cuda`).
 
 use std::sync::OnceLock;
 
@@ -16,7 +19,7 @@ use candle_core::{
 };
 
 const WARP_SIZE: usize = 32;
-const CUDA_MODULE_NAME: &str = "dinf_residual_rms_norm_v1";
+const CUDA_MODULE_NAME: &str = "dinf_residual_rms_norm_v2";
 const CUDA_KERNEL_NAME: &str = "dinf_residual_rms_norm_f32";
 
 const CUDA_SOURCE: &str = r#"
@@ -61,9 +64,18 @@ extern "C" __global__ void dinf_residual_rms_norm_f32(
 
     const float mean = sum / hidden_dim;
     const float scale = rsqrtf(mean + eps);
-    for (int column = tid; column < hidden_dim; column += block_size) {
-        const float scaled = __fmul_rn(scale, output[column]);
-        output[hidden_dim + column] = __fmul_rn(scaled, weight[column]);
+    // The loop runs over the quantizer's padded row, whose length is a
+    // multiple of 32, so a warp's lanes stay together: the normalized row's
+    // Q8_1 form follows the two planes.
+    const int end = dinf_q8_1_padded(hidden_dim);
+    for (int column = tid; column < end; column += block_size) {
+        float value = 0.0f;
+        if (column < hidden_dim) {
+            const float scaled = __fmul_rn(scale, output[column]);
+            value = __fmul_rn(scaled, weight[column]);
+            output[hidden_dim + column] = value;
+        }
+        dinf_q8_1_store(output + 2 * hidden_dim, column, value);
     }
 }
 "#;
@@ -74,7 +86,7 @@ static FAST_PATH_LOGGED: OnceLock<()> = OnceLock::new();
 fn ptx() -> candle_core::Result<&'static str> {
     match PTX.get_or_init(|| {
         compile_ptx_with_opts(
-            CUDA_SOURCE,
+            format!("{}{}", super::q8_1_epilogue_cuda::SOURCE, CUDA_SOURCE),
             CompileOptions {
                 name: Some("residual_rms_norm.cu".to_string()),
                 use_fast_math: Some(false),
@@ -90,7 +102,7 @@ fn ptx() -> candle_core::Result<&'static str> {
 }
 
 pub(super) fn precompile(device: &Device) -> anyhow::Result<()> {
-    if !device.is_cuda() || std::env::var_os("DINF_DISABLE_CUDA_RESIDUAL_NORM").is_some() {
+    if !device.is_cuda() {
         return Ok(());
     }
     let device = device.as_cuda_device()?;
@@ -161,8 +173,12 @@ impl candle_core::CustomOp2 for ResidualRmsNorm {
         let output_elements = self
             .hidden_dim
             .checked_mul(2)
+            .and_then(|planes| {
+                planes.checked_add(super::q8_1_epilogue_cuda::tail_elements(self.hidden_dim))
+            })
             .ok_or_else(|| candle_core::Error::Msg("residual RMSNorm output overflow".into()))?;
-        // SAFETY: The kernel writes both complete output planes.
+        // SAFETY: The kernel writes both complete output planes and the
+        // normalized plane's Q8_1 form after them.
         let mut output = unsafe { device.alloc::<f32>(output_elements)? };
         let function =
             device.get_or_load_custom_func(CUDA_KERNEL_NAME, CUDA_MODULE_NAME, ptx()?)?;
@@ -259,8 +275,7 @@ pub(super) fn forward(
     eps: f32,
 ) -> anyhow::Result<Option<(Tensor, Tensor)>> {
     let hidden_dim = residual.dim(candle_core::D::Minus1)?;
-    if std::env::var_os("DINF_DISABLE_CUDA_RESIDUAL_NORM").is_some()
-        || hidden_dim == 0
+    if hidden_dim == 0
         || !residual.device().is_cuda()
         || residual.dtype() != DType::F32
         || update.dtype() != DType::F32
@@ -271,7 +286,7 @@ pub(super) fn forward(
         || residual.shape() != update.shape()
         || residual.elem_count() != hidden_dim
         || weight.elem_count() != hidden_dim
-        || hidden_dim > i32::MAX as usize
+        || hidden_dim > i32::MAX as usize - 512
         || !residual.device().same_device(update.device())
         || !residual.device().same_device(weight.device())
     {
@@ -289,6 +304,7 @@ pub(super) fn forward(
             eps,
         },
     )?;
+    super::q8_1_epilogue_cuda::publish(&packed, hidden_dim, hidden_dim, 2 * hidden_dim)?;
     let residual = packed.narrow(0, 0, 1)?.reshape(shape.clone())?;
     let normalized = packed.narrow(0, 1, 1)?.reshape(shape)?;
     FAST_PATH_LOGGED.get_or_init(|| {

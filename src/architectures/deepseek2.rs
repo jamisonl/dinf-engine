@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -41,7 +40,6 @@ mod native_yarn;
 
 // ===== Helpers =====
 
-static PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
 static ATTN_NORM_NS: AtomicU64 = AtomicU64::new(0);
 static ATTN_NS: AtomicU64 = AtomicU64::new(0);
 static ATTN_RESIDUAL_NS: AtomicU64 = AtomicU64::new(0);
@@ -55,7 +53,7 @@ static PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
 static MOE_PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
 
 fn layer_profile_enabled() -> bool {
-    *PROFILE_ENABLED.get_or_init(|| std::env::var_os("DINF_PROFILE_LAYERS").is_some())
+    super::profiling::layer_profiling_enabled()
 }
 
 fn finish_profile_region(device: &Device, started: Instant, counter: &AtomicU64) -> Result<()> {
@@ -200,31 +198,6 @@ fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
     candle_nn::ops::softmax_last_dim(x).map_err(Into::into)
 }
 
-fn trace_tensor(label: &str, layer: usize, tensor: &Tensor) -> Result<()> {
-    if std::env::var_os("DINF_TRACE_DEEPSEEK").is_none() {
-        return Ok(());
-    }
-    let values = tensor
-        .flatten_all()?
-        .to_dtype(DType::F32)?
-        .to_vec1::<f32>()?;
-    let head = values.iter().take(3).copied().collect::<Vec<_>>();
-    let mut tail = values.iter().rev().take(3).copied().collect::<Vec<_>>();
-    tail.reverse();
-    let sum = values.iter().map(|value| *value as f64).sum::<f64>();
-    tracing::info!(
-        target: "dinf_engine::deepseek_trace",
-        label,
-        layer,
-        shape = ?tensor.dims(),
-        ?head,
-        ?tail,
-        sum,
-        "DeepSeek tensor"
-    );
-    Ok(())
-}
-
 fn create_causal_mask(seq_len: usize, total_seq_len: usize, device: &Device) -> Result<Tensor> {
     let mask: Vec<f32> = (0..seq_len)
         .flat_map(|i| {
@@ -287,7 +260,6 @@ impl MlaAttention {
         kv_cache: &mut Option<KvCache>,
         seq_len: usize,
         start_pos: usize,
-        layer: usize,
         arithmetic: Option<TextArithmeticPolicy>,
     ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
@@ -330,64 +302,51 @@ impl MlaAttention {
                 cpu_math::project_rows(q_b, &q_latent, rows)?
             }
         };
-        trace_tensor("q", layer, &q)?;
 
         // 2. KV path: compress → split latent + k_pe → norm latent → expand → split k_nope + v
-        trace_tensor("kv_cmpr_pe", layer, &kv_mixed)?;
         let kv_latent = kv_mixed.narrow(D::Minus1, 0, self.kv_lora_rank)?;
         let kv_normed = self.kv_a_norm.forward(&kv_latent)?;
         let kv = cpu_math::project_rows(&self.kv_b, &kv_normed, rows)?;
-        trace_tensor("kv", layer, &kv)?;
 
         // 3. Layout heads, apply partial RoPE, and assemble full Q/K/V.
         #[cfg(target_os = "macos")]
-        let fused_layout = if std::env::var_os("DINF_DISABLE_DEEPSEEK_FUSED_MLA_LAYOUT").is_none()
-            && std::env::var_os("DINF_TRACE_DEEPSEEK").is_none()
-        {
-            super::deepseek_mla_metal::try_fused_mla_layout(
-                &q,
-                &kv,
-                &kv_mixed,
-                &self.rope_cos,
-                &self.rope_sin,
-                b,
-                s,
-                self.num_heads,
-                self.qk_nope_head_dim,
-                self.qk_rope_head_dim,
-                self.v_head_dim,
-                self.kv_lora_rank,
-                start_pos,
-            )?
-        } else {
-            None
-        };
+        let fused_layout = super::deepseek_mla_metal::try_fused_mla_layout(
+            &q,
+            &kv,
+            &kv_mixed,
+            &self.rope_cos,
+            &self.rope_sin,
+            b,
+            s,
+            self.num_heads,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.v_head_dim,
+            self.kv_lora_rank,
+            start_pos,
+        )?;
         #[cfg(all(feature = "cuda", not(target_os = "macos")))]
-        let fused_layout = if std::env::var_os("DINF_TRACE_DEEPSEEK").is_none() {
-            super::deepseek_mla_cuda::try_fused_mla_layout(
-                &q,
-                &kv,
-                &kv_mixed,
-                &self.rope_cos,
-                &self.rope_sin,
-                b,
-                s,
-                self.num_heads,
-                self.qk_nope_head_dim,
-                self.qk_rope_head_dim,
-                self.v_head_dim,
-                self.kv_lora_rank,
-                start_pos,
-            )?
-        } else {
-            None
-        };
+        let fused_layout = super::deepseek_mla_cuda::try_fused_mla_layout(
+            &q,
+            &kv,
+            &kv_mixed,
+            &self.rope_cos,
+            &self.rope_sin,
+            b,
+            s,
+            self.num_heads,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.v_head_dim,
+            self.kv_lora_rank,
+            start_pos,
+        )?;
         #[cfg(all(not(feature = "cuda"), not(target_os = "macos")))]
         let fused_layout: Option<(Tensor, Tensor, Tensor)> = None;
         let (q, k, v) = if let Some(layout) = fused_layout {
             layout
         } else {
-            self.portable_mla_layout(q, kv, &kv_mixed, b, s, start_pos, layer)?
+            self.portable_mla_layout(q, kv, &kv_mixed, b, s, start_pos)?
         };
 
         // 4. KV cache (naive V1: store full decompressed K/V)
@@ -422,14 +381,8 @@ impl MlaAttention {
             output
         } else if let Some(output) = cpu_math::attention(&q, &k, &v, self.softmax_scale)? {
             output
-        } else if std::env::var_os("DINF_TRACE_DEEPSEEK").is_none()
-            && let Some(output) = super::try_fused_f16_sdpa_native(
-                &q,
-                &k,
-                &v,
-                seq_len > 1,
-                self.softmax_scale as f32,
-            )?
+        } else if let Some(output) =
+            super::try_fused_f16_sdpa_native(&q, &k, &v, seq_len > 1, self.softmax_scale as f32)?
         {
             output
         } else {
@@ -443,10 +396,8 @@ impl MlaAttention {
                 att
             };
             let att = softmax_last_dim(&att)?;
-            trace_tensor("attn_weights", layer, &att)?;
             att.matmul(&v.contiguous()?)?
         };
-        trace_tensor("kqv_out", layer, &out)?;
 
         // 6. Output projection
         let out = out
@@ -460,7 +411,6 @@ impl MlaAttention {
         cpu_math::project_rows(&self.o_proj, &out, rows)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn portable_mla_layout(
         &self,
         q: Tensor,
@@ -469,7 +419,6 @@ impl MlaAttention {
         batch: usize,
         seq_len: usize,
         start_pos: usize,
-        layer: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim;
         let q = q
@@ -477,7 +426,6 @@ impl MlaAttention {
             .transpose(1, 2)?;
         let q_nope = q.narrow(D::Minus1, 0, self.qk_nope_head_dim)?;
         let q_pe = q.narrow(D::Minus1, self.qk_nope_head_dim, self.qk_rope_head_dim)?;
-        trace_tensor("q_pe", layer, &q_pe)?;
         let q_pe = if let Some(rotated) =
             native_yarn::apply(&q_pe, start_pos, self.rope_cos.dim(0)?, self.native_yarn)?
         {
@@ -485,13 +433,11 @@ impl MlaAttention {
         } else {
             apply_rotary_emb(&q_pe, start_pos, &self.rope_cos, &self.rope_sin)?
         };
-        trace_tensor("q_pe_rope", layer, &q_pe)?;
 
         let k_pe = kv_mixed
             .narrow(D::Minus1, self.kv_lora_rank, self.qk_rope_head_dim)?
             .reshape((batch, seq_len, 1, self.qk_rope_head_dim))?
             .transpose(1, 2)?;
-        trace_tensor("k_pe", layer, &k_pe)?;
         let k_pe = if let Some(rotated) =
             native_yarn::apply(&k_pe, start_pos, self.rope_cos.dim(0)?, self.native_yarn)?
         {
@@ -499,7 +445,6 @@ impl MlaAttention {
         } else {
             apply_rotary_emb(&k_pe, start_pos, &self.rope_cos, &self.rope_sin)?
         };
-        trace_tensor("k_pe_rope", layer, &k_pe)?;
 
         let kv = kv
             .reshape((
@@ -768,12 +713,7 @@ impl MoeLayer {
 
         #[cfg(target_os = "macos")]
         let fused_indexed_routing = match &self.experts {
-            MoeExperts::Indexed(_)
-                if self.experts.len() <= 128
-                    && self.num_active <= 16
-                    && std::env::var_os("DINF_DISABLE_DEEPSEEK_GPU_ROUTING").is_none()
-                    && std::env::var_os("DINF_DISABLE_FUSED_SOFTMAX_ROUTING").is_none() =>
-            {
+            MoeExperts::Indexed(_) if self.experts.len() <= 128 && self.num_active <= 16 => {
                 Some(fused_softmax_topk_route(
                     &router_logits.contiguous()?,
                     self.num_active,
@@ -799,9 +739,7 @@ impl MoeLayer {
             Some(routing)
         } else {
             match &self.experts {
-                MoeExperts::Indexed(_)
-                    if std::env::var_os("DINF_DISABLE_DEEPSEEK_GPU_ROUTING").is_none() =>
-                {
+                MoeExperts::Indexed(_) => {
                     let router_probs = router_probs
                         .as_ref()
                         .context("missing DeepSeek router probabilities")?;
@@ -1200,7 +1138,6 @@ impl DeepSeek2Stage {
                 }
             }
         };
-        trace_tensor("embd", 0, &hidden_states)?;
 
         for (i, block) in self.blocks.iter().enumerate() {
             let profile = layer_profile_enabled();
@@ -1225,16 +1162,13 @@ impl DeepSeek2Stage {
                     if profile {
                         finish_profile_region(normed.device(), started, &ATTN_NORM_NS)?;
                     }
-                    trace_tensor("attn_norm", i, &normed)?;
                     let started = Instant::now();
                     let attn_out = with_kv_cache(&mut cache[i], |kv| {
-                        b.attn
-                            .forward(&normed, kv, seq_len, start_pos, i, arithmetic)
+                        b.attn.forward(&normed, kv, seq_len, start_pos, arithmetic)
                     })?;
                     if profile {
                         finish_profile_region(attn_out.device(), started, &ATTN_NS)?;
                     }
-                    trace_tensor("attn_out", i, &attn_out)?;
                     let normed = if profile {
                         let started = Instant::now();
                         hidden_states = (hidden_states + attn_out)?;
@@ -1249,21 +1183,17 @@ impl DeepSeek2Stage {
                         hidden_states = residual;
                         normed
                     };
-                    trace_tensor("ffn_inp", i, &hidden_states)?;
                     // FFN with residual
-                    trace_tensor("ffn_norm", i, &normed)?;
                     let started = Instant::now();
                     let ffn_out = b.ffn.forward_rows(&normed, ffn_rows)?;
                     if profile {
                         finish_profile_region(ffn_out.device(), started, &FFN_NS)?;
                     }
-                    trace_tensor("ffn_out", i, &ffn_out)?;
                     let started = Instant::now();
                     hidden_states = (hidden_states + ffn_out)?;
                     if profile {
                         finish_profile_region(hidden_states.device(), started, &FFN_RESIDUAL_NS)?;
                     }
-                    trace_tensor("l_out", i, &hidden_states)?;
                 }
                 DeepSeekBlock::Moe(b) => {
                     // Attention with residual
@@ -1272,16 +1202,13 @@ impl DeepSeek2Stage {
                     if profile {
                         finish_profile_region(normed.device(), started, &ATTN_NORM_NS)?;
                     }
-                    trace_tensor("attn_norm", i, &normed)?;
                     let started = Instant::now();
                     let attn_out = with_kv_cache(&mut cache[i], |kv| {
-                        b.attn
-                            .forward(&normed, kv, seq_len, start_pos, i, arithmetic)
+                        b.attn.forward(&normed, kv, seq_len, start_pos, arithmetic)
                     })?;
                     if profile {
                         finish_profile_region(attn_out.device(), started, &ATTN_NS)?;
                     }
-                    trace_tensor("attn_out", i, &attn_out)?;
                     let normed = if profile {
                         let started = Instant::now();
                         hidden_states = (hidden_states + attn_out)?;
@@ -1296,21 +1223,17 @@ impl DeepSeek2Stage {
                         hidden_states = residual;
                         normed
                     };
-                    trace_tensor("ffn_inp", i, &hidden_states)?;
                     // MoE FFN with residual
-                    trace_tensor("ffn_norm", i, &normed)?;
                     let started = Instant::now();
                     let moe_out = b.moe.forward_rows(&normed, ffn_rows)?;
                     if profile {
                         finish_profile_region(moe_out.device(), started, &FFN_NS)?;
                     }
-                    trace_tensor("ffn_out", i, &moe_out)?;
                     let started = Instant::now();
                     hidden_states = (hidden_states + moe_out)?;
                     if profile {
                         finish_profile_region(hidden_states.device(), started, &FFN_RESIDUAL_NS)?;
                     }
-                    trace_tensor("l_out", i, &hidden_states)?;
                 }
             }
         }

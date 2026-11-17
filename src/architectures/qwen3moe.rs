@@ -6,7 +6,6 @@ use candle_core::D;
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
 
-#[cfg(target_os = "macos")]
 #[cfg(any(target_os = "macos", feature = "cuda"))]
 use super::indexed_moe::{
     IndexedMoeMatMul, indexed_moe_available, normalized_route_weights, silu_mul, weighted_route_sum,
@@ -333,10 +332,7 @@ impl Attention {
             && self.q_norm.weight.device().same_device(q.device())
             && self.k_norm.weight.device().same_device(k.device());
         #[cfg(target_os = "macos")]
-        let fused_qk_layout_norm = if !native_qk_norm
-            && seq_len > 1
-            && std::env::var_os("DINF_DISABLE_QWEN3_FUSED_QK_LAYOUT_NORM").is_none()
-        {
+        let fused_qk_layout_norm = if !native_qk_norm && seq_len > 1 {
             // Fold the NeoX rope into the per-head norm when the tables cover
             // this chunk; otherwise normalize here and rotate below.
             let norm_rope =
@@ -519,10 +515,8 @@ impl Attention {
         let attn_output = super::restore_quantized_attention_output(attn_output, rotation)?;
 
         #[cfg(target_os = "macos")]
-        let attn_output = if std::env::var_os("DINF_DISABLE_FUSED_ATTENTION_OUTPUT_LAYOUT")
-            .is_none()
-            && let Some(output) =
-                super::qkv_layout_metal::try_fused_attention_output_layout(&attn_output)?
+        let attn_output = if let Some(output) =
+            super::qkv_layout_metal::try_fused_attention_output_layout(&attn_output)?
         {
             output
         } else {
@@ -813,12 +807,7 @@ impl MoeLayer {
 
         #[cfg(target_os = "macos")]
         let fused_indexed_routing = match &self.experts {
-            MoeExperts::Indexed(_)
-                if self.experts.len() <= 128
-                    && self.num_active <= 16
-                    && std::env::var_os("DINF_DISABLE_QWEN3_GPU_ROUTING").is_none()
-                    && std::env::var_os("DINF_DISABLE_FUSED_SOFTMAX_ROUTING").is_none() =>
-            {
+            MoeExperts::Indexed(_) if self.experts.len() <= 128 && self.num_active <= 16 => {
                 // f32 IDs: the experts' single sanitize pass converts them.
                 Some(super::fused_route_metal::fused_softmax_topk_route_f32_ids(
                     &router_logits.contiguous()?,
@@ -845,9 +834,7 @@ impl MoeLayer {
             Some(routing)
         } else {
             match &self.experts {
-                MoeExperts::Indexed(_)
-                    if std::env::var_os("DINF_DISABLE_QWEN3_GPU_ROUTING").is_none() =>
-                {
+                MoeExperts::Indexed(_) => {
                     let router_probs = router_probs
                         .as_ref()
                         .context("missing Qwen3-MoE router probabilities")?;
@@ -889,27 +876,10 @@ impl MoeLayer {
             }
             #[cfg(any(target_os = "macos", feature = "cuda"))]
             MoeExperts::Indexed(experts) => {
-                let cpu_routing;
-                let (expert_ids, expert_weights) = if let Some(indexed) = indexed_routing.as_ref() {
-                    (&indexed.0, &indexed.1)
-                } else {
-                    let routing = routing
-                        .as_ref()
-                        .context("missing host Qwen3-MoE routing values")?;
-                    let mut ids = Vec::with_capacity(num_tokens * self.num_active);
-                    let mut weights = Vec::with_capacity(num_tokens * self.num_active);
-                    for row in routing {
-                        for (expert_id, weight) in self.selected_experts(row)? {
-                            ids.push(expert_id as u32);
-                            weights.push(weight);
-                        }
-                    }
-                    cpu_routing = (
-                        Tensor::from_vec(ids, (num_tokens, self.num_active), x.device())?,
-                        Tensor::from_vec(weights, (num_tokens, self.num_active), x.device())?,
-                    );
-                    (&cpu_routing.0, &cpu_routing.1)
-                };
+                // Indexed experts always route on the device (above).
+                let (expert_ids, expert_weights) = indexed_routing
+                    .as_ref()
+                    .context("missing indexed Qwen3-MoE routing")?;
                 experts.forward(
                     &flat_x,
                     expert_ids,
@@ -1290,8 +1260,7 @@ impl ModelArchitecture for Qwen3MoeStage {
 
     fn text_arithmetic_policy(&self, context: TextRequestContext) -> Option<TextArithmeticPolicy> {
         #[cfg(target_os = "macos")]
-        if std::env::var_os("DINF_DISABLE_INDEXED_MOE_MV").is_none()
-            && !self.blocks.is_empty()
+        if !self.blocks.is_empty()
             && self.blocks.iter().all(|b| {
                 b.attn.quant_config.is_none()
                     && b.attn.native_qkv.is_some()
@@ -1438,9 +1407,7 @@ fn build_moe_block(
     // Prompt chunks use the tensor-core kernels. Share the native decode
     // kernels' packed weights when present; otherwise copy from the GGUF.
     #[cfg(target_os = "macos")]
-    let prompt_projections = if device.is_metal()
-        && std::env::var_os("DINF_DISABLE_QWEN3_TENSOR_PROMPT_PROJECTIONS").is_none()
-    {
+    let prompt_projections = if device.is_metal() {
         use super::tensor_qmatmul_metal::MetalTensorQMatMul;
         let names = [
             "attn_q.weight",
@@ -1627,8 +1594,7 @@ fn build_moe_block(
             if use_indexed {
                 let indexed = IndexedMoeExperts {
                     #[cfg(target_os = "macos")]
-                    native_vector: std::env::var_os("DINF_DISABLE_INDEXED_MOE_MV").is_none()
-                        && attn.native_qkv.is_some()
+                    native_vector: attn.native_qkv.is_some()
                         && attn.quant_config.is_none()
                         && native_metal_expert_types(
                             gate_exps.as_ref(),

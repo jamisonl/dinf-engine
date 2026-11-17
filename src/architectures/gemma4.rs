@@ -1,3 +1,9 @@
+// The mixture-of-experts path needs Metal or CUDA kernels; elsewhere it only
+// reports that, which leaves its helpers unused.
+#![cfg_attr(
+    not(any(target_os = "macos", feature = "cuda")),
+    allow(dead_code, unused_variables, unreachable_code)
+)]
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -42,20 +48,22 @@ static FFN_POST_NORM_NS: AtomicU64 = AtomicU64::new(0);
 static FFN_RESIDUAL_NS: AtomicU64 = AtomicU64::new(0);
 static OUTPUT_SCALE_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
-static PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn layer_profile_enabled() -> bool {
-    *PROFILE_ENABLED.get_or_init(|| std::env::var_os("DINF_PROFILE_LAYERS").is_some())
+    super::profiling::layer_profiling_enabled()
 }
 
-fn finish_profile_region(device: &Device, started: Instant, counter: &AtomicU64) -> Result<()> {
-    device.synchronize()?;
-    counter.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    Ok(())
+fn finish_profile_region(
+    device: &Device,
+    started: Instant,
+    counter: &'static AtomicU64,
+) -> Result<()> {
+    super::profiling::finish_region(device, started, counter)
 }
 
 /// Reset the process-local Gemma 4 layer profiling counters.
 pub fn reset_layer_profile() {
+    super::profiling::clear_device_regions();
     for counter in [
         &ATTN_NORM_NS,
         &Q_PROJ_NS,
@@ -89,6 +97,7 @@ pub fn reset_layer_profile() {
 
 /// Print the process-local Gemma 4 layer profiling counters to stderr.
 pub fn report_layer_profile() {
+    super::profiling::drain_device_regions();
     let calls = PROFILE_CALLS.load(Ordering::Relaxed).max(1) as f64;
     let ms_per_call =
         |counter: &AtomicU64| counter.load(Ordering::Relaxed) as f64 / calls / 1_000_000.0;
@@ -136,7 +145,7 @@ pub fn report_layer_profile() {
 /// - GELU-gated FFN
 /// - per-layer output scale after the full block residual
 pub struct Gemma4Stage {
-    embedding: Option<Tensor>,
+    embedding: Option<GemmaEmbedding>,
     blocks: Vec<TransformerBlock>,
     output_norm: Option<RmsNorm>,
     lm_head: Option<QMatMul>,
@@ -159,6 +168,29 @@ struct TransformerBlock {
     moe: Option<Box<GemmaMoe>>,
     ffn_post_norm: RmsNorm,
     layer_output_scale: Option<Tensor>,
+}
+
+/// Token embedding table: dense F32, or the packed GGUF tensor when the
+/// device can dequantize selected rows itself.
+enum GemmaEmbedding {
+    Dense(Tensor),
+    Packed(Arc<QTensor>),
+}
+
+impl GemmaEmbedding {
+    /// F32 rows `[tokens, hidden]` on `device`.
+    fn rows(&self, tokens: &[u32], device: &Device) -> Result<Tensor> {
+        match self {
+            Self::Dense(table) => {
+                let ids = Tensor::new(tokens, device)?;
+                Ok(table.index_select(&ids, 0)?)
+            }
+            Self::Packed(table) => {
+                let ids = Tensor::new(tokens, &table.device())?;
+                Ok(table.embedding(&ids)?.to_device(device)?)
+            }
+        }
+    }
 }
 
 /// Gemma 4 routed experts, following llama.cpp's `gemma4.cpp`: the router
@@ -190,6 +222,17 @@ struct GemmaExperts {
 #[cfg(not(any(target_os = "macos", feature = "cuda")))]
 struct GemmaExperts;
 
+/// Output of the routed experts of a layer.
+#[cfg(any(target_os = "macos", feature = "cuda"))]
+enum RoutedExperts {
+    /// The weighted sum over each token's routes, `[batch, seq, hidden]`.
+    Summed(Tensor),
+    /// One token's routes `[1, top_k, hidden]` and weights `[1, top_k]`.
+    /// Only the CUDA post-FFN kernel asks for them.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    Routes { routes: Tensor, weights: Tensor },
+}
+
 impl GemmaMoe {
     /// Token count from which the router matmul uses a contiguous transpose.
     const ROUTER_TRANSPOSE_MIN_TOKENS: usize = 32;
@@ -206,29 +249,56 @@ impl GemmaMoe {
     /// the attention residual.
     #[cfg(any(target_os = "macos", feature = "cuda"))]
     fn forward(&self, expert_input: &Tensor, router_input: &Tensor) -> Result<Tensor> {
+        match self.forward_routes(expert_input, router_input, false)? {
+            RoutedExperts::Summed(routed) => Ok(routed),
+            RoutedExperts::Routes { .. } => unreachable!("routes were not requested"),
+        }
+    }
+
+    /// [`Self::forward`], except that with `keep_routes` one token's routes
+    /// are returned unsummed with their weights, for a caller whose next
+    /// kernel sums them.
+    #[cfg(any(target_os = "macos", feature = "cuda"))]
+    fn forward_routes(
+        &self,
+        expert_input: &Tensor,
+        router_input: &Tensor,
+        keep_routes: bool,
+    ) -> Result<RoutedExperts> {
         use super::indexed_moe::{normalized_route_weights, weighted_route_sum};
 
         let (b_sz, seq_len, hidden) = expert_input.dims3()?;
         let tokens = b_sz * seq_len;
-        let logits = router_input
-            .reshape((tokens, hidden))?
-            .matmul(&if tokens >= Self::ROUTER_TRANSPOSE_MIN_TOKENS {
-                // A contiguous transpose selects a faster GEMM for prompts;
-                // single tokens keep the transposed view's GEMV.
-                self.router.t()?.contiguous()?
-            } else {
-                self.router.t()?
-            })?
-            .contiguous()?;
+        // CUDA, one token: one launch for the router projection.
+        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+        let cuda_logits = if tokens == 1 {
+            super::gemma4_moe_decode_cuda::try_router_logits(router_input, &self.router)?
+        } else {
+            None
+        };
+        #[cfg(not(all(feature = "cuda", not(target_os = "macos"))))]
+        let cuda_logits: Option<Tensor> = None;
+        let logits = match cuda_logits {
+            Some(logits) => logits,
+            None => router_input
+                .reshape((tokens, hidden))?
+                .matmul(&if tokens >= Self::ROUTER_TRANSPOSE_MIN_TOKENS {
+                    // A contiguous transpose selects a faster GEMM for
+                    // prompts; single tokens keep the transposed view's GEMV.
+                    self.router.t()?.contiguous()?
+                } else {
+                    self.router.t()?
+                })?
+                .contiguous()?,
+        };
+        super::profiling::mark_region(logits.device(), "moe.router");
         let expert_input = expert_input.reshape((tokens, hidden))?;
 
         // Metal: one fused softmax/top-k route that emits validated u32 IDs
         // (no sanitize pass) shared by both projections, and expert scales
         // applied in the route sum. Its weights are f32 bits in a u32 tensor.
         #[cfg(target_os = "macos")]
-        let fused = if logits.device().is_metal()
-            && std::env::var_os("DINF_DISABLE_FUSED_SOFTMAX_ROUTING").is_none()
-        {
+        let fused = if logits.device().is_metal() {
             Some(super::fused_route_metal::fused_softmax_topk_route_u32(
                 &logits,
                 self.num_active,
@@ -238,17 +308,38 @@ impl GemmaMoe {
         } else {
             None
         };
+        // CUDA, one token: softmax, top-k, normalized weights and the expert
+        // scale in one launch.
+        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+        let cuda_route = if tokens == 1 {
+            super::gemma4_moe_decode_cuda::try_route(&logits, &self.down_scale, self.num_active)?
+        } else {
+            None
+        };
+        #[cfg(not(any(target_os = "macos", feature = "cuda")))]
+        let cuda_route: Option<(Tensor, Tensor)> = None;
         #[cfg(not(target_os = "macos"))]
         let fused: Option<(Tensor, Tensor)> = None;
+        #[cfg(target_os = "macos")]
+        let cuda_route: Option<(Tensor, Tensor)> = None;
         let sanitized = fused.is_some();
-        let (ids, weights) = match fused {
+        let (ids, weights) = match fused.or(cuda_route) {
             Some(routing) => routing,
             None => {
                 let probabilities = candle_nn::ops::softmax_last_dim(&logits)?;
-                let ids = probabilities
-                    .arg_sort_last_dim(false)?
-                    .narrow(candle_core::D::Minus1, 0, self.num_active)?
-                    .contiguous()?;
+                // CUDA selects the leading experts without sorting every row.
+                #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+                let top_ids =
+                    super::gemma4_moe_decode_cuda::try_top_k(&probabilities, self.num_active)?;
+                #[cfg(not(all(feature = "cuda", not(target_os = "macos"))))]
+                let top_ids: Option<Tensor> = None;
+                let ids = match top_ids {
+                    Some(ids) => ids,
+                    None => probabilities
+                        .arg_sort_last_dim(false)?
+                        .narrow(candle_core::D::Minus1, 0, self.num_active)?
+                        .contiguous()?,
+                };
                 let weights = normalized_route_weights(&probabilities, &ids)?;
                 // Fold each selected expert's output scale into its weight.
                 let expert_scales = self
@@ -259,6 +350,7 @@ impl GemmaMoe {
             }
         };
 
+        super::profiling::mark_region(logits.device(), "moe.route");
         let chunk = (Self::MAX_ROUTE_ROWS_PER_DISPATCH / self.num_active).max(1);
         let mut outputs = Vec::with_capacity(tokens.div_ceil(chunk));
         for start in (0..tokens).step_by(chunk) {
@@ -311,7 +403,12 @@ impl GemmaMoe {
                         projection.forward(x, &chunk_ids)
                     };
                     let gate_up = project(&self.experts.gate_up, &input)?;
-                    project(&self.experts.down, &geglu_packed(&gate_up)?)?
+                    super::profiling::mark_region(logits.device(), "moe.gate_up");
+                    let activated = geglu_packed(&gate_up)?;
+                    super::profiling::mark_region(logits.device(), "moe.geglu");
+                    let down = project(&self.experts.down, &activated)?;
+                    super::profiling::mark_region(logits.device(), "moe.down");
+                    down
                 }
             };
             let chunk_weights = weights.narrow(0, start, len)?.contiguous()?;
@@ -325,12 +422,25 @@ impl GemmaMoe {
                 )?);
                 continue;
             }
+            if keep_routes && tokens == 1 {
+                return Ok(RoutedExperts::Routes {
+                    routes: routed,
+                    weights: chunk_weights,
+                });
+            }
             outputs.push(weighted_route_sum(&routed, &chunk_weights)?);
+            super::profiling::mark_region(logits.device(), "moe.sum");
+        }
+        // One chunk needs no concatenation copy.
+        if outputs.len() == 1 {
+            return Ok(RoutedExperts::Summed(
+                outputs[0].reshape((b_sz, seq_len, hidden))?,
+            ));
         }
         let refs = outputs.iter().collect::<Vec<_>>();
-        Tensor::cat(&refs, 0)?
-            .reshape((b_sz, seq_len, hidden))
-            .map_err(Into::into)
+        Ok(RoutedExperts::Summed(
+            Tensor::cat(&refs, 0)?.reshape((b_sz, seq_len, hidden))?,
+        ))
     }
 
     #[cfg(not(any(target_os = "macos", feature = "cuda")))]
@@ -342,12 +452,12 @@ impl GemmaMoe {
 /// `gelu(gate) * up` over packed `[..., gate | up]` rows.
 fn geglu_packed(gate_up: &Tensor) -> Result<Tensor> {
     #[cfg(target_os = "macos")]
-    if gate_up.device().is_metal()
-        && gate_up.dtype() == DType::F32
-        && gate_up.is_contiguous()
-        && std::env::var_os("DINF_DISABLE_FUSED_GELU_MUL").is_none()
-    {
+    if gate_up.device().is_metal() && gate_up.dtype() == DType::F32 && gate_up.is_contiguous() {
         return super::indexed_moe_metal::fused_geglu(gate_up).map_err(Into::into);
+    }
+    #[cfg(feature = "cuda")]
+    if let Some(output) = super::gemma4_moe_decode_cuda::try_packed_geglu(gate_up)? {
+        return Ok(output);
     }
     let half = gate_up.dim(candle_core::D::Minus1)? / 2;
     let gate = gate_up
@@ -438,12 +548,10 @@ enum GemmaQMatMul {
 impl GemmaQMatMul {
     fn from_qtensor(qt: Arc<QTensor>, _device: &Device) -> Result<Self> {
         #[cfg(target_os = "macos")]
-        if std::env::var_os("DINF_DISABLE_METAL4_QMM").is_none()
-            && let Some(matmul) = super::tensor_qmatmul_metal::MetalTensorQMatMul::try_from_qtensor(
-                Arc::clone(&qt),
-                _device,
-            )?
-        {
+        if let Some(matmul) = super::tensor_qmatmul_metal::MetalTensorQMatMul::try_from_qtensor(
+            Arc::clone(&qt),
+            _device,
+        )? {
             METAL4_QMM_LOGGED.get_or_init(|| {
                 tracing::info!("Metal 4 tensor quantized matmul enabled for Gemma 4 prefill");
             });
@@ -522,6 +630,15 @@ impl RmsNorm {
 fn rms_norm_no_weight(x: &Tensor, eps: f64) -> Result<Tensor> {
     let dtype = x.dtype();
     let x_f32 = x.to_dtype(DType::F32)?;
+    // One fused kernel with a unit weight instead of four elementwise ones;
+    // multiplying by one is exact.
+    #[cfg(feature = "cuda")]
+    if x.device().is_cuda() {
+        let unit = Tensor::ones(x.dim(candle_core::D::Minus1)?, DType::F32, x.device())?;
+        return candle_nn::ops::rms_norm(&x_f32, &unit, eps as f32)?
+            .to_dtype(dtype)
+            .map_err(Into::into);
+    }
     #[cfg(target_os = "macos")]
     if let Some(result) = super::fused_norm_metal::try_fused_rms_norm_no_weight(&x_f32, eps as f32)?
     {
@@ -588,6 +705,7 @@ impl Attention {
         };
 
         let started = profile.then(Instant::now);
+        super::profiling::mark_region(x.device(), "attn.qkv_proj");
         let (cos, sin) = self.rope_tables.get(
             self.sliding_window.is_some(),
             start_pos,
@@ -659,6 +777,64 @@ impl Attention {
         if let Some(started) = started.filter(|_| fused_norm_rope.is_some()) {
             finish_profile_region(x.device(), started, &ROPE_NS)?;
         }
+        // CUDA: the three head norms, both rotations and the head layout in
+        // one launch. The profile keeps the separate steps it reports.
+        // For one token whose cache has room, the same launch also writes
+        // the new key and value rows into the cache.
+        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+        let mut appended = false;
+        #[cfg(not(all(feature = "cuda", not(target_os = "macos"))))]
+        let appended = false;
+        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+        let fused_norm_rope = if fused_norm_rope.is_none() && !profile {
+            use super::qwen35_decode_layout_cuda::{
+                DecodeQkvDimensions, KvAppendSlot, try_forward_qkv_head_norm_rope,
+            };
+            let norm_rope = |append: Option<KvAppendSlot>| {
+                try_forward_qkv_head_norm_rope(
+                    &q,
+                    &k,
+                    &v,
+                    &self.q_norm.weight,
+                    &self.k_norm.weight,
+                    &cos,
+                    &sin,
+                    [
+                        self.q_norm.eps as f32,
+                        self.k_norm.eps as f32,
+                        self.rms_norm_eps as f32,
+                    ],
+                    DecodeQkvDimensions {
+                        batch: b_sz,
+                        num_heads: self.num_heads,
+                        num_kv_heads: self.num_kv_heads,
+                        head_dim: self.head_dim,
+                        rope_dims: self.rope_dim.min(self.head_dim),
+                        position: 0,
+                    },
+                    seq_len,
+                    append,
+                )
+            };
+            let slot = match kv_cache.as_ref() {
+                Some(KvCache::PreallocatedF16(dense)) if seq_len == 1 => dense
+                    .append_slot(seq_len)
+                    .map(|(k, v, start)| KvAppendSlot { k, v, start }),
+                _ => None,
+            };
+            match slot {
+                Some(slot) => match norm_rope(Some(slot))? {
+                    Some(fused) => {
+                        appended = true;
+                        Some(fused)
+                    }
+                    None => norm_rope(None)?,
+                },
+                None => norm_rope(None)?,
+            }
+        } else {
+            fused_norm_rope
+        };
         let (q, k, v) = if let Some(fused) = fused_norm_rope {
             fused
         } else {
@@ -667,8 +843,21 @@ impl Attention {
         };
 
         let started = profile.then(Instant::now);
-        let (q, mut k, mut v, rotation) =
-            super::prepare_quantized_attention(kv_cache, q, k, v, self.quant_config.as_deref())?;
+        super::profiling::mark_region(x.device(), "attn.norm_rope");
+        let (q, mut k, mut v, rotation) = match kv_cache {
+            // The launch above wrote the rows; count them and take the views.
+            #[cfg(feature = "cuda")]
+            Some(KvCache::PreallocatedF16(dense)) if appended => {
+                dense.commit_append(seq_len);
+                let (k, v) = dense.active_f16()?;
+                (q, k, v, None)
+            }
+            _ => {
+                debug_assert!(!appended);
+                super::prepare_quantized_attention(kv_cache, q, k, v, self.quant_config.as_deref())?
+            }
+        };
+        super::profiling::mark_region(x.device(), "attn.kv_append");
         if let Some(started) = started {
             finish_profile_region(x.device(), started, &KV_UPDATE_NS)?;
         }
@@ -685,7 +874,13 @@ impl Attention {
         }
 
         let started = profile.then(Instant::now);
+        let decode = if seq_len == 1 {
+            super::try_cuda_decode_sdpa(&q, &k, &v, self.scale as f32)?
+        } else {
+            None
+        };
         let fused = match self.sliding_window {
+            _ if decode.is_some() => decode,
             Some(window) if seq_len > 1 && bidirectional_spans.is_empty() => {
                 super::try_fused_f16_sdpa_windowed_native(&q, &k, &v, window, self.scale as f32)?
             }
@@ -716,6 +911,7 @@ impl Attention {
             softmax_last_dim(&attn_weights)?.matmul(&v)?
         };
         let attn_output = super::restore_quantized_attention_output(attn_output, rotation)?;
+        super::profiling::mark_region(x.device(), "attn.sdpa");
         if let Some(started) = started {
             let counter = if self.sliding_window.is_some() {
                 &SLIDING_SDPA_NS
@@ -726,10 +922,8 @@ impl Attention {
         }
         let started = profile.then(Instant::now);
         #[cfg(target_os = "macos")]
-        let attn_output = if std::env::var_os("DINF_DISABLE_FUSED_ATTENTION_OUTPUT_LAYOUT")
-            .is_none()
-            && let Some(output) =
-                super::qkv_layout_metal::try_fused_attention_output_layout(&attn_output)?
+        let attn_output = if let Some(output) =
+            super::qkv_layout_metal::try_fused_attention_output_layout(&attn_output)?
         {
             output
         } else {
@@ -739,12 +933,17 @@ impl Attention {
                 .contiguous()?
                 .reshape((b_sz, seq_len, ()))?
         };
+        // One token's `[batch, heads, 1, dim]` rows already have the output
+        // order, so the transpose copy is only needed for longer sequences.
         #[cfg(not(target_os = "macos"))]
-        let attn_output =
+        let attn_output = if seq_len == 1 && attn_output.is_contiguous() {
+            attn_output.reshape((b_sz, 1, ()))?
+        } else {
             attn_output
                 .transpose(1, 2)?
                 .contiguous()?
-                .reshape((b_sz, seq_len, ()))?;
+                .reshape((b_sz, seq_len, ()))?
+        };
         if let Some(started) = started {
             finish_profile_region(x.device(), started, &ATTN_OUTPUT_LAYOUT_NS)?;
         }
@@ -755,6 +954,7 @@ impl Attention {
             && let Some(output) =
                 super::dense_qmatmul_cuda::forward_one_to_f32(&attn_output, o_proj)?
         {
+            super::profiling::mark_region(x.device(), "attn.o_proj");
             return Ok(output);
         }
         #[cfg(not(target_os = "macos"))]
@@ -1187,6 +1387,55 @@ impl TransformerBlock {
                 + moe.experts_post_norm.forward(&routed)?)?;
             return self.post_ffn(&planes.sum, &combined, next_norm);
         }
+        // CUDA, one token: one kernel for the four post-attention planes and
+        // one for both branch norms, the post-FFN norm, residual and scale.
+        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+        if let Some((attn_out, ffn_in, Some((expert_in, router_in)))) =
+            super::gemma4_norm_fusion_cuda::try_attention_planes(
+                x_attn,
+                residual,
+                (&self.attn_post_norm.weight, self.attn_post_norm.eps as f32),
+                (&self.ffn_norm.weight, self.ffn_norm.eps as f32),
+                Some(super::gemma4_norm_fusion_cuda::MoePlanes {
+                    pre_weight: &moe.pre_norm.weight,
+                    eps: moe.rms_norm_eps as f32,
+                }),
+            )?
+        {
+            super::profiling::mark_region(residual.device(), "planes");
+            let shared = self.ffn.forward(&ffn_in)?;
+            super::profiling::mark_region(residual.device(), "ffn.shared");
+            // One token's routes stay unsummed: the kernel below sums them.
+            let (routed, route_weights) = match moe.forward_routes(&expert_in, &router_in, true)? {
+                RoutedExperts::Summed(routed) => (routed, None),
+                RoutedExperts::Routes { routes, weights } => (routes, Some(weights)),
+            };
+            if let Some(out) = super::gemma4_norm_fusion_cuda::try_post_ffn(
+                &shared,
+                &attn_out,
+                (&self.ffn_post_norm.weight, self.ffn_post_norm.eps as f32),
+                Some(super::gemma4_norm_fusion_cuda::MoeTail {
+                    routed: &routed,
+                    route_weights: route_weights.as_ref(),
+                    shared_weight: &moe.shared_post_norm.weight,
+                    routed_weight: &moe.experts_post_norm.weight,
+                    eps: moe.rms_norm_eps as f32,
+                }),
+                self.layer_output_scale.as_ref(),
+                next_norm.map(|norm| (&norm.weight, norm.eps as f32)),
+            )? {
+                super::profiling::mark_region(residual.device(), "post");
+                return Ok(out);
+            }
+            let routed = match route_weights {
+                Some(weights) => super::indexed_moe::weighted_route_sum(&routed, &weights)?
+                    .reshape(attn_out.shape())?,
+                None => routed,
+            };
+            let combined = (moe.shared_post_norm.forward(&shared)?
+                + moe.experts_post_norm.forward(&routed)?)?;
+            return self.post_ffn(&attn_out, &combined, next_norm);
+        }
         let (attn_out, ffn_in) = self.post_attention(residual, x_attn)?;
         let ffn_out = self.feed_forward(&attn_out, &ffn_in)?;
         self.post_ffn(&attn_out, &ffn_out, next_norm)
@@ -1206,6 +1455,16 @@ impl TransformerBlock {
                 None,
             )?
         {
+            return Ok((attn_out, ffn_in));
+        }
+        #[cfg(feature = "cuda")]
+        if let Some((attn_out, ffn_in, _)) = super::gemma4_norm_fusion_cuda::try_attention_planes(
+            x_attn,
+            residual,
+            (&self.attn_post_norm.weight, self.attn_post_norm.eps as f32),
+            (&self.ffn_norm.weight, self.ffn_norm.eps as f32),
+            None,
+        )? {
             return Ok((attn_out, ffn_in));
         }
         let x_attn = self.attn_post_norm.forward(x_attn)?;
@@ -1228,6 +1487,17 @@ impl TransformerBlock {
             self.ffn_post_norm.eps as f32,
             next_norm.map(|norm| (&norm.weight, norm.eps as f32)),
             self.layer_output_scale.as_ref(),
+        )? {
+            return Ok(out);
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(out) = super::gemma4_norm_fusion_cuda::try_post_ffn(
+            ffn_out,
+            attn_out,
+            (&self.ffn_post_norm.weight, self.ffn_post_norm.eps as f32),
+            None,
+            self.layer_output_scale.as_ref(),
+            next_norm.map(|norm| (&norm.weight, norm.eps as f32)),
         )? {
             return Ok(out);
         }
@@ -1273,12 +1543,26 @@ impl Gemma4Stage {
         let is_tail = range.is_tail();
         #[cfg(feature = "cuda")]
         super::dense_qmatmul_cuda::precompile(&device)?;
+        super::precompile_cuda_decode_sdpa(&device)?;
+        #[cfg(feature = "cuda")]
+        super::qwen35_decode_layout_cuda::precompile(&device)?;
+        #[cfg(feature = "cuda")]
+        super::gemma4_moe_decode_cuda::precompile(&device)?;
+        #[cfg(feature = "cuda")]
+        super::gemma4_norm_fusion_cuda::precompile(&device)?;
 
         let embedding = if is_head {
             let embd = tensors
                 .get("token_embd.weight")
                 .context("missing token_embd.weight for head stage")?;
-            Some(embd.as_ref().dequantize(&device)?)
+            // On CUDA the packed table stays packed and lookups dequantize
+            // only the selected rows; a dense F32 copy of a 262k-row table
+            // costs several GiB of device memory.
+            if device.is_cuda() && embd.device().is_cuda() {
+                Some(GemmaEmbedding::Packed(Arc::clone(embd)))
+            } else {
+                Some(GemmaEmbedding::Dense(embd.as_ref().dequantize(&device)?))
+            }
         } else {
             None
         };
@@ -1357,10 +1641,9 @@ impl Gemma4Stage {
     ) -> Result<Vec<Tensor>> {
         let batch = tokens.len();
         let embedding = self.embedding.as_ref().unwrap();
-        let token_tensor = Tensor::new(tokens, &self.device)?;
         let mut hidden_states =
             embedding
-                .index_select(&token_tensor, 0)?
+                .rows(tokens, &self.device)?
                 .reshape((batch, 1, self.hidden_dim))?;
         hidden_states = (hidden_states * (self.hidden_dim as f64).sqrt())?;
 
@@ -1430,8 +1713,7 @@ impl Gemma4Stage {
             StageInput::Tokens(tokens) => {
                 anyhow::ensure!(self.is_head, "only head stage can receive tokens");
                 let embedding = self.embedding.as_ref().unwrap();
-                let token_tensor = Tensor::new(tokens.as_slice(), &self.device)?;
-                let hidden = embedding.index_select(&token_tensor, 0)?.reshape((
+                let hidden = embedding.rows(tokens.as_slice(), &self.device)?.reshape((
                     1,
                     seq_len,
                     self.hidden_dim,
@@ -1455,6 +1737,9 @@ impl Gemma4Stage {
 
         let mut normed = None;
         for (i, block) in self.blocks.iter().enumerate() {
+            if seq_len == 1 {
+                crate::decode_layer_boundary(i);
+            }
             let next_norm = self.blocks.get(i + 1).map(|next| &next.attn_norm);
             let carried = normed.take();
             (hidden_states, normed) = with_kv_cache(&mut cache[i], |kv| {
@@ -1514,12 +1799,11 @@ impl ModelArchitecture for Gemma4Stage {
     fn embed_tokens(&self, tokens: &[u32]) -> Result<Tensor> {
         anyhow::ensure!(self.is_head, "only a Gemma 4 head stage can embed tokens");
         anyhow::ensure!(!tokens.is_empty(), "cannot embed an empty token list");
-        let token_tensor = Tensor::new(tokens, &self.device)?;
         let embeddings = self
             .embedding
             .as_ref()
             .context("Gemma 4 head stage has no token embedding")?
-            .index_select(&token_tensor, 0)?;
+            .rows(tokens, &self.device)?;
         (embeddings * (self.hidden_dim as f64).sqrt()).map_err(Into::into)
     }
 
@@ -1576,10 +1860,9 @@ impl ModelArchitecture for Gemma4Stage {
         let start_pos = positions[0];
         let batch = tokens.len();
         let embedding = self.embedding.as_ref().unwrap();
-        let token_tensor = Tensor::new(tokens, &self.device)?;
         let mut hidden_states =
             embedding
-                .index_select(&token_tensor, 0)?
+                .rows(tokens, &self.device)?
                 .reshape((batch, 1, self.hidden_dim))?;
         hidden_states = (hidden_states * (self.hidden_dim as f64).sqrt())?;
 
@@ -1842,14 +2125,19 @@ fn build_moe(
             gate_up.dtype(),
             down.dtype()
         );
-        let gate_up =
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        let mut gate_up =
             IndexedMoeMatMul::from_qtensor(&gate_up, experts, 2 * expert_ffn, hidden, device)?;
         #[cfg(target_os = "macos")]
         gate_up.prepare_geglu()?;
-        GemmaExperts {
-            gate_up,
-            down: IndexedMoeMatMul::from_qtensor(&down, experts, hidden, expert_ffn, device)?,
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        let mut down = IndexedMoeMatMul::from_qtensor(&down, experts, hidden, expert_ffn, device)?;
+        #[cfg(feature = "cuda")]
+        if device.is_cuda() {
+            gate_up.prefer_cuda_grouped_wmma()?;
+            down.prefer_cuda_grouped_wmma()?;
         }
+        GemmaExperts { gate_up, down }
     };
     #[cfg(not(any(target_os = "macos", feature = "cuda")))]
     let experts_impl = {
@@ -1934,9 +2222,12 @@ fn gelu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         && gate.is_contiguous()
         && up.is_contiguous()
         && gate.shape() == up.shape()
-        && std::env::var_os("DINF_DISABLE_FUSED_GELU_MUL").is_none()
     {
         return super::indexed_moe_metal::fused_gelu_mul(gate, up).map_err(Into::into);
+    }
+    #[cfg(feature = "cuda")]
+    if let Some(output) = super::gemma4_moe_decode_cuda::try_gelu_mul(gate, up)? {
+        return Ok(output);
     }
     (candle_nn::Activation::NewGelu.forward(gate)? * up).map_err(Into::into)
 }
@@ -2070,7 +2361,9 @@ mod tests {
             quant_config: None,
         };
         Gemma4Stage {
-            embedding: Some(Tensor::zeros((8, 4), DType::F32, &Device::Cpu).unwrap()),
+            embedding: Some(GemmaEmbedding::Dense(
+                Tensor::zeros((8, 4), DType::F32, &Device::Cpu).unwrap(),
+            )),
             blocks: vec![TransformerBlock {
                 attn_norm: norm(4),
                 attn: attention,
@@ -2107,7 +2400,7 @@ mod tests {
                 &Device::Cpu,
             )?)
         };
-        stage.embedding = Some(weights(8, 4)?);
+        stage.embedding = Some(GemmaEmbedding::Dense(weights(8, 4)?));
         stage.lm_head = Some(QMatMul::Tensor(weights(8, 4)?));
         stage.blocks[0].attn.k_proj = GemmaQMatMul::Candle(QMatMul::Tensor(weights(4, 4)?));
         stage.blocks[0].attn.v_proj = Some(GemmaQMatMul::Candle(QMatMul::Tensor(weights(4, 4)?)));

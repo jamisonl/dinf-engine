@@ -17,8 +17,7 @@ Recorded results:
 
 These checks do not cover end-to-end generation, 40-step schedules, image
 quality, longer prompts, other hardware or other kernel sizes. `SOURCE.json`
-records the reference contracts, fixed limits and results, and pins upstream
-revisions, source hashes, inputs and checkpoint files.
+pins upstream revisions, source hashes, inputs and checkpoint files.
 `requirements.lock` pins Python packages and distribution hashes;
 `rust/Cargo.lock` pins the engine's dependency versions and vendored patches.
 
@@ -130,8 +129,7 @@ The checker rejects missing or extra steps, wrong modes or runtime labels,
 wrong shapes, nonfinite values, non-BF16 values and output files whose names
 do not match their keys. It bounds and checks regular files before hashing and
 hashes exactly the bytes it compares. The gate file binds each schedule to its
-original little-endian F32 hash; check the gate and helper hashes against
-`SOURCE.json`.
+original little-endian F32 hash.
 
 Synthetic self-test (no checkpoint):
 
@@ -204,7 +202,7 @@ last recorded hidden state to `last_hidden_state`, which `Qwen3VLTextModel`
 sets to its final norm output (`modeling_qwen3_vl.py:840-843`). With the hook
 installed, the encoder's last recorded state and this reference's direct
 language output are therefore the same pre-norm tensor; without it, the
-recorded state is post-norm. `SOURCE.json` pins these sources.
+recorded state is post-norm.
 
 Keep exact token IDs, full shard hashes, dtype and device records and all
 hidden values with each result. This checks numeric conditioning, not prompt

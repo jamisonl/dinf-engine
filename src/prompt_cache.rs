@@ -1277,12 +1277,12 @@ mod tests {
     fn prompt_cache_extension_and_batch_reuse() -> Result<()> {
         let mut stage = test_stage();
         let mut first = generation(&stage, "alice", &[0, 1]);
-        first.set_speculative_decoding_enabled(false);
+        first.set_speculative_decoding_enabled(&stage, false);
         finish(&mut stage, &mut first)?;
         let mut a = generation(&stage, "alice", &[0, 1, 0]);
         let mut b = generation(&stage, "alice", &[0, 1, 1]);
         for g in [&mut a, &mut b] {
-            g.set_speculative_decoding_enabled(false);
+            g.set_speculative_decoding_enabled(&stage, false);
             g.step(&mut stage)?;
             assert_eq!(g.reused_prompt_tokens(), 2);
         }

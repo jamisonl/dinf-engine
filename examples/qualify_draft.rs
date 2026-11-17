@@ -1,7 +1,8 @@
 //! Full target + DFlash checks. Usage: TARGET.gguf DRAFT.gguf cpu|metal [TOKENS=64].
 //! Admit both models before running. Exact requests must retain the scalar path.
 //! An unseeded sampled request separately proves draft execution and cleanup.
-//! Set DINF_ALLOW_APPROXIMATE_SPECULATIVE=1 only for the opt-in greedy diagnostic.
+//! Set DINF_ALLOW_APPROXIMATE_SPECULATIVE=1 only for the opt-in greedy diagnostic;
+//! this example turns it into `SpeculativeOptions::allow_approximate`.
 
 use std::path::Path;
 
@@ -10,7 +11,9 @@ use candle_core::Device;
 use dinf_engine::continuous::{GenerationSession, SpeculativeStats};
 use dinf_engine::sampling::SamplingParams;
 use dinf_engine::tokenizer::GgufTokenizer;
-use dinf_engine::{LayerRange, PipelineStage, read_gguf_metadata};
+use dinf_engine::{
+    EngineOptions, LayerRange, PipelineStage, SpeculativeOptions, read_gguf_metadata,
+};
 use serde_json::json;
 
 fn clean(stage: &PipelineStage) -> Result<()> {
@@ -31,7 +34,7 @@ fn run(
     budget: usize,
 ) -> Result<(Vec<u32>, SpeculativeStats)> {
     let mut session = GenerationSession::new(stage, prompt.to_vec(), params.clone(), vec![]);
-    session.set_speculative_decoding_enabled(enabled);
+    session.set_speculative_decoding_enabled(stage, enabled);
     while !session.is_finished() {
         session.step_with_prefill_budget(stage, budget)?;
     }
@@ -57,7 +60,7 @@ fn run(
 
 fn cancel(stage: &mut PipelineStage, prompt: &[u32], params: &SamplingParams) -> Result<()> {
     let mut session = GenerationSession::new(stage, prompt.to_vec(), params.clone(), vec![]);
-    session.set_speculative_decoding_enabled(true);
+    session.set_speculative_decoding_enabled(stage, true);
     while session.generated().len() < 3 {
         session.step(stage)?;
     }
@@ -103,6 +106,13 @@ fn main() -> Result<()> {
     stage.attach_speculative_draft(Path::new(&args[1]))?;
     ensure!(stage.speculative_decoding_enabled(), "draft did not attach");
     let approximate = std::env::var("DINF_ALLOW_APPROXIMATE_SPECULATIVE").as_deref() == Ok("1");
+    stage.set_options(EngineOptions {
+        speculative: SpeculativeOptions {
+            allow_approximate: approximate,
+            ..Default::default()
+        },
+        ..Default::default()
+    })?;
     let greedy = SamplingParams {
         temperature: 0.0,
         max_tokens: count,

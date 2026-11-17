@@ -1462,8 +1462,7 @@ impl CustomOp2 for DequantizeRotatedKv {
             && self.output_dtype == DType::F16
             && self.head_dim.is_multiple_of(8)
             && key_layout.start_offset().is_multiple_of(4)
-            && value_layout.start_offset().is_multiple_of(4)
-            && std::env::var_os("DINF_DISABLE_TURBOQUANT_VECTOR_DEQUANT").is_none();
+            && value_layout.start_offset().is_multiple_of(4);
         let pipeline = match self.output_dtype {
             DType::F16 if vectorized => pipelines.dequantize_rotated8_f16x4,
             DType::F16 => pipelines.dequantize_rotated_f16,
@@ -1935,7 +1934,7 @@ fn rotate_attention_impl(
 
 /// Compile the TurboQuant Metal kernels during model warmup.
 pub(crate) fn precompile(device: &Device) -> anyhow::Result<()> {
-    if !device.is_metal() || std::env::var_os("DINF_DISABLE_TURBOQUANT_METAL").is_some() {
+    if !device.is_metal() {
         return Ok(());
     }
     let _ = pipelines(device.as_metal_device()?)?;

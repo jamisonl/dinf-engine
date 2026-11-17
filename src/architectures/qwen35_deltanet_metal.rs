@@ -859,7 +859,7 @@ fn onchip_prefill_pipeline_with_cache(
 }
 
 pub(super) fn precompile(device: &Device) -> anyhow::Result<()> {
-    if device.is_metal() && std::env::var_os("DINF_DISABLE_QWEN35_DELTANET_METAL").is_none() {
+    if device.is_metal() {
         let device = device.as_metal_device()?;
         pipeline(device)?;
         named_pipeline(
@@ -879,11 +879,8 @@ pub(super) fn precompile(device: &Device) -> anyhow::Result<()> {
             &DELTANET_PREFILL_PIPELINE,
         )?;
         // The model-shape specialization is best effort.  Its compile failure
-        // must never prevent the generic Metal scan from being used.  Honor
-        // the diagnostic switch here as well as at lazy dispatch time.
-        if std::env::var_os("DINF_DISABLE_QWEN35_ONCHIP_PREFILL").is_none() {
-            let _ = onchip_prefill_pipeline(device)?;
-        }
+        // must never prevent the generic Metal scan from being used.
+        let _ = onchip_prefill_pipeline(device)?;
         named_pipeline(
             device,
             "qwen35_deltanet_replay_f32",
@@ -1362,9 +1359,7 @@ const FUSED_DECODE_128_THREADS: usize = 512;
 
 /// Whether decode can use the 128x128 specialization.
 fn fused_decode_128_supported(key_dim: usize, value_dim: usize) -> bool {
-    key_dim == 128
-        && value_dim == 128
-        && std::env::var_os("DINF_DISABLE_QWEN35_DECODE_128").is_none()
+    key_dim == 128 && value_dim == 128
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1530,8 +1525,7 @@ pub(super) fn prefill(
             value_dim,
             record_replay,
             // Short scans do not amortize the on-chip tile's setup cost.
-            onchip_state: seq_len >= 7
-                && std::env::var_os("DINF_DISABLE_QWEN35_ONCHIP_PREFILL").is_none(),
+            onchip_state: seq_len >= 7,
         },
     )?;
     let recurrent_output_elements = seq_len * total_value_dim;

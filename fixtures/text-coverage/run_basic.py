@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run pinned text basics: --paths paths.json --binary qualify_text --output NEW_DIR.
+"""Run pinned text basics: --registry registry.json --paths paths.json --binary qualify_text --output NEW_DIR.
 
 Use --model ID repeatedly for a subset. --rss-caps accepts {ID: {backend: bytes}}
 when a backend lacks a recorded cap. --checksum-cache reuses this runner's own
@@ -313,7 +313,7 @@ def exit_status(result, models, backend):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--registry", type=Path, default=Path(__file__).with_name("basic-coverage.json"))
+    parser.add_argument("--registry", type=Path, required=True)
     parser.add_argument("--paths", type=Path, required=True)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

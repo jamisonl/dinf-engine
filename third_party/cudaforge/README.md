@@ -397,7 +397,7 @@ fn main() -> cudaforge::Result<()> {
 | Variable | Description |
 |----------|-------------|
 | `CUDA_COMPUTE_CAPS` | Comma-separated fatbinary architectures (e.g., `80,89,90a`) |
-| `DINF_CUDA_ARCHS` | dinf release-facing alias for `CUDA_COMPUTE_CAPS` |
+| `DINF_CUDA_ARCHS` | dinf alias for `CUDA_COMPUTE_CAPS` |
 | `CUDA_COMPUTE_CAP` | Default compute capability (e.g., `80`, `90`) |
 | `NVCC` | Path to nvcc binary |
 | `CUDA_HOME` | CUDA installation root |

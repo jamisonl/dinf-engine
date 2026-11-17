@@ -127,7 +127,9 @@ impl Qwen35Stage {
                         )?);
                         cache[layer] = state.map(LayerCache::DeltaNet);
                     }
-                    block.output_and_ffn(&hidden, &Tensor::cat(&outputs, 1)?, false)?
+                    block
+                        .output_and_ffn(&hidden, &Tensor::cat(&outputs, 1)?, false, None)?
+                        .0
                 }
                 Qwen35Block::GatedAttention(block) => {
                     let normed = block.attn_norm.forward(&hidden)?;
@@ -157,7 +159,9 @@ impl Qwen35Stage {
                         )?);
                         cache[layer] = state.map(LayerCache::Attention);
                     }
-                    block.output_and_ffn(&hidden, &Tensor::cat(&outputs, 1)?, false)?
+                    block
+                        .output_and_ffn(&hidden, &Tensor::cat(&outputs, 1)?, false, None)?
+                        .0
                 }
             };
         }

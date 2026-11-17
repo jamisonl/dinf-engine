@@ -24,7 +24,26 @@ pub(crate) fn check_identity(file: &File, expected: FileIdentity) -> Result<()> 
     Ok(())
 }
 
-pub(crate) fn read_exact_at(
+pub(crate) fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    // Windows positional reads move the file cursor; put it back so callers
+    // see the same position on every platform.
+    #[cfg(windows)]
+    let cursor = {
+        use std::io::Seek;
+        let mut handle = file;
+        handle.stream_position()?
+    };
+    let result = read_exact_at_moving_cursor(file, bytes, offset);
+    #[cfg(windows)]
+    {
+        use std::io::{Seek, SeekFrom};
+        let mut handle = file;
+        handle.seek(SeekFrom::Start(cursor))?;
+    }
+    result
+}
+
+fn read_exact_at_moving_cursor(
     file: &File,
     mut bytes: &mut [u8],
     mut offset: u64,
@@ -47,6 +66,55 @@ pub(crate) fn read_exact_at(
         }
     }
     Ok(())
+}
+
+/// Test fixtures extend files far past their written bytes. Unix makes such
+/// files sparse; Windows allocates them unless the file is marked sparse.
+#[cfg(test)]
+pub(crate) trait SparseSetLen {
+    fn set_len_sparse(&self, len: u64) -> std::io::Result<()>;
+}
+
+#[cfg(test)]
+impl SparseSetLen for File {
+    fn set_len_sparse(&self, len: u64) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            unsafe extern "system" {
+                fn DeviceIoControl(
+                    device: *mut std::ffi::c_void,
+                    control_code: u32,
+                    in_buffer: *mut std::ffi::c_void,
+                    in_size: u32,
+                    out_buffer: *mut std::ffi::c_void,
+                    out_size: u32,
+                    bytes_returned: *mut u32,
+                    overlapped: *mut std::ffi::c_void,
+                ) -> i32;
+            }
+            const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+            let mut returned = 0u32;
+            // SAFETY: the handle is open for the lifetime of `self`; the
+            // control code takes no buffers, and `returned` outlives the call.
+            let ok = unsafe {
+                DeviceIoControl(
+                    self.as_raw_handle(),
+                    FSCTL_SET_SPARSE,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        self.set_len(len)
+    }
 }
 
 /// SHA256(sizeLE ++ head8MiB ++ tail8MiB). Tail is included only above 8MiB,

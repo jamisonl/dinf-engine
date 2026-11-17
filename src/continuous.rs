@@ -186,7 +186,6 @@ pub struct GenerationSession {
     next_input_token: Option<u32>,
     pending_tokens: VecDeque<u32>,
     speculative_speed: SpeculativeSpeedMonitor,
-    speculative_speed_enabled: bool,
     speculative_disabled: bool,
     speculative_stats: SpeculativeStats,
     finished: bool,
@@ -388,8 +387,6 @@ impl GenerationSession {
             next_input_token: None,
             pending_tokens: VecDeque::new(),
             speculative_speed: SpeculativeSpeedMonitor::default(),
-            speculative_speed_enabled: std::env::var("DINF_SPECULATIVE_SPEED_FALLBACK").as_deref()
-                == Ok("1"),
             speculative_disabled: false,
             speculative_stats: SpeculativeStats::default(),
             finished: false,
@@ -447,11 +444,12 @@ impl GenerationSession {
         }
 
         let speculative_eligible = self.speculative_for_input(stage, 1);
+        let policy = stage.options().speculative;
         let measure_scalar = speculative_eligible
-            && self.speculative_speed_enabled
+            && policy.elapsed_time_fallback
+            && policy.fallback
             && self.next_input_token.is_some()
-            && self.speculative_speed.needs_probe()
-            && std::env::var_os("DINF_DISABLE_SPECULATIVE_FALLBACK").is_none();
+            && self.speculative_speed.needs_probe();
         if let Some(anchor) = self.next_input_token
             && speculative_eligible
             && !measure_scalar
@@ -688,7 +686,7 @@ impl GenerationSession {
     fn speculative_eligible(&self, stage: &PipelineStage) -> bool {
         !self.speculative_disabled
             && (self.params.seed.is_none() && self.params.temperature > 0.0
-                || std::env::var("DINF_ALLOW_APPROXIMATE_SPECULATIVE").as_deref() == Ok("1"))
+                || stage.options().speculative.allow_approximate)
             && stage.session_speculative_ready(&self.cache)
             && self.mrope_decode_delta.is_none()
             && self.prompt_embeddings.is_none()
@@ -868,11 +866,13 @@ impl GenerationSession {
         let wall_time =
             pass_started.map_or(draft_time + target_time + commit_time, |t| t.elapsed());
         self.speculative_speed.record_pass(outputs.len(), wall_time);
+        let policy = stage.options().speculative;
+        let elapsed_time_policy = policy.elapsed_time_fallback;
         let (reached_hardware_limit, adaptive_fallback) = self.speculative_speed.fallback_decision(
             pre_m5,
             self.speculative_stats.passes,
-            std::env::var_os("DINF_DISABLE_SPECULATIVE_FALLBACK").is_some(),
-            self.speculative_speed_enabled,
+            !policy.fallback,
+            elapsed_time_policy,
         );
         if reached_hardware_limit || adaptive_fallback {
             self.speculative_disabled = true;
@@ -881,7 +881,7 @@ impl GenerationSession {
                 total_passes = self.speculative_stats.passes,
                 hardware_limit = reached_hardware_limit,
                 adaptive_fallback,
-                elapsed_time_policy = self.speculative_speed_enabled,
+                elapsed_time_policy,
                 scalar_ms_per_token = self
                     .speculative_speed
                     .scalar_token_time()
@@ -987,7 +987,7 @@ impl GenerationSession {
             && self.speculative_eligible(stage)
             && self.next_input_token.is_some()
             && self.pending_tokens.is_empty()
-            && !self.speculative_speed_enabled
+            && !stage.options().speculative.elapsed_time_fallback
             && rows <= self.params.max_tokens.saturating_sub(self.generated.len())
             && stage.speculative_rows_fit_context(&self.cache, rows)
     }
@@ -1160,11 +1160,15 @@ impl GenerationSession {
     }
 
     /// Apply the caller's speculative-decoding policy before this request starts.
-    pub fn set_speculative_decoding_enabled(&mut self, enabled: bool) {
+    ///
+    /// A greedy or seeded request decodes without its draft unless `stage`'s
+    /// [`SpeculativeOptions::allow_approximate`](crate::SpeculativeOptions::allow_approximate)
+    /// is set.
+    pub fn set_speculative_decoding_enabled(&mut self, stage: &PipelineStage, enabled: bool) {
         // Batched target checks can differ numerically from scalar decoding.
         // A seed or greedy request needs the scalar path until parity holds.
         let exact = self.params.seed.is_some() || self.params.temperature <= 0.0;
-        let approximate = std::env::var("DINF_ALLOW_APPROXIMATE_SPECULATIVE").as_deref() == Ok("1");
+        let approximate = stage.options().speculative.allow_approximate;
         self.speculative_disabled = !enabled || (exact && !approximate);
         self.speculative_stats.fell_back |= enabled && exact && !approximate;
     }
@@ -1718,7 +1722,7 @@ mod tests {
         };
         let mut reference = GenerationSession::new(&plain, vec![2], params.clone(), vec![]);
         let mut session = GenerationSession::new(&drafted, vec![2], params, vec![]);
-        session.set_speculative_decoding_enabled(true);
+        session.set_speculative_decoding_enabled(&drafted, true);
         while !reference.is_finished() {
             assert_eq!(reference.step(&mut plain)?, session.step(&mut drafted)?);
         }
@@ -1729,10 +1733,14 @@ mod tests {
         session.discard_cache(&mut drafted);
 
         // An explicit `new_seeded` seed is exact too, even with no params seed.
-        let unseeded = SamplingParams { seed: None, ..params_for_seeded() };
-        let mut reference = GenerationSession::new_seeded(&plain, vec![2], unseeded.clone(), vec![], 42);
+        let unseeded = SamplingParams {
+            seed: None,
+            ..params_for_seeded()
+        };
+        let mut reference =
+            GenerationSession::new_seeded(&plain, vec![2], unseeded.clone(), vec![], 42);
         let mut session = GenerationSession::new_seeded(&drafted, vec![2], unseeded, vec![], 42);
-        session.set_speculative_decoding_enabled(true);
+        session.set_speculative_decoding_enabled(&drafted, true);
         while !reference.is_finished() {
             assert_eq!(reference.step(&mut plain)?, session.step(&mut drafted)?);
         }
@@ -1743,8 +1751,39 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn allow_approximate_option_lets_a_seeded_request_draft() -> anyhow::Result<()> {
+        let (mut drafted, _) =
+            crate::session_state_tests::speculative_boundary_stage(32, Some(32))?;
+        drafted.set_options(crate::EngineOptions {
+            speculative: crate::SpeculativeOptions {
+                allow_approximate: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })?;
+        let params = SamplingParams {
+            seed: Some(42),
+            ..params_for_seeded()
+        };
+        let mut session = GenerationSession::new(&drafted, vec![2], params, vec![]);
+        session.set_speculative_decoding_enabled(&drafted, true);
+        while !session.is_finished() {
+            session.step(&mut drafted)?;
+        }
+        assert!(session.speculative_stats().passes > 0);
+        session.discard_cache(&mut drafted);
+        Ok(())
+    }
+
     fn params_for_seeded() -> SamplingParams {
-        SamplingParams { temperature: 2.5, top_k: 0, top_p: 1.0, max_tokens: 8, ..Default::default() }
+        SamplingParams {
+            temperature: 2.5,
+            top_k: 0,
+            top_p: 1.0,
+            max_tokens: 8,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -2645,7 +2684,7 @@ mod tests {
                     )?)
                 }
                 "mrope" => session.mrope_decode_delta = Some(0),
-                "scope" => session.prompt_cache_scope = Some("remote".into()),
+                "scope" => session.prompt_cache_scope = Some("other".into()),
                 "untrusted" => {
                     let cache = std::mem::replace(&mut session.cache, stage.new_session_state());
                     session = GenerationSession::with_cache(

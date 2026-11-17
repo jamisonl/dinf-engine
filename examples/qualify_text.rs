@@ -196,6 +196,13 @@ fn qualify(
         device,
         None,
     )?;
+    // DINF_CUDA_GRAPH_DECODE=0 issues CUDA decode launches one by one
+    // instead of as captured graphs, which is the default.
+    if std::env::var_os("DINF_CUDA_GRAPH_DECODE").is_some_and(|value| value == "0") {
+        let mut options = stage.options().clone();
+        options.cuda_graph_decode = false;
+        stage.set_options(options)?;
+    }
     let mut runs = Vec::new();
     let modes: &[(&str, f64)] = if smoke {
         eprintln!("Checking basic smoke: {}", path.display());
@@ -296,6 +303,8 @@ fn main() -> Result<()> {
             "cpu" => Device::Cpu,
             #[cfg(target_os = "macos")]
             "metal" => Device::new_metal(0)?,
+            #[cfg(feature = "cuda")]
+            "cuda" => Device::new_cuda(0)?,
             _ => anyhow::bail!("backend {backend:?} is unavailable in this build"),
         };
         if text_split_contract {

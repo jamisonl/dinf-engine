@@ -8,11 +8,6 @@ use candle_core::{CpuStorage, CustomOp2, DType, Layout, MetalStorage, Result, Sh
 use candle_metal_kernels::metal::ComputePipeline;
 use objc2_metal::{MTLCompileOptions, MTLDevice, MTLGPUFamily, MTLLanguageVersion, MTLSize};
 
-fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("DINF_DIFFUSION_DENSE").as_deref() != Ok("0"))
-}
-
 fn pipeline(device: &candle_core::MetalDevice) -> Result<Option<ComputePipeline>> {
     static CACHE: OnceLock<Mutex<HashMap<DeviceId, Option<ComputePipeline>>>> = OnceLock::new();
     let mut cache = CACHE
@@ -63,8 +58,7 @@ fn supports_device(device: &candle_core::MetalDevice) -> bool {
 }
 
 pub(super) fn try_linear(input: &Tensor, weight: &Tensor) -> Result<Option<Tensor>> {
-    if !enabled()
-        || !input.device().is_metal()
+    if !input.device().is_metal()
         || input.dtype() != DType::BF16
         || weight.dtype() != DType::BF16
         || !input.device().same_device(weight.device())
@@ -261,7 +255,7 @@ mod tests {
         assert!(try_linear(&x.to_dtype(DType::F32)?, &w.to_dtype(DType::F32)?)?.is_none());
         assert!(try_linear(&x.narrow(0, 0, 1)?, &w)?.is_none());
         assert!(try_linear(&x, &cpu_w)?.is_none());
-        if !supports_device(device.as_metal_device()?) || !enabled() {
+        if !supports_device(device.as_metal_device()?) {
             return Ok(());
         }
         // Transposed storage requires a copy; it must not be treated as packed.

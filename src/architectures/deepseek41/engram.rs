@@ -22,6 +22,8 @@
 //! the request history with the candidate. Disk/decode errors discard the
 //! candidate and all temporary output. No fallback inference backend is used.
 
+#[cfg(test)]
+use crate::verified_file::SparseSetLen;
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -1135,7 +1137,7 @@ mod tests {
         use super::super::profile::{self, Detail};
         let span = small_layout().table_span(1, 32, 408 * ROW_BYTES as u64)?;
         let mut artifact = tempfile::NamedTempFile::new()?;
-        artifact.as_file().set_len(span.end)?;
+        artifact.as_file().set_len_sparse(span.end)?;
         artifact.seek(SeekFrom::Start(span.offset))?;
         artifact.write_all(&uniform_row(0x38, 127))?;
         let table = Table::open(artifact.path(), span)?;
@@ -1313,7 +1315,7 @@ mod tests {
             .table_span(1, offset, u64::from(TABLE_ROWS[0]) * ROW_BYTES as u64)
             .unwrap();
         let mut artifact = tempfile::NamedTempFile::new().unwrap();
-        artifact.as_file().set_len(span.end).unwrap(); // Sparse 100GB table, not resident weights.
+        artifact.as_file().set_len_sparse(span.end).unwrap(); // Sparse 100GB table, not resident weights.
         artifact.seek(SeekFrom::Start(offset)).unwrap();
         artifact.write_all(&uniform_row(0x38, 127)).unwrap();
         artifact
@@ -1344,7 +1346,7 @@ mod tests {
         let span = layout.table_span(1, 32, 408 * ROW_BYTES as u64).unwrap();
         let mut artifact = tempfile::NamedTempFile::new().unwrap();
         assert!(Table::open(artifact.path(), span).is_err());
-        artifact.as_file().set_len(span.end).unwrap();
+        artifact.as_file().set_len_sparse(span.end).unwrap();
         artifact.seek(SeekFrom::Start(32)).unwrap();
         artifact.write_all(&uniform_row(0x38, 127)).unwrap();
         let table = Table::open(artifact.path(), span).unwrap();
@@ -1361,7 +1363,7 @@ mod tests {
         assert!(Table::from_file(file, table.file_identity(), span).is_err());
         let table = Table::open(artifact.path(), span).unwrap();
         assert_eq!(table.read_rows(&[0]).unwrap(), vec![[-1.0; DIM]]);
-        artifact.as_file().set_len(span.end - 1).unwrap();
+        artifact.as_file().set_len_sparse(span.end - 1).unwrap();
         assert!(table.read_rows(&[0]).is_err());
         assert!(Table::open(artifact.path(), span).is_err());
         drop(pending); // Whole-model failure: candidate hash state is discarded.
@@ -1384,7 +1386,7 @@ mod tests {
             .table_span(1, 32, 408 * ROW_BYTES as u64)
             .unwrap();
         let mut artifact = tempfile::NamedTempFile::new().unwrap();
-        artifact.as_file().set_len(span.end).unwrap();
+        artifact.as_file().set_len_sparse(span.end).unwrap();
         artifact.seek(SeekFrom::Start(span.offset)).unwrap();
         artifact.write_all(&uniform_row(0x38, 127)).unwrap();
         let file = File::open(artifact.path()).unwrap();
@@ -1392,7 +1394,7 @@ mod tests {
         let table = Table::from_file(file.try_clone().unwrap(), expected, span).unwrap();
         assert_eq!(table.read_rows(&[0]).unwrap(), vec![[1.0; DIM]]);
         let other = tempfile::NamedTempFile::new().unwrap();
-        other.as_file().set_len(span.end).unwrap();
+        other.as_file().set_len_sparse(span.end).unwrap();
         advance_modified(other.as_file());
         assert!(Table::from_file(File::open(other.path()).unwrap(), expected, span).is_err());
         // Metadata-only changes also invalidate the verified descriptor.
@@ -1413,7 +1415,7 @@ mod tests {
             assert!(Table::from_file(current.try_clone().unwrap(), modified, span).is_err());
         }
         let table = Table::from_file(current.try_clone().unwrap(), actual, span).unwrap();
-        artifact.as_file().set_len(span.end - 1).unwrap();
+        artifact.as_file().set_len_sparse(span.end - 1).unwrap();
         assert!(table.read_rows(&[0]).is_err());
         assert!(Table::from_file(current, actual, span).is_err());
     }
@@ -1424,7 +1426,7 @@ mod tests {
             .table_span(1, 32, 408 * ROW_BYTES as u64)
             .unwrap();
         let mut artifact = tempfile::NamedTempFile::new().unwrap();
-        artifact.as_file().set_len(span.end).unwrap();
+        artifact.as_file().set_len_sparse(span.end).unwrap();
         artifact.seek(SeekFrom::Start(span.offset)).unwrap();
         artifact.write_all(&uniform_row(0x38, 127)).unwrap();
         let table = Table::open(artifact.path(), span).unwrap();
@@ -1466,7 +1468,7 @@ mod tests {
     fn batched_fixture(offset: u64) -> Result<(tempfile::NamedTempFile, Table)> {
         let span = small_layout().table_span(1, offset, 408 * ROW_BYTES as u64)?;
         let mut artifact = tempfile::NamedTempFile::new()?;
-        artifact.as_file().set_len(span.end)?;
+        artifact.as_file().set_len_sparse(span.end)?;
         artifact.seek(SeekFrom::Start(span.offset))?;
         let codes = [0, 128, 1, 129, 0x38, 0xb8, 0x7e, 0xfe];
         for row in 0..span.rows {
@@ -1672,7 +1674,7 @@ mod tests {
             assert!(error.to_string().contains("identity"));
         }
         let (artifact, truncated) = batched_fixture(37)?;
-        artifact.as_file().set_len(truncated.span.end - 1)?;
+        artifact.as_file().set_len_sparse(truncated.span.end - 1)?;
         let error = truncated
             .read_rows_batched_with(&[407], |_, _, _| {
                 panic!("truncation must fail identity before I/O")

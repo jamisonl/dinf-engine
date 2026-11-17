@@ -1,5 +1,7 @@
+use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::qmatmul::QMatMul;
@@ -49,19 +51,16 @@ static MOE_ROUTE_STATS_TILES: AtomicU64 = AtomicU64::new(0);
 static MOE_ROUTE_STATS_TILES_64: AtomicU64 = AtomicU64::new(0);
 static MOE_ROUTE_STATS_MULTI_TILE_EXPERTS: AtomicU64 = AtomicU64::new(0);
 static MOE_ROUTE_STATS_MAX_ROUTES: AtomicU64 = AtomicU64::new(0);
-static PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
-#[cfg(target_os = "macos")]
-static ROUTE_STATS_ENABLED: OnceLock<bool> = OnceLock::new();
 #[cfg(target_os = "macos")]
 static NEMOTRON_METAL4_QMM_LOGGED: OnceLock<()> = OnceLock::new();
 
 fn layer_profile_enabled() -> bool {
-    *PROFILE_ENABLED.get_or_init(|| std::env::var_os("DINF_PROFILE_LAYERS").is_some())
+    super::profiling::layer_profiling_enabled()
 }
 
 #[cfg(target_os = "macos")]
 fn route_stats_enabled() -> bool {
-    *ROUTE_STATS_ENABLED.get_or_init(|| std::env::var_os("DINF_PROFILE_MOE_ROUTES").is_some())
+    super::profiling::moe_route_profiling_enabled()
 }
 
 /// Reset the process-local Nemotron-H layer profiling counters.
@@ -179,35 +178,6 @@ fn record_profile_time(device: &Device, started: Instant, elapsed: &AtomicU64) -
     Ok(())
 }
 
-fn trace_layer_tensor(label: &str, layer: isize, tensor: &Tensor, seq_len: usize) -> Result<()> {
-    if std::env::var_os("DINF_TRACE_NEMOTRON_LAYERS").is_none() {
-        return Ok(());
-    }
-    if let Some(requested) = std::env::var("DINF_TRACE_NEMOTRON_SEQ_LEN")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        && requested != seq_len
-    {
-        return Ok(());
-    }
-
-    let values = tensor
-        .i((0, seq_len - 1, ..))?
-        .flatten_all()?
-        .to_dtype(DType::F32)?
-        .to_vec1::<f32>()?;
-    let head = values.iter().take(6).copied().collect::<Vec<_>>();
-    let sum = values.iter().map(|value| *value as f64).sum::<f64>();
-    let sum_sq = values
-        .iter()
-        .map(|value| (*value as f64) * (*value as f64))
-        .sum::<f64>();
-    eprintln!(
-        "DINF_NEMOTRON_LAYER label={label} layer={layer} seq_len={seq_len} head={head:?} sum={sum:.9} sum_sq={sum_sq:.9}"
-    );
-    Ok(())
-}
-
 // ── Nemotron-H architecture ─────────────────────────────────────────────
 //
 // Hybrid architecture with three block types:
@@ -268,12 +238,10 @@ enum NemotronQMatMul {
 impl NemotronQMatMul {
     fn from_qtensor(qt: Arc<QTensor>, _device: &Device) -> Result<Self> {
         #[cfg(target_os = "macos")]
-        if std::env::var_os("DINF_DISABLE_METAL4_QMM").is_none()
-            && let Some(matmul) = super::tensor_qmatmul_metal::MetalTensorQMatMul::try_from_qtensor(
-                Arc::clone(&qt),
-                _device,
-            )?
-        {
+        if let Some(matmul) = super::tensor_qmatmul_metal::MetalTensorQMatMul::try_from_qtensor(
+            Arc::clone(&qt),
+            _device,
+        )? {
             NEMOTRON_METAL4_QMM_LOGGED.get_or_init(|| {
                 tracing::info!(
                     "Metal 4 tensor quantized matmul enabled for Nemotron prompt projections"
@@ -306,13 +274,7 @@ impl NemotronQMatMul {
         match self {
             Self::Candle(matmul) => relu_squared(&matmul.forward(x)?),
             #[cfg(target_os = "macos")]
-            Self::MetalTensor(matmul)
-                if std::env::var_os("DINF_DISABLE_NEMOTRON_SHARED_RELU2_FUSION").is_none() =>
-            {
-                matmul.forward_relu_squared(x).map_err(Into::into)
-            }
-            #[cfg(target_os = "macos")]
-            Self::MetalTensor(matmul) => relu_squared(&matmul.forward(x)?),
+            Self::MetalTensor(matmul) => matmul.forward_relu_squared(x).map_err(Into::into),
         }
     }
 
@@ -599,19 +561,9 @@ impl Mamba2Block {
         }
         let started = Instant::now();
         let combined = combined.squeeze(0)?.to_dtype(DType::F32)?;
-        let strided_inputs = std::env::var_os("DINF_DISABLE_NEMOTRON_STRIDED_INPUTS").is_none();
         let z = combined.narrow(1, 0, self.d_inner)?;
         let conv_input = combined.narrow(1, self.d_inner, self.d_conv)?;
         let dt_raw = combined.narrow(1, self.d_inner + self.d_conv, self.n_heads)?;
-        let (z, conv_input, dt_raw) = if strided_inputs {
-            (z, conv_input, dt_raw)
-        } else {
-            (
-                z.contiguous()?,
-                conv_input.contiguous()?,
-                dt_raw.contiguous()?,
-            )
-        };
         if profile {
             record_profile_time(x.device(), started, &MAMBA_INPUT_LAYOUT_PROFILE_NS)?;
         }
@@ -654,23 +606,8 @@ impl Mamba2Block {
 
         let started = Instant::now();
         let y = y.reshape((seq_len, self.d_inner))?;
-        let normalized = if std::env::var_os("DINF_DISABLE_NEMOTRON_FUSED_GATE_NORM").is_none() {
-            super::nemotron_mamba::fused_gate_group_norm(&z, &y, &self.ssm_norm)?.reshape((
-                1,
-                seq_len,
-                self.d_inner,
-            ))?
-        } else {
-            let gate = candle_nn::Activation::Silu.forward(&z)?;
-            let gated = (&gate * &y)?;
-            let group_size = self.d_inner / self.n_group;
-            let grouped = gated.reshape((seq_len, self.n_group, group_size))?;
-            let variance = (&grouped * &grouped)?.mean_keepdim(D::Minus1)?;
-            let normalized = grouped.broadcast_div(&(variance + 1e-5)?.sqrt()?)?;
-            normalized
-                .broadcast_mul(&self.ssm_norm)?
-                .reshape((1, seq_len, self.d_inner))?
-        };
+        let normalized = super::nemotron_mamba::fused_gate_group_norm(&z, &y, &self.ssm_norm)?
+            .reshape((1, seq_len, self.d_inner))?;
         let projected = self.ssm_out.forward(&normalized)?.to_dtype(DType::F32)?;
         let result = (&residual + &projected)?
             .to_dtype(input_dtype)
@@ -714,16 +651,6 @@ impl Mamba2Block {
         let z = combined.narrow(1, 0, self.d_inner)?;
         let conv_input = combined.narrow(1, self.d_inner, self.d_conv)?;
         let dt_raw = combined.narrow(1, self.d_inner + self.d_conv, self.n_heads)?;
-        let (z, conv_input, dt_raw) =
-            if std::env::var_os("DINF_DISABLE_NEMOTRON_STRIDED_INPUTS").is_none() {
-                (z, conv_input, dt_raw)
-            } else {
-                (
-                    z.contiguous()?,
-                    conv_input.contiguous()?,
-                    dt_raw.contiguous()?,
-                )
-            };
         if profile {
             record_profile_time(x.device(), started, &MAMBA_INPUT_LAYOUT_PROFILE_NS)?;
         }
@@ -790,8 +717,6 @@ impl Mamba2Block {
 
         #[cfg(feature = "cuda")]
         if x.device().is_cuda()
-            && std::env::var_os("DINF_DISABLE_NEMOTRON_MAMBA_CUDA").is_none()
-            && (seq_len == 1 || std::env::var_os("DINF_DISABLE_NEMOTRON_PREFILL_CUDA").is_none())
             && super::nemotron_mamba_cuda::supports(
                 seq_len,
                 self.d_conv,
@@ -806,12 +731,7 @@ impl Mamba2Block {
         }
 
         #[cfg(target_os = "macos")]
-        if seq_len > 1
-            && x.device().is_metal()
-            && self.kernel_size <= 8
-            && self.d_state <= 256
-            && std::env::var_os("DINF_DISABLE_NEMOTRON_PREFILL_METAL").is_none()
-        {
+        if seq_len > 1 && x.device().is_metal() && self.kernel_size <= 8 && self.d_state <= 256 {
             return self.forward_metal_prefill(x, cache);
         }
 
@@ -957,10 +877,7 @@ impl MetalIndexedNemotronExperts {
             let ids = expert_ids.narrow(0, start, len)?;
             let route_weights = weights.narrow(0, start, len)?;
             let started = Instant::now();
-            let route_plan = if len >= 64
-                && std::env::var_os("DINF_DISABLE_COMPACT_MOE_METAL").is_none()
-                && std::env::var_os("DINF_DISABLE_INDEXED_MOE_ROUTE_PLAN_REUSE").is_none()
-            {
+            let route_plan = if len >= 64 {
                 Some(self.up_proj.prepare_route_plan(&ids)?)
             } else {
                 None
@@ -1132,11 +1049,7 @@ impl MoeBlock {
         #[cfg(target_os = "macos")]
         let fused_indexed_routing = match (&self.experts, &self.expert_bias) {
             (NemotronExperts::MetalIndexed(_), Some(bias))
-                if self.weights_norm
-                    && self.experts.len() <= 128
-                    && self.num_active <= 16
-                    && std::env::var_os("DINF_DISABLE_NEMOTRON_GPU_ROUTING").is_none()
-                    && std::env::var_os("DINF_DISABLE_FUSED_TOPK_ROUTING").is_none() =>
+                if self.weights_norm && self.experts.len() <= 128 && self.num_active <= 16 =>
             {
                 Some(fused_sigmoid_topk_route(
                     &router_logits.contiguous()?,
@@ -1172,9 +1085,7 @@ impl MoeBlock {
         #[cfg(any(target_os = "macos", feature = "cuda"))]
         let indexed_routing = if let Some(routing) = fused_indexed_routing {
             Some(routing)
-        } else if self.experts.is_indexed()
-            && std::env::var_os("DINF_DISABLE_NEMOTRON_GPU_ROUTING").is_none()
-        {
+        } else if self.experts.is_indexed() {
             let selection_scores = selection_scores
                 .as_ref()
                 .context("missing Nemotron selection scores")?;
@@ -1748,7 +1659,6 @@ impl NemotronStage {
                 #[cfg(target_os = "macos")]
                 let experts = {
                     let use_indexed_metal = device.is_metal()
-                        && std::env::var_os("DINF_DISABLE_INDEXED_MOE_METAL").is_none()
                         && MetalIndexedMoeMatMul::supports_dtype(up_exps.dtype())
                         && MetalIndexedMoeMatMul::supports_dtype(down_exps.dtype());
                     if use_indexed_metal {
@@ -1980,7 +1890,6 @@ impl ModelArchitecture for NemotronStage {
         if profile {
             self.device.synchronize()?;
         }
-        trace_layer_tensor("embedding", -1, &hidden_states, seq_len)?;
 
         for (i, block) in self.blocks.iter().enumerate() {
             let started = Instant::now();
@@ -2013,7 +1922,6 @@ impl ModelArchitecture for NemotronStage {
                     result
                 }
             };
-            trace_layer_tensor("block_out", i as isize, &hidden_states, seq_len)?;
             if profile {
                 let (elapsed, calls) = match block {
                     NemotronBlock::Mamba2(_) => (&MAMBA_PROFILE_NS, &MAMBA_PROFILE_CALLS),

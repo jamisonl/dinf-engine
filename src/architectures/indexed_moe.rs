@@ -59,6 +59,7 @@ fn backend_supports_dtype(backend: IndexedMoeBackendKind, dtype: GgmlDType) -> b
         IndexedMoeBackendKind::Cuda => matches!(
             dtype,
             GgmlDType::Q4_0
+                | GgmlDType::Q5_0
                 | GgmlDType::Q8_0
                 | GgmlDType::Q2K
                 | GgmlDType::Q3K
@@ -73,9 +74,8 @@ fn backend_supports_dtype(backend: IndexedMoeBackendKind, dtype: GgmlDType) -> b
 fn select_backend(
     backend: Option<IndexedMoeBackendKind>,
     dtype: GgmlDType,
-    disabled: bool,
 ) -> Option<IndexedMoeBackendKind> {
-    backend.filter(|backend| !disabled && backend_supports_dtype(*backend, dtype))
+    backend.filter(|backend| backend_supports_dtype(*backend, dtype))
 }
 
 #[cfg(any(target_os = "macos", feature = "cuda"))]
@@ -92,36 +92,8 @@ fn device_backend(device: &Device) -> Option<IndexedMoeBackendKind> {
 }
 
 #[cfg(any(target_os = "macos", feature = "cuda"))]
-fn backend_disabled(backend: IndexedMoeBackendKind) -> bool {
-    match backend {
-        #[cfg(any(target_os = "macos", test))]
-        IndexedMoeBackendKind::Metal => {
-            std::env::var_os("DINF_DISABLE_INDEXED_MOE_METAL").is_some()
-        }
-        #[cfg(any(feature = "cuda", test))]
-        IndexedMoeBackendKind::Cuda => std::env::var_os("DINF_DISABLE_INDEXED_MOE_CUDA").is_some(),
-    }
-}
-
-#[cfg(any(target_os = "macos", feature = "cuda"))]
-fn backend_dtype_disabled(backend: IndexedMoeBackendKind, _dtype: GgmlDType) -> bool {
-    match backend {
-        #[cfg(any(target_os = "macos", test))]
-        IndexedMoeBackendKind::Metal => false,
-        #[cfg(any(feature = "cuda", test))]
-        IndexedMoeBackendKind::Cuda => {
-            _dtype == GgmlDType::Q4_0
-                && std::env::var_os("DINF_DISABLE_INDEXED_MOE_Q4_0_CUDA").is_some()
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", feature = "cuda"))]
 pub(super) fn indexed_moe_available(device: &Device, dtype: GgmlDType) -> bool {
-    let backend = device_backend(device);
-    let disabled = backend
-        .is_some_and(|backend| backend_disabled(backend) || backend_dtype_disabled(backend, dtype));
-    select_backend(backend, dtype, disabled).is_some()
+    select_backend(device_backend(device), dtype).is_some()
 }
 
 /// Quantized indexed expert matmul with one backend-neutral contract.
@@ -138,6 +110,10 @@ pub(super) struct IndexedMoeMatMul {
     num_experts: usize,
     out_dim: usize,
     in_dim: usize,
+    /// Prompts use the half-precision tensor-core CUDA kernel where it
+    /// covers the expert format.
+    #[cfg(feature = "cuda")]
+    cuda_grouped_wmma: bool,
 }
 
 #[cfg(any(target_os = "macos", feature = "cuda"))]
@@ -178,13 +154,7 @@ impl IndexedMoeMatMul {
         let backend_kind = device_backend(device)
             .context("indexed MoE requires a supported accelerator device")?;
         anyhow::ensure!(
-            select_backend(
-                Some(backend_kind),
-                packed.dtype(),
-                backend_disabled(backend_kind)
-                    || backend_dtype_disabled(backend_kind, packed.dtype())
-            )
-            .is_some(),
+            select_backend(Some(backend_kind), packed.dtype()).is_some(),
             "indexed MoE {:?} does not support {:?}",
             backend_kind,
             packed.dtype()
@@ -235,7 +205,7 @@ impl IndexedMoeMatMul {
                     "indexed MoE CUDA weights were not materialized on the target device"
                 );
                 super::indexed_moe_epilogue_cuda::precompile(device)?;
-                if weights.dtype() == GgmlDType::Q4_0 {
+                if super::indexed_moe_cuda::supports(weights.dtype()) {
                     super::indexed_moe_cuda::precompile(device)?;
                 }
                 IndexedMoeBackend::Cuda(weights)
@@ -249,7 +219,24 @@ impl IndexedMoeMatMul {
             num_experts,
             out_dim,
             in_dim,
+            #[cfg(feature = "cuda")]
+            cuda_grouped_wmma: false,
         })
+    }
+
+    /// Run CUDA prompts (more than one token) through the tensor-core grouped
+    /// kernel when it covers this expert format. It rounds inputs and weights
+    /// to F16; single-token decode is unchanged.
+    #[cfg(feature = "cuda")]
+    pub(super) fn prefer_cuda_grouped_wmma(&mut self) -> Result<()> {
+        if let IndexedMoeBackend::Cuda(weights) = &self.backend
+            && (super::indexed_moe_cuda::supports_grouped_wmma(weights.dtype())
+                || super::indexed_moe_cuda::supports_f32_decode(weights.dtype()))
+        {
+            super::indexed_moe_cuda::precompile(&self.device)?;
+            self.cuda_grouped_wmma = true;
+        }
+        Ok(())
     }
 
     /// Use the native vector order for one admitted Metal request.
@@ -403,16 +390,32 @@ impl IndexedMoeMatMul {
             "indexed MoE input, IDs, and weights must share one device"
         );
 
-        // Candle's CUDA indexed MoE kernel reads its storage from byte zero and
-        // does not apply tensor layout offsets. `contiguous()` retains an
+        // The GGUF prompt kernel reads its storage from byte zero and does not
+        // apply tensor layout offsets. `contiguous()` retains an
         // already-contiguous narrow view, so prompt chunks after the first one
-        // would silently reread chunk zero. Copy only offset CUDA views; Metal
-        // kernels consume their layout offsets and do not need this copy.
+        // would silently reread chunk zero. Copy only offset CUDA views for
+        // that kernel; every other kernel consumes its layout offsets.
         #[cfg(feature = "cuda")]
-        let copy_cuda_views = matches!(
-            &self.backend,
-            IndexedMoeBackend::Cuda(weights) if weights.dtype() != GgmlDType::Q4_0
-        );
+        let grouped_wmma = self.cuda_grouped_wmma && tokens > 1;
+        // The same opt-in sends one token through the one-launch F32 kernel
+        // for formats whose default decode path takes several launches.
+        #[cfg(feature = "cuda")]
+        let f32_decode = self.cuda_grouped_wmma
+            && tokens == 1
+            && matches!(
+                &self.backend,
+                IndexedMoeBackend::Cuda(weights)
+                    if super::indexed_moe_cuda::supports_f32_decode(weights.dtype())
+            );
+        #[cfg(feature = "cuda")]
+        let copy_cuda_views = !grouped_wmma
+            && !f32_decode
+            && matches!(
+                &self.backend,
+                IndexedMoeBackend::Cuda(weights)
+                    if !super::indexed_moe_cuda::supports(weights.dtype())
+                        && (tokens > 1 || weights.dtype() == GgmlDType::Q8_0)
+            );
         #[cfg(not(feature = "cuda"))]
         let copy_cuda_views = false;
         let input = accelerator_kernel_input(input, copy_cuda_views)?;
@@ -430,7 +433,16 @@ impl IndexedMoeMatMul {
             IndexedMoeBackend::Metal(inner) => inner.forward(&input, &expert_ids)?,
             #[cfg(feature = "cuda")]
             IndexedMoeBackend::Cuda(weights) => {
-                if weights.dtype() == GgmlDType::Q4_0 {
+                if grouped_wmma {
+                    super::indexed_moe_cuda::forward_grouped_wmma(
+                        &input,
+                        &expert_ids,
+                        weights,
+                        self.num_experts,
+                        self.out_dim,
+                        self.in_dim,
+                    )?
+                } else if f32_decode || super::indexed_moe_cuda::supports(weights.dtype()) {
                     super::indexed_moe_cuda::forward(
                         &input,
                         &expert_ids,
@@ -510,7 +522,7 @@ impl IndexedMoeMatMul {
     ) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         if let IndexedMoeBackend::Cuda(weights) = &self.backend
-            && weights.dtype() == GgmlDType::Q4_0
+            && super::indexed_moe_cuda::supports(weights.dtype())
         {
             return super::indexed_moe_cuda::forward_relu_squared(
                 input,
@@ -624,7 +636,7 @@ pub(super) fn normalized_route_weights(
     }
 
     #[cfg(feature = "cuda")]
-    if probabilities.device().is_cuda() && cuda_epilogue_enabled() {
+    if probabilities.device().is_cuda() {
         return cuda_normalized_route_weights(
             &probabilities.contiguous()?,
             &expert_ids.contiguous()?,
@@ -662,7 +674,7 @@ pub(super) fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         return fused_silu_mul(gate, up).map_err(Into::into);
     }
     #[cfg(feature = "cuda")]
-    if gate.device().is_cuda() && gate.dtype() == DType::F32 && cuda_epilogue_enabled() {
+    if gate.device().is_cuda() && gate.dtype() == DType::F32 {
         return cuda_silu_mul(&gate.contiguous()?, &up.contiguous()?);
     }
     Ok((candle_nn::Activation::Silu.forward(gate)? * up)?)
@@ -720,7 +732,7 @@ pub(super) fn weighted_route_sum(routes: &Tensor, weights: &Tensor) -> Result<Te
     }
 
     #[cfg(feature = "cuda")]
-    if routes.device().is_cuda() && cuda_epilogue_enabled() {
+    if routes.device().is_cuda() {
         return cuda_weighted_route_sum(&routes.contiguous()?, &weights.contiguous()?);
     }
 
@@ -739,12 +751,6 @@ pub(super) fn weighted_route_sum(routes: &Tensor, weights: &Tensor) -> Result<Te
     Ok(output)
 }
 
-#[cfg(feature = "cuda")]
-fn cuda_epilogue_enabled() -> bool {
-    std::env::var_os("DINF_DISABLE_INDEXED_MOE_CUDA").is_none()
-        && std::env::var_os("DINF_DISABLE_INDEXED_MOE_EPILOGUE_CUDA").is_none()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +759,7 @@ mod tests {
     fn cuda_dtype_selection_is_explicit_and_safe() {
         for dtype in [
             GgmlDType::Q4_0,
+            GgmlDType::Q5_0,
             GgmlDType::Q8_0,
             GgmlDType::Q2K,
             GgmlDType::Q3K,
@@ -761,7 +768,7 @@ mod tests {
             GgmlDType::Q6K,
         ] {
             assert_eq!(
-                select_backend(Some(IndexedMoeBackendKind::Cuda), dtype, false),
+                select_backend(Some(IndexedMoeBackendKind::Cuda), dtype),
                 Some(IndexedMoeBackendKind::Cuda)
             );
         }
@@ -770,13 +777,12 @@ mod tests {
             GgmlDType::F16,
             GgmlDType::BF16,
             GgmlDType::Q4_1,
-            GgmlDType::Q5_0,
             GgmlDType::Q5_1,
             GgmlDType::Q8_1,
             GgmlDType::Q8K,
         ] {
             assert_eq!(
-                select_backend(Some(IndexedMoeBackendKind::Cuda), dtype, false),
+                select_backend(Some(IndexedMoeBackendKind::Cuda), dtype),
                 None
             );
         }
@@ -796,16 +802,12 @@ mod tests {
     }
 
     #[test]
-    fn backend_selection_honors_disable_and_device_availability() {
+    fn backend_selection_honors_device_availability() {
         assert_eq!(
-            select_backend(Some(IndexedMoeBackendKind::Metal), GgmlDType::Q4_0, false),
+            select_backend(Some(IndexedMoeBackendKind::Metal), GgmlDType::Q4_0),
             Some(IndexedMoeBackendKind::Metal)
         );
-        assert_eq!(
-            select_backend(Some(IndexedMoeBackendKind::Metal), GgmlDType::Q4_0, true),
-            None
-        );
-        assert_eq!(select_backend(None, GgmlDType::Q4K, false), None);
+        assert_eq!(select_backend(None, GgmlDType::Q4K), None);
     }
 
     #[test]

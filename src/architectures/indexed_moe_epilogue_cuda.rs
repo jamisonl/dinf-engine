@@ -320,10 +320,7 @@ extern "C" __global__ void dinf_silu_mul_exact_f32(
     }
 
     pub(crate) fn precompile(device: &Device) -> anyhow::Result<()> {
-        if !device.is_cuda()
-            || std::env::var_os("DINF_DISABLE_INDEXED_MOE_CUDA").is_some()
-            || std::env::var_os("DINF_DISABLE_INDEXED_MOE_EPILOGUE_CUDA").is_some()
-        {
+        if !device.is_cuda() {
             return Ok(());
         }
         let device = device.as_cuda_device()?;
@@ -342,7 +339,7 @@ extern "C" __global__ void dinf_silu_mul_exact_f32(
     }
 
     pub(crate) fn precompile_exact_silu(device: &Device) -> anyhow::Result<()> {
-        if !device.is_cuda() || std::env::var_os("DINF_DISABLE_CUDA_SILU_MUL").is_some() {
+        if !device.is_cuda() {
             return Ok(());
         }
         let device = device.as_cuda_device()?;
@@ -568,7 +565,8 @@ extern "C" __global__ void dinf_silu_mul_exact_f32(
                 "route weights",
             )?;
             let device = routes.device();
-            let mut output = device.alloc_zeros::<f32>(geometry.output_elements)?;
+            // SAFETY: The kernel writes every output element.
+            let mut output = unsafe { device.alloc::<f32>(geometry.output_elements)? };
             let function = device.get_or_load_custom_func(
                 WEIGHTED_SUM_KERNEL_NAME,
                 CUDA_MODULE_NAME,

@@ -17,6 +17,9 @@ pub(super) struct DeltaNetGeometry {
     pub(super) conv_state_elements: usize,
     pub(super) recurrent_output_elements: usize,
     pub(super) recurrent_state_elements: usize,
+    /// Per-token gates and scaled queries and keys for the CUDA prompt scan.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(super) terms_elements: usize,
 }
 
 impl DeltaNetGeometry {
@@ -69,6 +72,15 @@ impl DeltaNetGeometry {
             value_dim,
             "DeltaNet state",
         )?;
+        let terms_elements = checked_mul(
+            seq_len,
+            checked_add(
+                checked_mul(n_v_heads, 2, "DeltaNet gates")?,
+                checked_mul(total_key_dim, 2, "scaled query and key width")?,
+                "DeltaNet terms width",
+            )?,
+            "DeltaNet terms",
+        )?;
         let conv_packed_elements = checked_add(
             conv_elements,
             conv_state_elements,
@@ -91,6 +103,7 @@ impl DeltaNetGeometry {
             ("DeltaNet state", recurrent_state_elements),
             ("packed convolution output", conv_packed_elements),
             ("packed DeltaNet output", recurrent_packed_elements),
+            ("DeltaNet terms", terms_elements),
         ] {
             ensure!(
                 value <= i32::MAX as usize,
@@ -109,6 +122,7 @@ impl DeltaNetGeometry {
             conv_state_elements,
             recurrent_output_elements,
             recurrent_state_elements,
+            terms_elements,
         })
     }
 
@@ -133,6 +147,26 @@ impl DeltaNetGeometry {
             32 => "qwen35_deltanet_scan_f32_32",
             64 => "qwen35_deltanet_scan_f32_64",
             128 => "qwen35_deltanet_scan_f32_128",
+            _ => unreachable!("head size was checked when the geometry was built"),
+        }
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(super) fn terms_kernel_name(self) -> &'static str {
+        match self.head_dim {
+            32 => "qwen35_deltanet_terms_f32_32",
+            64 => "qwen35_deltanet_terms_f32_64",
+            128 => "qwen35_deltanet_terms_f32_128",
+            _ => unreachable!("head size was checked when the geometry was built"),
+        }
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(super) fn prompt_scan_kernel_name(self) -> &'static str {
+        match self.head_dim {
+            32 => "qwen35_deltanet_prompt_scan_f32_32",
+            64 => "qwen35_deltanet_prompt_scan_f32_64",
+            128 => "qwen35_deltanet_prompt_scan_f32_128",
             _ => unreachable!("head size was checked when the geometry was built"),
         }
     }

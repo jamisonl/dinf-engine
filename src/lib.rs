@@ -38,7 +38,21 @@ pub(crate) const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 512;
 pub mod architectures;
 /// Continuous-batching and speculative-decoding session helpers.
 pub mod continuous;
+/// Graph-captured single-token decode steps on CUDA.
+#[cfg(feature = "cuda")]
+pub mod cuda_graph;
+
+/// Mark a layer boundary in a decode step. While the step is being recorded
+/// as CUDA graphs, this is where a recorded segment is launched.
+#[inline]
+pub(crate) fn decode_layer_boundary(layer_index: usize) {
+    #[cfg(feature = "cuda")]
+    cuda_graph::segment_boundary(layer_index);
+    #[cfg(not(feature = "cuda"))]
+    let _ = layer_index;
+}
 pub(crate) mod deepseek4_gguf;
+mod device_stages;
 /// Native image diffusion, independent of autoregressive generation sessions.
 pub mod diffusion;
 mod gguf_limits;
@@ -47,10 +61,14 @@ pub mod gguf_loader;
 pub(crate) mod gsq_coder;
 /// Inference throughput and latency aggregation.
 pub mod metrics;
+/// Runtime options for a loaded stage.
+pub mod options;
 mod prompt_cache;
 mod qmatmul;
 /// Token sampling controls and deterministic request-scoped random sampling.
 pub mod sampling;
+#[cfg(feature = "cuda")]
+mod sampling_cuda;
 #[cfg(target_os = "macos")]
 mod sampling_metal;
 mod speculative_batch;
@@ -69,6 +87,7 @@ pub mod vision;
 
 pub use api::{Engine, EngineBuilder, GenerationOutput};
 pub use gguf_loader::{GgufMetadata, LayerRange, StageMemoryProfile, read_gguf_metadata};
+pub use options::{EngineOptions, ProfileOptions, SpeculativeOptions};
 pub use prompt_cache::RESERVED_PROMPT_SCOPE_PREFIX;
 pub use sampling::SamplingParams as GenerationParams;
 
@@ -122,6 +141,12 @@ pub(crate) fn test_in_subprocess(name: &str) -> bool {
     print!("{}", String::from_utf8_lossy(&output.stdout));
     eprint!("{}", String::from_utf8_lossy(&output.stderr));
     true
+}
+
+/// Metal tests skip on platforms without Metal.
+#[cfg(all(test, not(target_os = "macos")))]
+pub(crate) fn test_metal_device() -> Option<Device> {
+    None
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -373,43 +398,6 @@ impl DecodeProfile {
     }
 }
 
-fn trace_logits(logits: &candle_core::Tensor, step: usize) -> Result<()> {
-    let trace_enabled = std::env::var_os("DINF_TRACE_TOP_LOGITS").is_some();
-    let save_path = std::env::var_os("DINF_SAVE_LOGITS");
-    if !trace_enabled && save_path.is_none() {
-        return Ok(());
-    }
-
-    let requested_step = std::env::var("DINF_LOGITS_STEP")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok());
-    if requested_step.is_some_and(|requested| requested != step) {
-        return Ok(());
-    }
-
-    let values = logits
-        .flatten_all()?
-        .to_dtype(candle_core::DType::F32)?
-        .to_vec1::<f32>()?;
-
-    if trace_enabled {
-        let mut ranked = values.iter().copied().enumerate().collect::<Vec<_>>();
-        ranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        ranked.truncate(12);
-        eprintln!("DINF_TOP_LOGITS step={step} top={ranked:?}");
-    }
-
-    if let Some(path) = save_path {
-        let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
-        for value in values {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        std::fs::write(path, bytes)?;
-    }
-
-    Ok(())
-}
-
 /// Position of a stage within the pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StagePosition {
@@ -431,16 +419,13 @@ enum DecodeBatchInputs<'a> {
 fn resolve_speculative_block_size(
     trained_rows: usize,
     preferred_rows: usize,
-    override_rows: Option<usize>,
     max_draft_tokens: Option<usize>,
 ) -> Result<usize> {
     anyhow::ensure!(
         trained_rows >= 2,
         "DFlash block must include an anchor and a draft token"
     );
-    let rows = override_rows
-        .unwrap_or(preferred_rows)
-        .clamp(2, trained_rows);
+    let rows = preferred_rows.clamp(2, trained_rows);
     match max_draft_tokens {
         None => Ok(rows),
         Some(max) => {
@@ -527,6 +512,14 @@ pub struct PipelineStage {
     /// its storage along with the memory budget charged to those sessions.
     decode_batch_caches: HashMap<Vec<u64>, Weak<PersistentDecodeBatch>>,
     prompt_cache: prompt_cache::PromptCache,
+    options: EngineOptions,
+    /// State for graph-captured single-token decode steps.
+    #[cfg(feature = "cuda")]
+    cuda_decode_graph: cuda_graph::DecodeGraph,
+    /// This stage's count among the stages on its GPU. Declared last so it
+    /// is dropped after the stage's device buffers.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    device_stages: device_stages::StageRegistration,
 }
 
 /// Mutable inference state owned by one logical generation session.
@@ -661,6 +654,24 @@ impl PipelineStage {
         kv_quant_bits: Option<u8>,
     ) -> Result<Self> {
         let path = || gguf_path.context("prepared native source cannot reopen a path");
+        // Count this stage on its GPU before it allocates there. This waits
+        // for a decode step that another stage is recording on the GPU.
+        let device_stages = device_stages::StageRegistration::register(device);
+        // cudarc attaches ordering events to every buffer it allocates, for
+        // use across streams. The engine issues all work for a device on one
+        // stream, and a captured decode graph cannot carry those events, so
+        // turn them off before any weight is allocated.
+        #[cfg(feature = "cuda")]
+        let cuda_events_off = match device {
+            Device::Cuda(cuda) => {
+                if cuda.is_event_tracking() {
+                    // SAFETY: One stream per device; see above.
+                    unsafe { cuda.disable_event_tracking() };
+                }
+                true
+            }
+            _ => false,
+        };
         if let Some(bits) = kv_quant_bits {
             turboquant::validate_inference_bits(bits)?;
         }
@@ -752,10 +763,7 @@ impl PipelineStage {
             #[allow(unused_mut)] // Metal can use its native F16 reconstruction.
             let mut dense_copies = if device.is_cpu() { 2 } else { 5 };
             #[cfg(target_os = "macos")]
-            if device.is_metal()
-                && head_dim <= crate::turboquant_metal::MAX_METAL_HEAD_DIM
-                && std::env::var_os("DINF_DISABLE_TURBOQUANT_METAL").is_none()
-            {
+            if device.is_metal() && head_dim <= crate::turboquant_metal::MAX_METAL_HEAD_DIM {
                 dense_copies = 1;
             }
             kv_bytes_per_token
@@ -841,6 +849,14 @@ impl PipelineStage {
             preallocated_kv_cache,
             decode_batch_caches: std::collections::HashMap::new(),
             prompt_cache: prompt_cache::PromptCache::default(),
+            options: EngineOptions::default(),
+            #[cfg(feature = "cuda")]
+            cuda_decode_graph: if cuda_events_off {
+                cuda_graph::DecodeGraph::event_free()
+            } else {
+                cuda_graph::DecodeGraph::default()
+            },
+            device_stages,
         })
     }
 
@@ -932,6 +948,28 @@ impl PipelineStage {
                 .unwrap_or(draft.block_size() - 1)
                 .min(draft.block_size() - 1)
         })
+    }
+
+    /// Runtime options this stage applies to requests.
+    pub fn options(&self) -> &EngineOptions {
+        &self.options
+    }
+
+    /// Replace this stage's runtime options.
+    ///
+    /// The new options apply from the next call. A
+    /// [`GenerationSession`](crate::continuous::GenerationSession) already in
+    /// progress reads the speculative policy at each step, so set options
+    /// before starting requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, leaving the current options in place, when
+    /// [`EngineOptions::validate`] rejects `options`.
+    pub fn set_options(&mut self, options: EngineOptions) -> Result<()> {
+        options.validate()?;
+        self.options = options;
+        Ok(())
     }
 
     fn speculative_reservation_rows(&self, trained_rows: usize) -> usize {
@@ -1033,16 +1071,7 @@ impl PipelineStage {
             return Ok(None);
         };
         let preferred = self.preferred_speculative_block_size()?.unwrap();
-        let override_rows = std::env::var("DINF_SPEC_BLOCK_SIZE")
-            .ok()
-            .and_then(|value| value.parse().ok());
-        resolve_speculative_block_size(
-            max,
-            preferred,
-            override_rows,
-            self.speculative_draft_max_tokens,
-        )
-        .map(Some)
+        resolve_speculative_block_size(max, preferred, self.speculative_draft_max_tokens).map(Some)
     }
 
     pub(crate) fn uses_pre_m5_speculative_policy(&self) -> Result<bool> {
@@ -1203,7 +1232,7 @@ impl PipelineStage {
         if self.arch.family() == "deepseek41" {
             anyhow::ensure!(
                 next_position <= self.context_length,
-                "Maya context limit exceeded"
+                "DeepSeek V4.1 context limit exceeded"
             );
             anyhow::ensure!(
                 matches!(&input, StageInput::Tokens(tokens)
@@ -1499,7 +1528,6 @@ impl PipelineStage {
         if !self.preallocated_kv_cache {
             #[cfg(target_os = "macos")]
             if self.device.is_metal()
-                && std::env::var_os("DINF_DISABLE_TURBOQUANT_METAL").is_none()
                 && self.quant_config.as_ref().is_some_and(|config| {
                     config.head_dim() <= crate::turboquant_metal::MAX_METAL_HEAD_DIM
                 })
@@ -1907,6 +1935,90 @@ impl PipelineStage {
         start_pos: usize,
         pass: ForwardPass<'_>,
     ) -> Result<(StageOutput, Vec<candle_core::Tensor>)> {
+        #[cfg(feature = "cuda")]
+        if self.cuda_graph_step_eligible(&input, seq_len) {
+            return self.forward_with_session_graph(state, input, seq_len, start_pos, pass);
+        }
+        self.forward_with_session_direct(state, input, seq_len, start_pos, pass)
+    }
+
+    /// Whether this step may run as one captured CUDA graph: a single text
+    /// token on CUDA, with the option on and no earlier capture failure. The
+    /// stage must also be the only one on its GPU, which is checked when the
+    /// step takes its recording turn.
+    #[cfg(feature = "cuda")]
+    fn cuda_graph_step_eligible(&self, input: &StageInput, seq_len: usize) -> bool {
+        self.options.cuda_graph_decode
+            && seq_len == 1
+            && self.device.is_cuda()
+            && matches!(input, StageInput::Tokens(_))
+            && self.speculative.is_none()
+            && !self.options.profile.decode
+            && !architectures::profiling::layer_profiling_enabled()
+            && self.cuda_decode_graph.usable()
+    }
+
+    /// Run one decode step with its launches recorded and run as one graph.
+    /// If the capture fails, the session is rolled back and the step repeats
+    /// with direct launches; when that succeeds, graph capture stays off for
+    /// this stage.
+    #[cfg(feature = "cuda")]
+    fn forward_with_session_graph(
+        &mut self,
+        state: &mut PipelineStageSessionState,
+        input: StageInput,
+        seq_len: usize,
+        start_pos: usize,
+        pass: ForwardPass<'_>,
+    ) -> Result<(StageOutput, Vec<candle_core::Tensor>)> {
+        // Another stage on this GPU could issue work into the recording, so
+        // only a sole stage records; the turn also holds back a stage being
+        // loaded on the GPU until this step is submitted.
+        let Some(turn) = self.device_stages.begin_recording() else {
+            return self.forward_with_session_direct(state, input, seq_len, start_pos, pass);
+        };
+        // Checkpoints do not cover every cache kind; those steps run direct.
+        let Ok(checkpoint) = self.checkpoint_session_state(state) else {
+            drop(turn);
+            return self.forward_with_session_direct(state, input, seq_len, start_pos, pass);
+        };
+        let retry_input = input.clone();
+        let device = self.device.clone();
+        let mut graph = std::mem::take(&mut self.cuda_decode_graph);
+        let outcome = graph.run(&device, || {
+            self.forward_with_session_direct(state, input, seq_len, start_pos, pass)
+        });
+        self.cuda_decode_graph = graph;
+        drop(turn);
+        let graph_error = match outcome {
+            Ok(output) => return Ok(output),
+            Err(error) => error,
+        };
+        self.restore_session_checkpoint(state, checkpoint);
+        let direct = self.forward_with_session_direct(state, retry_input, seq_len, start_pos, pass);
+        if direct.is_ok() {
+            tracing::warn!(
+                "CUDA graph decode disabled for this stage after a failed capture: {graph_error:#}"
+            );
+            self.cuda_decode_graph.disable();
+        }
+        direct
+    }
+
+    /// Counters for graph-captured decode steps on this stage.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_graph_decode_stats(&self) -> cuda_graph::DecodeGraphStats {
+        self.cuda_decode_graph.stats()
+    }
+
+    fn forward_with_session_direct(
+        &mut self,
+        state: &mut PipelineStageSessionState,
+        input: StageInput,
+        seq_len: usize,
+        start_pos: usize,
+        pass: ForwardPass<'_>,
+    ) -> Result<(StageOutput, Vec<candle_core::Tensor>)> {
         self.validate_token_input(&input, seq_len)?;
         anyhow::ensure!(
             state.cache.len() == self.cache.len(),
@@ -2117,7 +2229,10 @@ impl PipelineStage {
         #[cfg(target_os = "macos")]
         let result = crate::architectures::with_speculative_verify(verify);
         #[cfg(not(target_os = "macos"))]
-        let result = verify();
+        let result = {
+            let mut verify = verify;
+            verify()
+        };
         let (output, captures) = match result {
             Ok(result) => result,
             Err(error) => {
@@ -3286,9 +3401,9 @@ impl PipelineStage {
         anyhow::ensure!(!tokens.is_empty(), "generation prompt must contain a token");
         self.validate_token_ids(&tokens)?;
 
-        let profile_enabled = std::env::var_os("DINF_PROFILE_DECODE").is_some();
-        let sync_after_forward = std::env::var_os("DINF_PROFILE_SYNC").is_some();
-        let layer_profile_enabled = std::env::var_os("DINF_PROFILE_LAYERS").is_some();
+        let profile_enabled = self.options.profile.decode;
+        let sync_after_forward = self.options.profile.sync_after_forward;
+        let layer_profile_enabled = architectures::profiling::layer_profiling_enabled();
         let mut profile = DecodeProfile::default();
         if layer_profile_enabled {
             architectures::deepseek2::reset_layer_profile();
@@ -3376,7 +3491,6 @@ impl PipelineStage {
             StageOutput::Logits(l) => l,
             _ => anyhow::bail!("expected logits from solo stage"),
         };
-        trace_logits(&logits, 0)?;
 
         let sampling_start = Instant::now();
         let mut rng = params
@@ -3432,7 +3546,6 @@ impl PipelineStage {
                 StageOutput::Logits(l) => l,
                 _ => anyhow::bail!("expected logits from solo stage"),
             };
-            trace_logits(&logits, generated.len())?;
             let sampling_start = Instant::now();
             let next_token = sampling_history.sample(&logits, params, &mut rng)?;
             profile.sampling += sampling_start.elapsed();
@@ -3476,10 +3589,9 @@ impl PipelineStage {
         start_pos: usize,
         mrope_decode_delta: Option<i64>,
     ) -> Result<StageOutput> {
-        let chunk_tokens = std::env::var("DINF_PREFILL_CHUNK_TOKENS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| (1..=4096).contains(value))
+        let chunk_tokens = self
+            .options
+            .prefill_chunk_tokens
             .unwrap_or(DEFAULT_PREFILL_CHUNK_TOKENS);
         let context = TextRequestContext::new(
             start_pos
@@ -3547,26 +3659,25 @@ mod session_state_tests {
     struct CacheCountingArchitecture;
 
     #[test]
-    fn draft_token_cap_excludes_anchor_and_bounds_diagnostic_override() -> Result<()> {
-        for (preferred, override_rows, cap, expected) in [
-            (8, None, None, 8),
-            (8, None, Some(7), 8),
-            (8, None, Some(3), 4),
-            (8, None, Some(1), 2),
-            (8, Some(8), Some(3), 4),
-            (7, None, Some(7), 7),
-            (7, Some(8), Some(7), 8),
-            (8, Some(usize::MAX), Some(100), 8),
-            (8, Some(0), Some(7), 2),
+    fn draft_token_cap_excludes_anchor_and_bounds_preferred_rows() -> Result<()> {
+        for (preferred, cap, expected) in [
+            (8, None, 8),
+            (8, Some(7), 8),
+            (8, Some(3), 4),
+            (8, Some(1), 2),
+            (7, Some(7), 7),
+            (7, None, 7),
+            (usize::MAX, Some(100), 8),
+            (0, Some(7), 2),
         ] {
             assert_eq!(
-                super::resolve_speculative_block_size(8, preferred, override_rows, cap)?,
+                super::resolve_speculative_block_size(8, preferred, cap)?,
                 expected
             );
         }
-        assert!(super::resolve_speculative_block_size(1, 8, None, Some(7)).is_err());
-        assert!(super::resolve_speculative_block_size(8, 8, None, Some(0)).is_err());
-        assert!(super::resolve_speculative_block_size(8, 8, None, Some(usize::MAX)).is_err());
+        assert!(super::resolve_speculative_block_size(1, 8, Some(7)).is_err());
+        assert!(super::resolve_speculative_block_size(8, 8, Some(0)).is_err());
+        assert!(super::resolve_speculative_block_size(8, 8, Some(usize::MAX)).is_err());
         Ok(())
     }
 
@@ -4354,6 +4465,10 @@ mod session_state_tests {
             preallocated_kv_cache: false,
             decode_batch_caches: std::collections::HashMap::new(),
             prompt_cache: crate::prompt_cache::PromptCache::default(),
+            options: crate::EngineOptions::default(),
+            #[cfg(feature = "cuda")]
+            cuda_decode_graph: crate::cuda_graph::DecodeGraph::default(),
+            device_stages: crate::device_stages::StageRegistration::uncounted(),
         }
     }
 

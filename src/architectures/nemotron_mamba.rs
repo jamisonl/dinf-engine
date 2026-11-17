@@ -410,7 +410,6 @@ type PipelineCache = OnceLock<Mutex<HashMap<DeviceId, ComputePipeline>>>;
 
 static MAMBA2_SCAN_PIPELINE: PipelineCache = OnceLock::new();
 static CONV_SCAN_PIPELINE: PipelineCache = OnceLock::new();
-static MAMBA2_PREFILL_PIPELINE: PipelineCache = OnceLock::new();
 static MAMBA2_PREFILL_GATES_PIPELINE: PipelineCache = OnceLock::new();
 static MAMBA2_PARALLEL_PREFILL_PIPELINE: PipelineCache = OnceLock::new();
 static MAMBA2_GROUPED_PREFILL_PIPELINE: PipelineCache = OnceLock::new();
@@ -446,36 +445,25 @@ fn named_pipeline(
 }
 
 pub(super) fn precompile(device: &Device) -> anyhow::Result<()> {
-    if device.is_metal() && std::env::var_os("DINF_DISABLE_NEMOTRON_PREFILL_METAL").is_none() {
+    if device.is_metal() {
         let device = device.as_metal_device()?;
         mamba2_scan_pipeline(device)?;
         named_pipeline(device, "nemotron_conv_scan_silu_f32", &CONV_SCAN_PIPELINE)?;
         named_pipeline(
             device,
-            "nemotron_mamba2_prefill_f32",
-            &MAMBA2_PREFILL_PIPELINE,
+            "nemotron_mamba2_prefill_gates_f32",
+            &MAMBA2_PREFILL_GATES_PIPELINE,
         )?;
-        if std::env::var_os("DINF_DISABLE_NEMOTRON_PARALLEL_SCAN").is_none() {
-            if std::env::var_os("DINF_DISABLE_NEMOTRON_PRECOMPUTED_GATES").is_none() {
-                named_pipeline(
-                    device,
-                    "nemotron_mamba2_prefill_gates_f32",
-                    &MAMBA2_PREFILL_GATES_PIPELINE,
-                )?;
-            }
-            named_pipeline(
-                device,
-                "nemotron_mamba2_prefill_parallel_f32",
-                &MAMBA2_PARALLEL_PREFILL_PIPELINE,
-            )?;
-            if std::env::var_os("DINF_DISABLE_NEMOTRON_GROUPED_SCAN").is_none() {
-                named_pipeline(
-                    device,
-                    "nemotron_mamba2_prefill_parallel4_f32",
-                    &MAMBA2_GROUPED_PREFILL_PIPELINE,
-                )?;
-            }
-        }
+        named_pipeline(
+            device,
+            "nemotron_mamba2_prefill_parallel_f32",
+            &MAMBA2_PARALLEL_PREFILL_PIPELINE,
+        )?;
+        named_pipeline(
+            device,
+            "nemotron_mamba2_prefill_parallel4_f32",
+            &MAMBA2_GROUPED_PREFILL_PIPELINE,
+        )?;
         named_pipeline(
             device,
             "nemotron_mamba2_gate_group_norm_f32",
@@ -773,68 +761,51 @@ impl CustomOp3 for Mamba2Prefill<'_> {
             .with_size_for(output_elements, DType::F32)
             .with_label("nemotron-mamba2-prefill")
             .build()?;
-        let parallel = std::env::var_os("DINF_DISABLE_NEMOTRON_PARALLEL_SCAN").is_none();
-        let grouped_scan = parallel
-            && self.head_dim >= 4
-            && self.head_dim.is_multiple_of(4)
-            && std::env::var_os("DINF_DISABLE_NEMOTRON_GROUPED_SCAN").is_none();
-        let precompute_gates =
-            parallel && std::env::var_os("DINF_DISABLE_NEMOTRON_PRECOMPUTED_GATES").is_none();
+        let grouped_scan = self.head_dim >= 4 && self.head_dim.is_multiple_of(4);
         let pipeline = if grouped_scan {
             named_pipeline(
                 device,
                 "nemotron_mamba2_prefill_parallel4_f32",
                 &MAMBA2_GROUPED_PREFILL_PIPELINE,
             )?
-        } else if parallel {
+        } else {
             named_pipeline(
                 device,
                 "nemotron_mamba2_prefill_parallel_f32",
                 &MAMBA2_PARALLEL_PREFILL_PIPELINE,
-            )?
-        } else {
-            named_pipeline(
-                device,
-                "nemotron_mamba2_prefill_f32",
-                &MAMBA2_PREFILL_PIPELINE,
             )?
         };
         let encoder = device.command_encoder()?;
         encoder.set_label("nemotron-mamba2-prefill");
         let encoder_ref: &candle_metal_kernels::metal::ComputeCommandEncoder = encoder.as_ref();
         let offset = |layout: &Layout| layout.start_offset() * DType::F32.size_in_bytes();
-        let gates = if precompute_gates {
-            let gate_elements = self.seq_len * self.n_heads;
-            let gates = device
-                .new_buffer_builder()
-                .with_size_for(gate_elements * 2, DType::F32)
-                .with_label("nemotron-mamba2-prefill-gates")
-                .build()?;
-            let gate_pipeline = named_pipeline(
-                device,
-                "nemotron_mamba2_prefill_gates_f32",
-                &MAMBA2_PREFILL_GATES_PIPELINE,
-            )?;
-            encoder_ref.set_compute_pipeline_state(&gate_pipeline);
-            encoder_ref.set_input_buffer(0, Some(dt_raw.buffer()), offset(dt_layout));
-            encoder_ref.set_input_buffer(1, Some(a.buffer()), offset(a_layout));
-            encoder_ref.set_input_buffer(2, Some(dt_bias.buffer()), offset(dt_bias_layout));
-            encoder_ref.set_output_buffer(3, Some(&gates), 0);
-            encoder_ref.set_bytes(4, &(gate_elements as u32));
-            encoder_ref.set_bytes(5, &(self.n_heads as u32));
-            encoder_ref.set_bytes(6, &(dt_layout.stride()[0] as u32));
-            encoder_ref.dispatch_threads(
-                objc2_metal::MTLSize {
-                    width: gate_elements,
-                    height: 1,
-                    depth: 1,
-                },
-                candle_metal_kernels::utils::get_block_dims(gate_elements.min(256), 1, 1),
-            );
-            Some(gates)
-        } else {
-            None
-        };
+        let gate_elements = self.seq_len * self.n_heads;
+        let gates = device
+            .new_buffer_builder()
+            .with_size_for(gate_elements * 2, DType::F32)
+            .with_label("nemotron-mamba2-prefill-gates")
+            .build()?;
+        let gate_pipeline = named_pipeline(
+            device,
+            "nemotron_mamba2_prefill_gates_f32",
+            &MAMBA2_PREFILL_GATES_PIPELINE,
+        )?;
+        encoder_ref.set_compute_pipeline_state(&gate_pipeline);
+        encoder_ref.set_input_buffer(0, Some(dt_raw.buffer()), offset(dt_layout));
+        encoder_ref.set_input_buffer(1, Some(a.buffer()), offset(a_layout));
+        encoder_ref.set_input_buffer(2, Some(dt_bias.buffer()), offset(dt_bias_layout));
+        encoder_ref.set_output_buffer(3, Some(&gates), 0);
+        encoder_ref.set_bytes(4, &(gate_elements as u32));
+        encoder_ref.set_bytes(5, &(self.n_heads as u32));
+        encoder_ref.set_bytes(6, &(dt_layout.stride()[0] as u32));
+        encoder_ref.dispatch_threads(
+            objc2_metal::MTLSize {
+                width: gate_elements,
+                height: 1,
+                depth: 1,
+            },
+            candle_metal_kernels::utils::get_block_dims(gate_elements.min(256), 1, 1),
+        );
 
         encoder_ref.set_compute_pipeline_state(&pipeline);
         encoder_ref.set_input_buffer(0, Some(state.buffer()), offset(state_layout));
@@ -860,43 +831,27 @@ impl CustomOp3 for Mamba2Prefill<'_> {
         encoder_ref.set_bytes(11, &(self.d_state as u32));
         encoder_ref.set_bytes(12, &(self.head_dim as u32));
         encoder_ref.set_bytes(13, &(self.n_group as u32));
-        if parallel {
-            if let Some(gates) = gates.as_ref() {
-                encoder_ref.set_input_buffer(14, Some(gates), 0);
-            } else {
-                encoder_ref.set_input_buffer(14, Some(dt_raw.buffer()), offset(dt_layout));
-            }
-            encoder_ref.set_bytes(15, &u32::from(precompute_gates));
-            encoder_ref.set_bytes(16, &(dt_layout.stride()[0] as u32));
-            encoder_ref.set_bytes(17, &(x_layout.stride()[0] as u32));
-            encoder_ref.dispatch_thread_groups(
-                objc2_metal::MTLSize {
-                    width: if grouped_scan {
-                        self.n_heads * (self.head_dim / 4)
-                    } else {
-                        token_elements
-                    },
-                    height: 1,
-                    depth: 1,
+        encoder_ref.set_input_buffer(14, Some(&gates), 0);
+        // The scan reads the precomputed gates written above.
+        encoder_ref.set_bytes(15, &1u32);
+        encoder_ref.set_bytes(16, &(dt_layout.stride()[0] as u32));
+        encoder_ref.set_bytes(17, &(x_layout.stride()[0] as u32));
+        encoder_ref.dispatch_thread_groups(
+            objc2_metal::MTLSize {
+                width: if grouped_scan {
+                    self.n_heads * (self.head_dim / 4)
+                } else {
+                    token_elements
                 },
-                objc2_metal::MTLSize {
-                    width: 32,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-        } else {
-            encoder_ref.set_bytes(14, &(dt_layout.stride()[0] as u32));
-            encoder_ref.set_bytes(15, &(x_layout.stride()[0] as u32));
-            encoder_ref.dispatch_threads(
-                objc2_metal::MTLSize {
-                    width: token_elements,
-                    height: 1,
-                    depth: 1,
-                },
-                candle_metal_kernels::utils::get_block_dims(token_elements.min(256), 1, 1),
-            );
-        }
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
 
         Ok((
             MetalStorage::new(output, device.clone(), output_elements, DType::F32),

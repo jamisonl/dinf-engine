@@ -133,15 +133,6 @@ fn check_grouping(mut moe: V4Moe, device: &Device) -> Result<()> {
 
 #[test]
 fn grouped_expert_policy() {
-    use std::ffi::OsStr;
-    assert!(enabled(None, true));
-    assert!(!enabled(None, false));
-    for native in [true, false] {
-        assert!(enabled(Some(OsStr::new("1")), native));
-        for value in ["0", "false", "invalid", ""] {
-            assert!(!enabled(Some(OsStr::new(value)), native));
-        }
-    }
     for enabled in [false, true] {
         for decode_rows in [false, true] {
             for rows in [0, 1, 2, 4, 7, 8, 9, 32, 1024] {

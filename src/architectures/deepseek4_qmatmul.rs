@@ -493,15 +493,7 @@ impl DeepSeek4QMatMul {
     }
 
     pub(crate) fn iq1_simd_enabled() -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            let configured = std::env::var_os("DINF_DEEPSEEK4_SIMD");
-            metal::simd_enabled(configured.as_deref(), cfg!(target_arch = "aarch64"))
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            false
-        }
+        cfg!(all(target_os = "macos", target_arch = "aarch64"))
     }
 
     /// Opt-in native selected-expert gate/up matvec, with one Metal dispatch.
@@ -1886,9 +1878,8 @@ template [[host_name("dinf_dsv4_iq1_s_grouped_down_simd")]] kernel dsv4_iq1_down
         decode_rows: bool,
     ) -> Result<Tensor> {
         // Full-model output, slice, chunk and reuse checks pass on Apple
-        // Silicon. Keep an explicit opt-out and leave other Macs unchanged.
-        let configured = std::env::var_os("DINF_DEEPSEEK4_SIMD");
-        let enabled = simd_enabled(configured.as_deref(), cfg!(target_arch = "aarch64"));
+        // Silicon. Leave other Macs unchanged.
+        let enabled = cfg!(target_arch = "aarch64");
         let elements = if decode_rows {
             in_dim
         } else {
@@ -1923,10 +1914,6 @@ template [[host_name("dinf_dsv4_iq1_s_grouped_down_simd")]] kernel dsv4_iq1_down
         } else {
             KernelKind::Serial
         }
-    }
-
-    pub(super) fn simd_enabled(configured: Option<&std::ffi::OsStr>, apple_silicon: bool) -> bool {
-        configured.map_or(apple_silicon, |value| value == "1")
     }
 
     #[cfg(test)]
@@ -2160,19 +2147,6 @@ template [[host_name("dinf_dsv4_iq1_s_grouped_down_simd")]] kernel dsv4_iq1_down
             assert_eq!(select_kernel(1024, 1024, true), KernelKind::Simd);
             assert_eq!(select_kernel(4096, 4096, true), KernelKind::Simd);
             assert_eq!(select_kernel(4096, 8192, true), KernelKind::Serial);
-        }
-
-        #[test]
-        fn simd_defaults_to_apple_silicon_and_honors_explicit_overrides() {
-            use std::ffi::OsStr;
-            assert!(simd_enabled(None, true));
-            assert!(!simd_enabled(None, false));
-            for native in [false, true] {
-                assert!(simd_enabled(Some(OsStr::new("1")), native));
-                for value in ["0", "false", "invalid", ""] {
-                    assert!(!simd_enabled(Some(OsStr::new(value)), native));
-                }
-            }
         }
 
         #[test]

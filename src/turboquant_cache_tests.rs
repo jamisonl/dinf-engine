@@ -488,11 +488,6 @@ fn rotated_dequant_attention_microbench() -> Result<()> {
     const Q_HEADS: usize = 12;
     const ITERATIONS: usize = 20;
     let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-    let mode = if std::env::var_os("DINF_DISABLE_TURBOQUANT_VECTOR_DEQUANT").is_some() {
-        "scalar"
-    } else {
-        "vectorized"
-    };
 
     for sequence in [1024, 4096, 8192] {
         let mut cache =
@@ -544,7 +539,7 @@ fn rotated_dequant_attention_microbench() -> Result<()> {
         std::hint::black_box(elements);
         let seconds = started.elapsed().as_secs_f64();
         eprintln!(
-            "rotated_dequant_attention_microbench mode={mode} sequence={sequence} tok_s={:.2}",
+            "rotated_dequant_attention_microbench sequence={sequence} tok_s={:.2}",
             ITERATIONS as f64 / seconds
         );
     }

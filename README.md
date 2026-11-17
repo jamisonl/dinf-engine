@@ -1,10 +1,9 @@
 # dinf-engine
 
-A Rust inference engine for GGUF language models on CPU and Apple Metal, with
-experimental CUDA support. It loads local GGUF weights, tokenizes prompts,
-generates text and chat, and manages request and cache state. Applications
-embed it through the high-level `Engine` API or the lower-level stage and
-session APIs.
+A Rust inference engine for GGUF language models on CPU, Apple Metal and
+CUDA. It loads local GGUF weights, tokenizes prompts, generates text and
+chat, and manages request and cache state. Applications embed it through the
+high-level `Engine` API or the lower-level stage and session APIs.
 
 ## Features
 
@@ -39,16 +38,26 @@ session APIs.
 Vision input is supported for Qwen3.5, Gemma 4 and Llama 4. Speculative
 decoding uses DFlash2 draft models, and image generation uses Qwen Image.
 
-Each entry is backed by at least one checkpoint that passed the request-state
-checks in [`fixtures/text-coverage/basic-coverage.json`](fixtures/text-coverage/basic-coverage.json).
-The engine also contains code paths for Muse Spark Open and the GLM-DSA
-variant, but neither has been validated on a complete checkpoint, so they are
-not supported.
+"Supported" means at least one checkpoint of the model loads and passes short
+request-state checks (chunked prefill, cancellation, cache cleanup) on Apple
+Silicon. That is a smoke test, not proof of numeric correctness. Logits have
+been compared against llama.cpp for a smaller set: Qwen2.5, Mistral 7B, Phi-3,
+Qwen3 MoE, Qwen3.5 and DeepSeek V2 Lite in full, plus targeted comparisons for
+MiniMax M2.5, Nemotron 3 Nano and Qwen3.6/3.8. See
+[docs/VALIDATION.md](docs/VALIDATION.md) for what was measured and its limits.
+
+The Llama-family loader has been checked with Mistral and Qwen2 checkpoints;
+Meta Llama checkpoints use the same code but have not been run through the
+checks. The engine also contains code paths for Muse Spark Open and the
+GLM-DSA variant, but neither has been validated on a complete checkpoint, so
+they are not supported.
 
 ## Performance
 
-On Apple Silicon, dinf-engine matches or beats llama.cpp on recent Qwen and
-Gemma models, both when reading the prompt and when generating text.
+On recent Qwen and Gemma models dinf-engine is faster than llama.cpp on CUDA
+and matches or beats it on Apple Silicon (Metal), both when reading the
+prompt and when generating text. `examples/bench_text.rs` reports prompt and
+generation speed for a local model so you can measure your own hardware.
 
 ## Quick start
 
@@ -74,7 +83,10 @@ fn main() -> anyhow::Result<()> {
 
 On Apple Silicon, use `Device::new_metal(0)?` to run on the GPU.
 
-- `Engine::builder` sets a layer range and KV-cache limits.
+- `Engine::builder` sets a layer range, KV-cache limits and `EngineOptions`
+  (speculative policy, prefill chunk size, timing output).
+  `PipelineStage::set_options` changes them on a loaded stage. The engine
+  reads no environment variables for these.
 - `generate_chat` applies the model's chat template;
   `generate_chat_with_tools` adds tool schemas.
 - `generate_tokens` accepts token IDs and streams decoded text to a callback.
@@ -105,11 +117,15 @@ Stage and architecture APIs may change before a stable release.
 | --- | --- | --- |
 | CPU | `cargo build --release` | Default. |
 | Metal | `cargo build --release` on macOS | Enabled automatically on macOS. |
-| CUDA | `cargo build --release --features cuda` | Experimental; requires a CUDA toolchain. Not covered by the model validation. |
+| CUDA | `cargo build --release --features cuda` | Requires a CUDA toolchain. |
 
-The repository vendors patched copies of `candle-metal-kernels`, `cudaforge`
-and `gemm-common` under `third_party/`, wired in through `[patch.crates-io]`
-in `Cargo.toml`. Builds must use these patches.
+The repository vendors patched copies of `candle-core`,
+`candle-metal-kernels`, `cudaforge`, `cudarc` and `gemm-common` under
+`third_party/`, wired in through `[patch.crates-io]`
+in `Cargo.toml`. Builds must use these patches. Cargo applies `[patch]`
+sections only from the top-level workspace, so a project that depends on
+dinf-engine must copy the same `[patch.crates-io]` entries into its own
+`Cargo.toml`.
 
 ## Testing
 
@@ -124,9 +140,11 @@ On a Mac, set `DINF_REQUIRE_METAL_TESTS=1` so a missing GPU fails the Metal
 tests instead of skipping them. Full-model tests are `#[ignore]`d and need
 local weights.
 
-Model-level validation compares the engine's logits against llama.cpp on the
-same token history and checks request-state behavior such as chunked prefill,
-cancellation and cache reuse. See [docs/VALIDATION.md](docs/VALIDATION.md).
+Metal and CUDA tests skip when the device is absent, and there is no hosted
+CI yet. Model-level validation compares the engine's logits against llama.cpp
+on the same token history for a subset of models, and checks request-state
+behavior such as chunked prefill and cancellation for all of them. See
+[docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## License
 

@@ -220,9 +220,11 @@ int main(int argc, char ** argv) try {
     }
 #endif
 
-    require(argc >= 7 && argc <= 9, "usage: llama_reference MODEL cpu|metal TOKENS.txt ROWS OUTPUT_PREFIX MODEL_SHA256 [SHARDS.txt|- [FORCED_TOKENS.txt]]");
-    const bool metal = std::string(argv[2]) == "metal";
-    require(metal || std::string(argv[2]) == "cpu", "backend must be cpu or metal");
+    require(argc >= 7 && argc <= 9, "usage: llama_reference MODEL cpu|metal|cuda TOKENS.txt ROWS OUTPUT_PREFIX MODEL_SHA256 [SHARDS.txt|- [FORCED_TOKENS.txt]]");
+    // "cuda" offloads like "metal", through llama.cpp's CUDA backend.
+    const bool cuda = std::string(argv[2]) == "cuda";
+    const bool metal = cuda || std::string(argv[2]) == "metal";
+    require(metal || std::string(argv[2]) == "cpu", "backend must be cpu, metal or cuda");
     const int rows = parse_integer(argv[4]);
     require(rows > 0 && rows <= 256, "ROWS must be in 1..256");
     const std::string hash(argv[6]);
@@ -256,8 +258,8 @@ int main(int argc, char ** argv) try {
 #endif
     ggml_backend_dev_t devices[] = {nullptr, nullptr};
     if (metal) {
-        const auto reg = ggml_backend_reg_by_name("MTL");
-        require(reg != nullptr && ggml_backend_reg_dev_count(reg) > 0, "Metal backend unavailable");
+        const auto reg = ggml_backend_reg_by_name(cuda ? "CUDA" : "MTL");
+        require(reg != nullptr && ggml_backend_reg_dev_count(reg) > 0, "accelerator backend unavailable");
         devices[0] = ggml_backend_reg_dev_get(reg, 0);
     }
     auto mp = llama_model_default_params();

@@ -586,7 +586,7 @@ impl BlockModulation {
 
 fn gated_residual(hidden: &Tensor, gate: &Tensor, update: &Tensor) -> Result<Tensor> {
     #[cfg(target_os = "macos")]
-    if hidden.device().is_metal() && super::fused_metal::enabled() {
+    if hidden.device().is_metal() {
         return super::fused_metal::gated_residual(hidden, gate, update);
     }
     hidden + gate.broadcast_mul(update)?
@@ -898,7 +898,7 @@ impl NoAffineLayerNorm {
             return Ok(output);
         }
         #[cfg(target_os = "macos")]
-        if input.device().is_metal() && super::fused_metal::enabled() {
+        if input.device().is_metal() {
             return super::fused_metal::norm_scale(input, scale, self.eps as f32);
         }
         self.forward(input)?.broadcast_mul(scale)
@@ -1317,7 +1317,7 @@ fn apply_rope(input: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         return super::fused_metal::rope_native_bf16(input, cos, sin);
     }
     #[cfg(target_os = "macos")]
-    if input.device().is_metal() && super::fused_metal::enabled() {
+    if input.device().is_metal() {
         return super::fused_metal::rope(input, cos, sin);
     }
     apply_rope_reference(input, cos, sin)

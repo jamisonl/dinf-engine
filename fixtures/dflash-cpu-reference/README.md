@@ -122,8 +122,6 @@ python3 -m unittest test_verify_dflash_copy
 - `reference-repair.patch`: the requested-F32 repair.
 - `inputs.json`: original and patched source hashes, static libraries,
   compiler arguments and fixture file hashes checked by `build.py`.
-- `validation-summary.json`, `preparation.json`: hashes of the tested build
-  outputs and the fixture files they were produced from.
 - `LICENSE-MIT`: the upstream ggml MIT notice. Keep it with copies of the
   patch or fixture code.
 

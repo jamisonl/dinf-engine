@@ -110,12 +110,10 @@ impl GlmQMatMul {
     fn from_qtensor(qt: Arc<QTensor>, device: &Device) -> Result<Self> {
         let pad_single_token = device.is_metal() && needs_glm_metal_single_token_gemm(qt.dtype());
         #[cfg(target_os = "macos")]
-        if std::env::var_os("DINF_DISABLE_METAL4_QMM").is_none()
-            && let Some(matmul) = super::tensor_qmatmul_metal::MetalTensorQMatMul::try_from_qtensor(
-                Arc::clone(&qt),
-                device,
-            )?
-        {
+        if let Some(matmul) = super::tensor_qmatmul_metal::MetalTensorQMatMul::try_from_qtensor(
+            Arc::clone(&qt),
+            device,
+        )? {
             if qt.dtype() == GgmlDType::Q4_0 && qt.shape().dims().last() == Some(&128) {
                 // GLM's 128-wide KDA gate projections feed its recurrent
                 // state. Keep the same F32 row calculation for every prompt
@@ -329,6 +327,8 @@ impl HcMix {
         let scale = dense_tensor(tensors, &format!("{prefix}_scale.weight"), device)?;
         anyhow::ensure!(base.dims() == [mix_dim], "invalid {prefix}_base shape");
         anyhow::ensure!(scale.dims() == [3], "invalid {prefix}_scale shape");
+        let apple_silicon_metal =
+            cfg!(all(target_os = "macos", target_arch = "aarch64")) && device.is_metal();
         Ok(Self {
             projection: qmatmul(tensors, &format!("{prefix}_fn.weight"), device)?,
             base,
@@ -338,22 +338,10 @@ impl HcMix {
             hidden: md.hidden_dim,
             sinkhorn_iterations: md.hyperconnection_sinkhorn_iterations.max(1),
             eps: md.hyperconnection_epsilon.max(1e-6),
-            fused_sinkhorn: super::hc_sinkhorn::enabled(
-                std::env::var_os("DINF_GLM5_FUSED_HC").as_deref(),
-                cfg!(all(target_os = "macos", target_arch = "aarch64")) && device.is_metal(),
-            ),
-            fused_post: super::hc_sinkhorn::enabled(
-                std::env::var_os("DINF_GLM5_FUSED_HC_POST").as_deref(),
-                cfg!(all(target_os = "macos", target_arch = "aarch64")) && device.is_metal(),
-            ),
-            fused_pre: super::hc_sinkhorn::enabled(
-                std::env::var_os("DINF_GLM5_FUSED_HC_PRE").as_deref(),
-                cfg!(all(target_os = "macos", target_arch = "aarch64")) && device.is_metal(),
-            ),
-            reuse_projection: super::hc_sinkhorn::enabled(
-                std::env::var_os("DINF_GLM5_REUSE_HC_PROJECTION").as_deref(),
-                cfg!(all(target_os = "macos", target_arch = "aarch64")) && device.is_metal(),
-            ),
+            fused_sinkhorn: apple_silicon_metal,
+            fused_post: apple_silicon_metal,
+            fused_pre: apple_silicon_metal,
+            reuse_projection: apple_silicon_metal,
         })
     }
 
@@ -658,11 +646,7 @@ impl KdaAttention {
             let q = q.squeeze(0)?;
             let k = k.squeeze(0)?;
             let v = v.squeeze(0)?;
-            if x.device().is_metal()
-                && q.is_contiguous()
-                && k.is_contiguous()
-                && v.is_contiguous()
-                && std::env::var_os("DINF_DISABLE_GLM5_KDA_METAL").is_none()
+            if x.device().is_metal() && q.is_contiguous() && k.is_contiguous() && v.is_contiguous()
             {
                 Some(super::glm5_next_kda_metal::scan(
                     &q,
@@ -1247,10 +1231,7 @@ fn latent_context(probabilities: &Tensor, latent: &Tensor, _prefill: bool) -> Re
     // always has the same shape for a given position and keeps the faster
     // general path. Use the phase, not the row count: a prompt tail can be 1.
     #[cfg(target_os = "macos")]
-    if _prefill
-        && super::glm5_next_context_metal::supported(probabilities.device())?
-        && std::env::var_os("DINF_DISABLE_GLM5_CONTEXT_METAL").is_none()
-    {
+    if _prefill && super::glm5_next_context_metal::supported(probabilities.device())? {
         return super::glm5_next_context_metal::weighted_context(probabilities, latent)
             .map_err(Into::into);
     }
@@ -1423,10 +1404,7 @@ impl MoeLayer {
 
         #[cfg(target_os = "macos")]
         let fused = match &self.experts {
-            MoeExperts::Indexed(_)
-                if logits.device().is_metal()
-                    && std::env::var_os("DINF_DISABLE_FUSED_TOPK_ROUTING").is_none() =>
-            {
+            MoeExperts::Indexed(_) if logits.device().is_metal() => {
                 let (ids, weights) = fused_sigmoid_topk_route(&logits, &self.bias, self.active)?;
                 Some((ids, (weights * self.scale as f64)?))
             }
@@ -1798,10 +1776,8 @@ impl Glm5NextStage {
             stage_hidden: metadata.hidden_dim * GLM5_STREAMS,
             vocab: metadata.vocab_size,
             context_length: metadata.context_length,
-            decode_batch_enabled: super::hc_sinkhorn::enabled(
-                std::env::var_os("DINF_GLM5_DECODE_BATCH").as_deref(),
-                cfg!(all(target_os = "macos", target_arch = "aarch64")) && device.is_metal(),
-            ),
+            decode_batch_enabled: cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                && device.is_metal(),
             device: device.clone(),
         })
     }
@@ -1974,10 +1950,8 @@ impl Glm5NextStage {
             stage_hidden: md.hidden_dim * GLM5_STREAMS,
             vocab: md.vocab_size,
             context_length: md.context_length,
-            decode_batch_enabled: super::hc_sinkhorn::enabled(
-                std::env::var_os("DINF_GLM5_DECODE_BATCH").as_deref(),
-                cfg!(all(target_os = "macos", target_arch = "aarch64")) && device.is_metal(),
-            ),
+            decode_batch_enabled: cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                && device.is_metal(),
             device,
         })
     }

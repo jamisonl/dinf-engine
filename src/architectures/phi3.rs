@@ -1,5 +1,7 @@
+use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::qmatmul::QMatMul;
@@ -48,12 +50,11 @@ static GATE_UP_PROJ_NS: AtomicU64 = AtomicU64::new(0);
 static FFN_ACTIVATION_NS: AtomicU64 = AtomicU64::new(0);
 static DOWN_PROJ_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
-static PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
 #[cfg(target_os = "macos")]
 static METAL4_QMM_LOGGED: OnceLock<()> = OnceLock::new();
 
 fn layer_profile_enabled() -> bool {
-    *PROFILE_ENABLED.get_or_init(|| std::env::var_os("DINF_PROFILE_LAYERS").is_some())
+    super::profiling::layer_profiling_enabled()
 }
 
 fn finish_profile_region(device: &Device, started: Instant, counter: &AtomicU64) -> Result<()> {
@@ -219,12 +220,10 @@ impl Phi3QMatMul {
 
     fn from_qtensor(qt: Arc<QTensor>, _device: &Device, native_contract: bool) -> Result<Self> {
         #[cfg(target_os = "macos")]
-        if std::env::var_os("DINF_DISABLE_METAL4_QMM").is_none()
-            && let Some(matmul) = super::tensor_qmatmul_metal::MetalTensorQMatMul::try_from_qtensor(
-                Arc::clone(&qt),
-                _device,
-            )?
-        {
+        if let Some(matmul) = super::tensor_qmatmul_metal::MetalTensorQMatMul::try_from_qtensor(
+            Arc::clone(&qt),
+            _device,
+        )? {
             METAL4_QMM_LOGGED.get_or_init(|| {
                 tracing::info!("Metal 4 tensor quantized matmul enabled for Phi-3 prefill");
             });

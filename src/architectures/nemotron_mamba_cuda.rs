@@ -572,7 +572,7 @@ extern "C" __global__ void nemotron_mamba2_decode_f32(
     }
 
     pub(crate) fn precompile(device: &Device) -> anyhow::Result<()> {
-        if !device.is_cuda() || std::env::var_os("DINF_DISABLE_NEMOTRON_MAMBA_CUDA").is_some() {
+        if !device.is_cuda() {
             return Ok(());
         }
         let device = device.as_cuda_device()?;

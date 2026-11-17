@@ -538,16 +538,14 @@ pub(crate) fn experts_packed(
     );
     Ok(Some(out))
 }
-/// `DINF_DEEPSEEK41_PACKED_PREFILL_MM=0` keeps the Coder's row kernels.
+/// Packed prefill matmuls are requested unless a test asks for the Coder's
+/// row kernels.
 fn packed_requested() -> bool {
-    static REQUESTED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var_os("DINF_DEEPSEEK41_PACKED_PREFILL_MM").is_none_or(|v| v != "0")
-    });
     #[cfg(test)]
     if PACKED_TEST_DISABLED.with(|v| v.get()) {
         return false;
     }
-    *REQUESTED
+    true
 }
 #[cfg(test)]
 thread_local! {

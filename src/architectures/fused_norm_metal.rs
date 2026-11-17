@@ -1220,8 +1220,7 @@ pub(super) fn try_fused_rms_norm(
     weight: &Tensor,
     eps: f32,
 ) -> Result<Option<Tensor>> {
-    if std::env::var_os("DINF_DISABLE_FUSED_RMSNORM").is_some()
-        || !input.device().is_metal()
+    if !input.device().is_metal()
         || input.dtype() != DType::F32
         || weight.dtype() != DType::F32
         || !input.is_contiguous()
@@ -1234,11 +1233,7 @@ pub(super) fn try_fused_rms_norm(
 }
 
 pub(super) fn try_fused_rms_norm_no_weight(input: &Tensor, eps: f32) -> Result<Option<Tensor>> {
-    if std::env::var_os("DINF_DISABLE_FUSED_RMSNORM").is_some()
-        || !input.device().is_metal()
-        || input.dtype() != DType::F32
-        || !input.is_contiguous()
-    {
+    if !input.device().is_metal() || input.dtype() != DType::F32 || !input.is_contiguous() {
         return Ok(None);
     }
     Ok(Some(input.apply_op1_no_bwd(&RmsNormNoWeight { eps })?))
@@ -1256,9 +1251,7 @@ pub(super) fn try_fused_head_rms_norm(
     let Some(fused_dim) = heads.checked_mul(head_dim) else {
         return Ok(None);
     };
-    if std::env::var_os("DINF_DISABLE_FUSED_RMSNORM").is_some()
-        || std::env::var_os("DINF_DISABLE_FUSED_HEAD_RMSNORM").is_some()
-        || !input.device().is_metal()
+    if !input.device().is_metal()
         || input.dtype() != DType::F32
         || weight.dtype() != DType::F32
         || !input.is_contiguous()
@@ -1299,9 +1292,7 @@ pub(super) fn try_fused_head_rms_norm_rope(
     let Some(fused_dim) = heads.checked_mul(head_dim) else {
         return Ok(None);
     };
-    if std::env::var_os("DINF_DISABLE_FUSED_RMSNORM").is_some()
-        || std::env::var_os("DINF_DISABLE_FUSED_HEAD_RMSNORM_ROPE").is_some()
-        || !input.device().is_metal()
+    if !input.device().is_metal()
         || [input, weight, cos, sin]
             .iter()
             .any(|t| t.dtype() != DType::F32 || !t.is_contiguous())
@@ -1443,9 +1434,7 @@ pub(super) fn try_fused_head_rms_norm_no_weight(
     let Some(fused_dim) = heads.checked_mul(head_dim) else {
         return Ok(None);
     };
-    if std::env::var_os("DINF_DISABLE_FUSED_RMSNORM").is_some()
-        || std::env::var_os("DINF_DISABLE_FUSED_HEAD_RMSNORM").is_some()
-        || !input.device().is_metal()
+    if !input.device().is_metal()
         || input.dtype() != DType::F32
         || !input.is_contiguous()
         || input.dims() != [batch, seq_len, fused_dim]
@@ -1473,10 +1462,7 @@ pub(super) fn try_fused_head_rms_norm_silu_gate(
     let Some(fused_dim) = heads.checked_mul(head_dim) else {
         return Ok(None);
     };
-    if std::env::var_os("DINF_DISABLE_QWEN35_FUSED_SSM_GATE").is_some()
-        || std::env::var_os("DINF_DISABLE_FUSED_RMSNORM").is_some()
-        || std::env::var_os("DINF_DISABLE_FUSED_HEAD_RMSNORM").is_some()
-        || !input.device().is_metal()
+    if !input.device().is_metal()
         || input.dtype() != DType::F32
         || gate.dtype() != DType::F32
         || weight.dtype() != DType::F32
@@ -1507,8 +1493,7 @@ pub(super) fn try_fused_add_rms_norm(
     weight: &Tensor,
     eps: f32,
 ) -> Result<Option<(Tensor, Tensor)>> {
-    if std::env::var_os("DINF_DISABLE_FUSED_ADD_RMSNORM").is_some()
-        || !lhs.device().is_metal()
+    if !lhs.device().is_metal()
         || lhs.dtype() != DType::F32
         || rhs.dtype() != DType::F32
         || weight.dtype() != DType::F32
@@ -1705,8 +1690,7 @@ pub(super) fn try_fused_post_norm_residual(
             && tensor.is_contiguous()
             && tensor.device().same_device(update.device())
     };
-    if std::env::var_os("DINF_DISABLE_FUSED_POST_NORM_RESIDUAL").is_some()
-        || !update.device().is_metal()
+    if !update.device().is_metal()
         || !f32_on_device(update)
         || !f32_on_device(residual)
         || !f32_on_device(post_weight)
@@ -1767,8 +1751,7 @@ pub(super) fn try_fused_moe_attention_planes(
             && tensor.is_contiguous()
             && tensor.device().same_device(update.device())
     };
-    if std::env::var_os("DINF_DISABLE_FUSED_POST_NORM_RESIDUAL").is_some()
-        || !update.device().is_metal()
+    if !update.device().is_metal()
         || ![update, residual, post_weight, shared_weight, expert_weight]
             .iter()
             .all(|tensor| ok(tensor))
@@ -1961,8 +1944,7 @@ pub(super) fn try_fused_dual_post_norm_residual(
             && tensor.is_contiguous()
             && tensor.device().same_device(shared.device())
     };
-    if std::env::var_os("DINF_DISABLE_FUSED_POST_NORM_RESIDUAL").is_some()
-        || !shared.device().is_metal()
+    if !shared.device().is_metal()
         || ![
             shared,
             routed,

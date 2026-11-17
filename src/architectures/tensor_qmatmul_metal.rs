@@ -1453,11 +1453,6 @@ template [[host_name("dinf_tensor_qmatmul_q8_0_h128")]] kernel q8_0_h128_fn dinf
 type PipelineCache = HashMap<(DeviceId, &'static str), Option<ComputePipeline>>;
 
 static PIPELINES: OnceLock<Mutex<PipelineCache>> = OnceLock::new();
-static TILE_OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
-static Q4K_VERIFY_MIN_OUT: OnceLock<usize> = OnceLock::new();
-static Q4K_VERIFY_MSG_MIN_OUT: OnceLock<usize> = OnceLock::new();
-static Q4K_VERIFY_MAX_TOKENS: OnceLock<usize> = OnceLock::new();
-static PRE_M5_SCALAR_Q6_R2_ENABLED: OnceLock<bool> = OnceLock::new();
 const VERIFY_TILE_TOKENS: usize = 8;
 const TINY_TILE_TOKENS: usize = 16;
 const SMALL_TILE_TOKENS: usize = 32;
@@ -1465,23 +1460,19 @@ const MEDIUM_TILE_TOKENS: usize = 64;
 const LARGE_TILE_TOKENS: usize = 128;
 const MIN_TENSOR_TOKENS: usize = 8;
 const MIN_Q4K_VERIFY_TOKENS: usize = 3;
-const MAX_Q4K_VERIFY_TOKENS: usize = 8;
-const DEFAULT_Q4K_VERIFY_MAX_TOKENS: usize = 6;
+const MAX_Q4K_VERIFY_TOKENS: usize = 6;
 const MIN_Q4K_KSPLIT_TOKENS: usize = 7;
-const DEFAULT_Q4K_VERIFY_MIN_OUT: usize = 4096;
-const DEFAULT_Q4K_VERIFY_MSG_MIN_OUT: usize = 100_000;
+const Q4K_VERIFY_MIN_OUT: usize = 4096;
+const Q4K_VERIFY_MSG_MIN_OUT: usize = 100_000;
 const Q8_KSPLIT_MIN_OUT: usize = 512;
 const Q6_KSPLIT_MIN_OUT: usize = 512;
 const Q6_KSPLIT_MAX_OUT: usize = 8192;
 const Q4K_VERIFY_K_PARTS: usize = 2;
 const Q4K_VERIFY_MSG_SIMDGROUPS: usize = 8;
 
-pub(super) fn supports_shared_verification() -> bool {
-    // The optional eight-row F32 Q4 verifier has no multi-block kernel yet.
-    // Keep that explicit numerical override on separate request checks.
-    q4k_verify_max_tokens() < VERIFY_TILE_TOKENS
-        || std::env::var_os("DINF_DISABLE_METAL4_Q4K_VERIFY").is_some()
-}
+// Shared draft verification sends full eight-row tiles. The F32 Q4 verifier,
+// which has no multi-block kernel, must never be asked to take one.
+const _: () = assert!(MAX_Q4K_VERIFY_TOKENS < VERIFY_TILE_TOKENS);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MetalTensorProfile {
@@ -1538,9 +1529,7 @@ fn metal_tensor_profile(device: &Device) -> Result<MetalTensorProfile> {
 }
 
 fn active_pre_m5_tensor_profile(device: &Device) -> Result<bool> {
-    Ok(std::env::var_os("DINF_DISABLE_METAL4_QMM").is_none()
-        && supports_metal_tensor(device)?
-        && uses_pre_m5_decode_profile(device)?)
+    Ok(supports_metal_tensor(device)? && uses_pre_m5_decode_profile(device)?)
 }
 
 fn uses_pre_m5_decode_profile(device: &Device) -> Result<bool> {
@@ -1559,86 +1548,21 @@ pub(super) fn uses_pre_m5_speculative_policy(device: &Device) -> Result<bool> {
     uses_pre_m5_decode_profile(device)
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
-}
-
-fn q4k_verify_min_out() -> usize {
-    *Q4K_VERIFY_MIN_OUT
-        .get_or_init(|| env_usize("DINF_METAL4_Q4K_VERIFY_MIN_OUT", DEFAULT_Q4K_VERIFY_MIN_OUT))
-}
-
-fn pre_m5_scalar_q6_r2_enabled() -> bool {
-    *PRE_M5_SCALAR_Q6_R2_ENABLED
-        .get_or_init(|| std::env::var_os("DINF_DISABLE_METAL_PRE_M5_Q6_R2").is_none())
-}
-
-fn q4k_verify_msg_min_out() -> usize {
-    *Q4K_VERIFY_MSG_MIN_OUT.get_or_init(|| {
-        env_usize(
-            "DINF_METAL4_Q4K_VERIFY_MSG_MIN_OUT",
-            DEFAULT_Q4K_VERIFY_MSG_MIN_OUT,
-        )
-    })
-}
-
-fn q4k_verify_max_tokens() -> usize {
-    (*Q4K_VERIFY_MAX_TOKENS.get_or_init(|| {
-        env_usize(
-            "DINF_METAL4_Q4K_VERIFY_MAX_TOKENS",
-            DEFAULT_Q4K_VERIFY_MAX_TOKENS,
-        )
-    }))
-    .min(MAX_Q4K_VERIFY_TOKENS)
-}
-
 fn q4k_verify_kernel_name(tokens: usize, msg: bool) -> Option<&'static str> {
     match (tokens, msg) {
         (3, false) => Some("dinf_tensor_qmatmul_q4k_verify_ks_m3"),
         (4, false) => Some("dinf_tensor_qmatmul_q4k_verify_ks_m4"),
         (5, false) => Some("dinf_tensor_qmatmul_q4k_verify_ks_m5"),
         (6, false) => Some("dinf_tensor_qmatmul_q4k_verify_ks_m6"),
-        (7, false) => Some("dinf_tensor_qmatmul_q4k_verify_ks_m7"),
-        (8, false) => Some("dinf_tensor_qmatmul_q4k_verify_ks_m8"),
         (3, true) => Some("dinf_tensor_qmatmul_q4k_verify_msg_m3"),
         (4, true) => Some("dinf_tensor_qmatmul_q4k_verify_msg_m4"),
         (5, true) => Some("dinf_tensor_qmatmul_q4k_verify_msg_m5"),
         (6, true) => Some("dinf_tensor_qmatmul_q4k_verify_msg_m6"),
-        (7, true) => Some("dinf_tensor_qmatmul_q4k_verify_msg_m7"),
-        (8, true) => Some("dinf_tensor_qmatmul_q4k_verify_msg_m8"),
         _ => None,
     }
 }
 
 fn tile_tokens(tokens: usize) -> usize {
-    if let Some(tile_tokens) = *TILE_OVERRIDE.get_or_init(|| {
-        let value = std::env::var_os("DINF_METAL4_QMM_TILE")?;
-        let parsed = value.to_string_lossy().parse::<usize>().ok();
-        if parsed.is_some_and(|tile| {
-            matches!(
-                tile,
-                VERIFY_TILE_TOKENS
-                    | TINY_TILE_TOKENS
-                    | SMALL_TILE_TOKENS
-                    | MEDIUM_TILE_TOKENS
-                    | LARGE_TILE_TOKENS
-            )
-        }) {
-            parsed
-        } else {
-            tracing::warn!(
-                value = %value.to_string_lossy(),
-                "ignoring unsupported DINF_METAL4_QMM_TILE; expected 8, 16, 32, 64, or 128"
-            );
-            None
-        }
-    }) {
-        return tile_tokens;
-    }
     match tokens {
         ..=VERIFY_TILE_TOKENS => VERIFY_TILE_TOKENS,
         9..=TINY_TILE_TOKENS => TINY_TILE_TOKENS,
@@ -1770,9 +1694,6 @@ pub(crate) fn supports_tensor_batch_attention(device: &Device) -> Result<bool> {
 }
 
 pub(crate) fn supports_metal_tensor_qmatmul(device: &Device) -> Result<bool> {
-    if std::env::var_os("DINF_DISABLE_METAL4_QMM").is_some() {
-        return Ok(false);
-    }
     supports_metal_tensor(device)
 }
 
@@ -1795,7 +1716,6 @@ impl MetalTensorQMatMul {
         // it per row instead of silently switching math when requests join.
         if self.profile == MetalTensorProfile::PreM5
             && self.dtype == GgmlDType::Q6K
-            && pre_m5_scalar_q6_r2_enabled()
             && matches!(input.rank(), 2 | 3)
             && (input.rank() == 2 || input.dim(0)? == 1)
             && input.dim(D::Minus2)? > 1
@@ -1835,33 +1755,23 @@ impl MetalTensorQMatMul {
         if pipeline(device.as_metal_device()?, packed.dtype(), validation_tile)?.is_none() {
             return Ok(None);
         }
-        if packed.dtype() == GgmlDType::Q4K
-            && std::env::var_os("DINF_DISABLE_METAL4_Q4K_KSPLIT").is_none()
-        {
-            if std::env::var_os("DINF_DISABLE_METAL4_Q4K_K32_KSPLIT").is_none() {
-                let _ = named_pipeline(
-                    device.as_metal_device()?,
-                    "dinf_tensor_qmatmul_q4k_ksplit_k32_t16",
-                )?;
-            }
+        if packed.dtype() == GgmlDType::Q4K {
+            let _ = named_pipeline(
+                device.as_metal_device()?,
+                "dinf_tensor_qmatmul_q4k_ksplit_k32_t16",
+            )?;
             let _ = named_pipeline(
                 device.as_metal_device()?,
                 "dinf_tensor_qmatmul_q4k_ksplit_t16",
             )?;
         }
-        if packed.dtype() == GgmlDType::Q8_0
-            && std::env::var_os("DINF_DISABLE_METAL4_Q8_KSPLIT").is_none()
-            && std::env::var_os("DINF_DISABLE_METAL4_Q8_K32_KSPLIT").is_none()
-        {
+        if packed.dtype() == GgmlDType::Q8_0 {
             let _ = named_pipeline(
                 device.as_metal_device()?,
                 "dinf_tensor_qmatmul_q8_0_ksplit_k32_t8",
             )?;
         }
-        if profile == MetalTensorProfile::PreM5
-            && packed.dtype() == GgmlDType::Q6K
-            && pre_m5_scalar_q6_r2_enabled()
-        {
+        if profile == MetalTensorProfile::PreM5 && packed.dtype() == GgmlDType::Q6K {
             let _ = named_pipeline(device.as_metal_device()?, "dinf_scalar_q6k_r2_sg2")?;
         }
         let (out_dim, in_dim) = packed.shape().dims2()?;
@@ -1869,9 +1779,6 @@ impl MetalTensorQMatMul {
             && packed.dtype() == GgmlDType::Q8_0
             && in_dim == 4096
             && matches!(out_dim, 2560 | 4096)
-            && std::env::var_os("DINF_DISABLE_FUSED_ADD_RMSNORM").is_none()
-            && std::env::var_os("DINF_DISABLE_FUSED_RMSNORM").is_none()
-            && std::env::var_os("DINF_DISABLE_QWEN35_FUSED_Q8_SSM_RESIDUAL").is_none()
         {
             let _ = named_pipeline(
                 device.as_metal_device()?,
@@ -1899,8 +1806,7 @@ impl MetalTensorQMatMul {
             in_dim,
             output_groups: None,
             profile,
-            prefill_weight_reuse: std::env::var_os("DINF_DISABLE_METAL4_PREFILL_WEIGHT_REUSE")
-                .is_none(),
+            prefill_weight_reuse: true,
         }))
     }
 
@@ -1932,8 +1838,7 @@ impl MetalTensorQMatMul {
             in_dim,
             output_groups: None,
             profile,
-            prefill_weight_reuse: std::env::var_os("DINF_DISABLE_METAL4_PREFILL_WEIGHT_REUSE")
-                .is_none(),
+            prefill_weight_reuse: true,
         }))
     }
 
@@ -1961,31 +1866,23 @@ impl MetalTensorQMatMul {
         if pipeline(device.as_metal_device()?, dtype, validation_tile)?.is_none() {
             return Ok(None);
         }
-        if dtype == GgmlDType::Q4K && std::env::var_os("DINF_DISABLE_METAL4_Q4K_KSPLIT").is_none() {
-            if std::env::var_os("DINF_DISABLE_METAL4_Q4K_K32_KSPLIT").is_none() {
-                let _ = named_pipeline(
-                    device.as_metal_device()?,
-                    "dinf_tensor_qmatmul_q4k_ksplit_k32_t16",
-                )?;
-            }
+        if dtype == GgmlDType::Q4K {
+            let _ = named_pipeline(
+                device.as_metal_device()?,
+                "dinf_tensor_qmatmul_q4k_ksplit_k32_t16",
+            )?;
             let _ = named_pipeline(
                 device.as_metal_device()?,
                 "dinf_tensor_qmatmul_q4k_ksplit_t16",
             )?;
         }
-        if dtype == GgmlDType::Q8_0
-            && std::env::var_os("DINF_DISABLE_METAL4_Q8_KSPLIT").is_none()
-            && std::env::var_os("DINF_DISABLE_METAL4_Q8_K32_KSPLIT").is_none()
-        {
+        if dtype == GgmlDType::Q8_0 {
             let _ = named_pipeline(
                 device.as_metal_device()?,
                 "dinf_tensor_qmatmul_q8_0_ksplit_k32_t8",
             )?;
         }
-        if profile == MetalTensorProfile::PreM5
-            && dtype == GgmlDType::Q6K
-            && pre_m5_scalar_q6_r2_enabled()
-        {
+        if profile == MetalTensorProfile::PreM5 && dtype == GgmlDType::Q6K {
             let _ = named_pipeline(device.as_metal_device()?, "dinf_scalar_q6k_r2_sg2")?;
         }
 
@@ -2030,8 +1927,7 @@ impl MetalTensorQMatMul {
             in_dim,
             output_groups: Some(output_groups.into()),
             profile,
-            prefill_weight_reuse: std::env::var_os("DINF_DISABLE_METAL4_PREFILL_WEIGHT_REUSE")
-                .is_none(),
+            prefill_weight_reuse: true,
         }))
     }
 
@@ -2054,8 +1950,6 @@ impl MetalTensorQMatMul {
             || input.dims3()?.1 != VERIFY_TILE_TOKENS
             || !(2..=4).contains(&groups.len())
             || groups.iter().sum::<usize>() != self.out_dim
-            || std::env::var_os("DINF_DISABLE_METAL4_Q8_KSPLIT").is_some()
-            || std::env::var_os("DINF_DISABLE_QWEN35_GROUPED_OUTPUT").is_some()
         {
             return Ok(None);
         }
@@ -2150,9 +2044,6 @@ impl MetalTensorQMatMul {
             || !matches!(input.rank(), 2 | 3)
             || !input.device().is_metal()
             || input.dtype() != DType::F32
-            || !pre_m5_scalar_q6_r2_enabled()
-            || std::env::var_os("DINF_DISABLE_FUSED_SILU_MUL").is_some()
-            || std::env::var_os("DINF_DISABLE_QWEN35_FUSED_Q6K_SWIGLU").is_some()
         {
             return Ok(None);
         }
@@ -2206,8 +2097,6 @@ impl MetalTensorQMatMul {
             || !residual.device().is_metal()
             || input.dtype() != DType::F32
             || residual.dtype() != DType::F32
-            || !pre_m5_scalar_q6_r2_enabled()
-            || std::env::var_os("DINF_DISABLE_QWEN35_FUSED_Q6K_FFN_RESIDUAL").is_some()
         {
             return Ok(None);
         }
@@ -2266,9 +2155,6 @@ impl MetalTensorQMatMul {
             || !residual.device().is_metal()
             || input.dtype() != DType::F32
             || residual.dtype() != DType::F32
-            || std::env::var_os("DINF_DISABLE_FUSED_ADD_RMSNORM").is_some()
-            || std::env::var_os("DINF_DISABLE_FUSED_RMSNORM").is_some()
-            || std::env::var_os("DINF_DISABLE_QWEN35_FUSED_Q8_SSM_RESIDUAL").is_some()
         {
             return Ok(None);
         }
@@ -2305,8 +2191,8 @@ impl MetalTensorQMatMul {
             && (tokens >= MIN_TENSOR_TOKENS
                 || (self.dtype == GgmlDType::Q4K
                     && (tokens >= MIN_Q4K_KSPLIT_TOKENS
-                        || ((MIN_Q4K_VERIFY_TOKENS..=q4k_verify_max_tokens()).contains(&tokens)
-                            && self.out_dim >= q4k_verify_min_out()))))
+                        || ((MIN_Q4K_VERIFY_TOKENS..=MAX_Q4K_VERIFY_TOKENS).contains(&tokens)
+                            && self.out_dim >= Q4K_VERIFY_MIN_OUT))))
         {
             match self.forward_with_tile_and_epilogue(input, None, true) {
                 Ok(output) => return Ok(output),
@@ -2898,7 +2784,6 @@ fn dispatch_tensor_qmatmul(
         && output_groups.is_none()
         && profile == MetalTensorProfile::Default
         && tokens >= 2
-        && std::env::var_os("DINF_DISABLE_METAL4_Q8_CONSISTENT_PREFILL").is_none()
         && dispatch_tensor_pipeline(
             dtype,
             in_dim,
@@ -2918,10 +2803,9 @@ fn dispatch_tensor_qmatmul(
         return Ok(true);
     }
     if dtype == GgmlDType::Q4K
-        && (MIN_Q4K_VERIFY_TOKENS..=q4k_verify_max_tokens()).contains(&tokens)
-        && out_dim >= q4k_verify_min_out()
+        && (MIN_Q4K_VERIFY_TOKENS..=MAX_Q4K_VERIFY_TOKENS).contains(&tokens)
+        && out_dim >= Q4K_VERIFY_MIN_OUT
         && in_dim.is_multiple_of(GgmlDType::Q4K.block_size())
-        && std::env::var_os("DINF_DISABLE_METAL4_Q4K_VERIFY").is_none()
         && dispatch_q4k_verify(
             in_dim,
             out_dim,
@@ -2938,8 +2822,6 @@ fn dispatch_tensor_qmatmul(
     if dtype == GgmlDType::Q4K
         && (MIN_Q4K_KSPLIT_TOKENS..=TINY_TILE_TOKENS).contains(&kernel_tokens)
         && in_dim.is_multiple_of(4 * 64)
-        && std::env::var_os("DINF_DISABLE_METAL4_Q4K_KSPLIT").is_none()
-        && std::env::var_os("DINF_DISABLE_METAL4_Q4K_HALF_KSPLIT").is_none()
         && {
             // Narrow batches are bound by the tensor matmul and dequantisation,
             // not bandwidth. Half-staged activations with a strict matmul (as
@@ -2972,8 +2854,6 @@ fn dispatch_tensor_qmatmul(
     if dtype == GgmlDType::Q4K
         && (MIN_Q4K_KSPLIT_TOKENS..=TINY_TILE_TOKENS).contains(&kernel_tokens)
         && in_dim.is_multiple_of(8 * 32)
-        && std::env::var_os("DINF_DISABLE_METAL4_Q4K_KSPLIT").is_none()
-        && std::env::var_os("DINF_DISABLE_METAL4_Q4K_K32_KSPLIT").is_none()
         && dispatch_ksplit_parts(
             GgmlDType::Q4K,
             "dinf_tensor_qmatmul_q4k_ksplit_k32_t16",
@@ -2994,7 +2874,6 @@ fn dispatch_tensor_qmatmul(
     if dtype == GgmlDType::Q4K
         && (MIN_Q4K_KSPLIT_TOKENS..=TINY_TILE_TOKENS).contains(&kernel_tokens)
         && in_dim.is_multiple_of(8 * 16)
-        && std::env::var_os("DINF_DISABLE_METAL4_Q4K_KSPLIT").is_none()
         && dispatch_ksplit(
             GgmlDType::Q4K,
             "dinf_tensor_qmatmul_q4k_ksplit_t16",
@@ -3015,8 +2894,6 @@ fn dispatch_tensor_qmatmul(
         && kernel_tokens == VERIFY_TILE_TOKENS
         && out_dim >= Q8_KSPLIT_MIN_OUT
         && in_dim.is_multiple_of(8 * 32)
-        && std::env::var_os("DINF_DISABLE_METAL4_Q8_KSPLIT").is_none()
-        && std::env::var_os("DINF_DISABLE_METAL4_Q8_K32_KSPLIT").is_none()
         && dispatch_ksplit(
             GgmlDType::Q8_0,
             "dinf_tensor_qmatmul_q8_0_ksplit_k32_t8",
@@ -3037,7 +2914,6 @@ fn dispatch_tensor_qmatmul(
         && kernel_tokens == VERIFY_TILE_TOKENS
         && out_dim >= Q8_KSPLIT_MIN_OUT
         && in_dim.is_multiple_of(8 * 16)
-        && std::env::var_os("DINF_DISABLE_METAL4_Q8_KSPLIT").is_none()
         && dispatch_ksplit(
             GgmlDType::Q8_0,
             "dinf_tensor_qmatmul_q8_0_ksplit_t8",
@@ -3059,7 +2935,6 @@ fn dispatch_tensor_qmatmul(
     if dtype == GgmlDType::Q6K
         && (MIN_Q4K_KSPLIT_TOKENS..=VERIFY_TILE_TOKENS).contains(&kernel_tokens)
         && in_dim.is_multiple_of(8 * 32)
-        && std::env::var_os("DINF_DISABLE_METAL4_Q6_HALF_KSPLIT").is_none()
         && dispatch_ksplit_staged(
             GgmlDType::Q6K,
             "dinf_tensor_qmatmul_q6k_ksplit_k32_t8_h",
@@ -3082,7 +2957,6 @@ fn dispatch_tensor_qmatmul(
         && kernel_tokens == VERIFY_TILE_TOKENS
         && (Q6_KSPLIT_MIN_OUT..=Q6_KSPLIT_MAX_OUT).contains(&out_dim)
         && in_dim.is_multiple_of(8 * 16)
-        && std::env::var_os("DINF_DISABLE_METAL4_Q6_KSPLIT").is_none()
         && dispatch_ksplit(
             GgmlDType::Q6K,
             "dinf_tensor_qmatmul_q6k_ksplit_t8",
@@ -3105,11 +2979,7 @@ fn dispatch_tensor_qmatmul(
     if tokens < MIN_TENSOR_TOKENS {
         return Ok(false);
     }
-    let tile_tokens = if std::env::var_os("DINF_METAL4_QMM_TILE").is_some() {
-        tile_tokens(tokens)
-    } else {
-        preferred_tile_tokens.unwrap_or_else(|| tile_tokens(tokens))
-    };
+    let tile_tokens = preferred_tile_tokens.unwrap_or_else(|| tile_tokens(tokens));
     dispatch_tensor_pipeline(
         dtype,
         in_dim,
@@ -3265,9 +3135,6 @@ fn half_input_pipeline(
     tile_tokens: usize,
     narrow_tiles: bool,
 ) -> Result<Option<ComputePipeline>> {
-    if std::env::var_os("DINF_DISABLE_METAL4_HALF_INPUT_QMM").is_some() {
-        return Ok(None);
-    }
     let name = match (dtype, tile_tokens) {
         (GgmlDType::Q8_0, VERIFY_TILE_TOKENS) if narrow_tiles => "dinf_tensor_qmatmul_q8_0_h8",
         (GgmlDType::Q8_0, TINY_TILE_TOKENS) if narrow_tiles => "dinf_tensor_qmatmul_q8_0_h16",
@@ -3296,7 +3163,7 @@ fn dispatch_q4k_verify(
     input_layout: &Layout,
     output: &candle_metal_kernels::metal::Buffer,
 ) -> Result<bool> {
-    let msg = out_dim >= q4k_verify_msg_min_out();
+    let msg = out_dim >= Q4K_VERIFY_MSG_MIN_OUT;
     let name = q4k_verify_kernel_name(tokens, msg);
     let Some(name) = name else {
         return Ok(false);
@@ -3570,7 +3437,6 @@ fn dispatch_legacy_qmatmul(
         && dtype == GgmlDType::Q6K
         && tokens == 1
         && batch == 1
-        && pre_m5_scalar_q6_r2_enabled()
         && dispatch_pre_m5_scalar_q6_r2(in_dim, out_dim, weights, input, input_layout, output)?
     {
         return Ok(());
@@ -3773,10 +3639,6 @@ mod tests {
     #[ignore = "set DINF_BENCH_QWEN_GGUF to a local Qwen GGUF"]
     fn bench_qwen_prefill_tiles() -> Result<()> {
         let device = Device::new_metal(0)?;
-        assert!(
-            std::env::var_os("DINF_METAL4_QMM_TILE").is_none(),
-            "unset DINF_METAL4_QMM_TILE before comparing tiles"
-        );
         assert_eq!(
             metal_tensor_profile(&device)?,
             MetalTensorProfile::Default,
@@ -4301,7 +4163,6 @@ mod tests {
         };
         if !supports_metal_tensor(&device)?
             || metal_tensor_profile(&device)? != MetalTensorProfile::PreM5
-            || !pre_m5_scalar_q6_r2_enabled()
         {
             return Ok(());
         }
@@ -4403,7 +4264,6 @@ mod tests {
         };
         if !supports_metal_tensor(&device)?
             || metal_tensor_profile(&device)? != MetalTensorProfile::PreM5
-            || !pre_m5_scalar_q6_r2_enabled()
         {
             return Ok(());
         }
@@ -4885,9 +4745,9 @@ mod tests {
 
     #[test]
     fn metal4_q4k_matches_candle_with_partial_tiles() -> Result<()> {
-        compare_with_candle(GgmlDType::Q4K, 3, DEFAULT_Q4K_VERIFY_MIN_OUT)?;
-        compare_with_candle(GgmlDType::Q4K, 5, DEFAULT_Q4K_VERIFY_MIN_OUT)?;
-        compare_with_candle(GgmlDType::Q4K, 8, DEFAULT_Q4K_VERIFY_MIN_OUT)?;
+        compare_with_candle(GgmlDType::Q4K, 3, Q4K_VERIFY_MIN_OUT)?;
+        compare_with_candle(GgmlDType::Q4K, 5, Q4K_VERIFY_MIN_OUT)?;
+        compare_with_candle(GgmlDType::Q4K, 8, Q4K_VERIFY_MIN_OUT)?;
         compare_with_candle(GgmlDType::Q4K, 7, 70)?;
         compare_with_candle(GgmlDType::Q4K, 8, 70)?;
         compare_with_candle(GgmlDType::Q4K, 16, 70)?;

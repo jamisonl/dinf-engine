@@ -479,11 +479,12 @@ pub fn sample_token_with_rng(
     // validates the complete tensor with one scalar readback.
     if params.temperature <= 0.0 {
         #[cfg(target_os = "macos")]
-        if logits.device().is_metal()
-            && logits.is_contiguous()
-            && std::env::var_os("DINF_DISABLE_FUSED_METAL_GREEDY").is_none()
-        {
+        if logits.device().is_metal() && logits.is_contiguous() {
             return crate::sampling_metal::greedy_argmax(&logits);
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(token) = crate::sampling_cuda::try_greedy_argmax(&logits)? {
+            return Ok(token);
         }
         let finite_witness = logits.sub(&logits)?.sum_all()?.to_scalar::<f32>()?;
         anyhow::ensure!(finite_witness == 0.0, "logits must be finite");

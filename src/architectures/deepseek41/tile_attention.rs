@@ -9,6 +9,7 @@
 //! depend on how a prompt is split into tiles. Output is BF16-rounded, as the
 //! row path's `heads` returns it.
 use anyhow::{Context, Result, ensure};
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 use candle_core::{DType, Device, Tensor};
 
 /// Most selected compressed rows per query, matching `select_scores`.

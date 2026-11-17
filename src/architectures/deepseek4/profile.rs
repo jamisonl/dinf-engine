@@ -1,7 +1,6 @@
 //! Opt-in synchronized region timings. These waits change GPU scheduling;
 //! use them to find expensive regions, not to claim production throughput.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -65,7 +64,6 @@ impl Counter {
     }
 }
 
-static ENABLED: OnceLock<bool> = OnceLock::new();
 static SINGLE: [Counter; NAMES.len()] = [const { Counter::new() }; NAMES.len()];
 static MULTI: [Counter; NAMES.len()] = [const { Counter::new() }; NAMES.len()];
 
@@ -76,7 +74,7 @@ pub(super) struct Stamp {
 }
 
 pub(super) fn start(device: &Device, rows: usize, region: Region) -> Result<Option<Stamp>> {
-    if !*ENABLED.get_or_init(|| std::env::var_os("DINF_PROFILE_LAYERS").is_some()) {
+    if !super::super::profiling::layer_profiling_enabled() {
         return Ok(None);
     }
     device.synchronize()?;

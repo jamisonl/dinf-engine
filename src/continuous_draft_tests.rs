@@ -334,42 +334,24 @@ fn each_draft_rejection_position_and_bonus_stop_matches_scalar() -> Result<()> {
     Ok(())
 }
 
-// Set the existing opt-in only in a child process. The normal suite can run
-// tests in parallel without racing a process-global environment write.
-fn batch_child(name: &str) -> Result<bool> {
-    if std::env::var("DINF_DRAFT_TEST_CHILD").as_deref() == Ok(name) {
-        assert_eq!(
-            std::env::var("DINF_ENABLE_SPECULATIVE_BATCH").as_deref(),
-            Ok("1")
-        );
-        return Ok(true);
-    }
-    let output = std::process::Command::new(std::env::current_exe()?)
-        .args([
-            "--exact",
-            &format!("continuous::draft_sampling_tests::{name}"),
-            "--test-threads=1",
-        ])
-        .env("DINF_DRAFT_TEST_CHILD", name)
-        .env("DINF_ENABLE_SPECULATIVE_BATCH", "1")
-        .env_remove("DINF_ALLOW_APPROXIMATE_SPECULATIVE")
-        .output()?;
-    anyhow::ensure!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(false)
+/// A drafted stage with shared verification turned on. Other stages keep
+/// the default options, so these tests no longer need a child process.
+fn shared_stage() -> Result<(PipelineStage, Arc<Mutex<Calls>>)> {
+    let (mut stage, calls) = stage(true)?;
+    stage.set_options(crate::EngineOptions {
+        speculative: crate::SpeculativeOptions {
+            shared_verification: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    })?;
+    Ok((stage, calls))
 }
 
 #[test]
 fn shared_draft_lanes_match_separate_target_streams() -> Result<()> {
-    if !batch_child("shared_draft_lanes_match_separate_target_streams")? {
-        return Ok(());
-    }
     for lanes in [2, 4] {
-        let (mut shared, calls) = stage(true)?;
+        let (mut shared, calls) = shared_stage()?;
         let (mut scalar, _) = stage(false)?;
         let mut a = (0..lanes)
             .map(|i| session(&scalar, vec![i as u32 % 3; i + 1], i, 17 + i as u64))
@@ -424,11 +406,8 @@ fn shared_draft_lanes_match_separate_target_streams() -> Result<()> {
 
 #[test]
 fn shared_draft_errors_restore_only_uncommitted_lanes() -> Result<()> {
-    if !batch_child("shared_draft_errors_restore_only_uncommitted_lanes")? {
-        return Ok(());
-    }
     for fault in [Fault::Target, Fault::Sample] {
-        let (mut shared, calls) = stage(true)?;
+        let (mut shared, calls) = shared_stage()?;
         let (mut scalar, _) = stage(false)?;
         let mut a = session(&scalar, vec![0], 0, 42);
         let mut lanes = [
@@ -514,10 +493,7 @@ fn shared_draft_errors_restore_only_uncommitted_lanes() -> Result<()> {
 
 #[test]
 fn shared_draft_cancel_keeps_other_lane_and_rebuilds_visible_prefix() -> Result<()> {
-    if !batch_child("shared_draft_cancel_keeps_other_lane_and_rebuilds_visible_prefix")? {
-        return Ok(());
-    }
-    let (mut shared, calls) = stage(true)?;
+    let (mut shared, calls) = shared_stage()?;
     let (mut scalar, _) = stage(false)?;
     shared.set_prompt_cache_limits(1 << 20, 4, Duration::from_secs(60));
     let mut a = session(&shared, vec![0], 0, 42);
@@ -595,7 +571,6 @@ fn full_target_shared_draft_paired_streams() -> Result<()> {
     use crate::{LayerRange, read_gguf_metadata, tokenizer::GgufTokenizer};
     use std::path::PathBuf;
 
-    anyhow::ensure!(std::env::var_os("DINF_ALLOW_APPROXIMATE_SPECULATIVE").is_none());
     let target = PathBuf::from(std::env::var("DINF_TEST_SHARED_TARGET")?);
     let draft = PathBuf::from(std::env::var("DINF_TEST_SHARED_DRAFT")?);
     let report_path = PathBuf::from(std::env::var("DINF_TEST_SHARED_REPORT")?);
@@ -611,6 +586,13 @@ fn full_target_shared_draft_paired_streams() -> Result<()> {
             None,
         )?;
         stage.attach_speculative_draft(&draft)?;
+        stage.set_options(crate::EngineOptions {
+            speculative: crate::SpeculativeOptions {
+                shared_verification: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })?;
         anyhow::ensure!(
             stage.supports_speculative_batch(),
             "shared path did not admit"
@@ -637,7 +619,7 @@ fn full_target_shared_draft_paired_streams() -> Result<()> {
                     let mut plain =
                         GenerationSession::new(&stage, prompt.clone(), p.clone(), vec![]);
                     let mut drafted = GenerationSession::new(&stage, prompt.clone(), p, vec![]);
-                    plain.set_speculative_decoding_enabled(false);
+                    plain.set_speculative_decoding_enabled(&stage, false);
                     plain.rng = SamplingRng::seeded(413 + i as u64);
                     drafted.rng = SamplingRng::seeded(413 + i as u64);
                     a.push(plain);

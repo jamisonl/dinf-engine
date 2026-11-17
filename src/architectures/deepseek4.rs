@@ -238,10 +238,6 @@ struct HcMix {
     fused_pre: bool,
 }
 
-fn fused_hc_enabled(configured: Option<&std::ffi::OsStr>, apple_silicon_metal: bool) -> bool {
-    super::hc_sinkhorn::enabled(configured, apple_silicon_metal)
-}
-
 impl HcMix {
     fn new(weights: &RawMap, prefix: &str, md: &GgufMetadata, device: &Device) -> Result<Self> {
         let stream_count = md.hyperconnection_count;
@@ -255,6 +251,8 @@ impl HcMix {
         let scale = vector(weights, &format!("{prefix}_scale.weight"), device)?;
         anyhow::ensure!(base.dims() == [mix_dim], "invalid {prefix}_base shape");
         anyhow::ensure!(scale.dims() == [3], "invalid {prefix}_scale shape");
+        let apple_silicon_metal =
+            cfg!(all(target_os = "macos", target_arch = "aarch64")) && device.is_metal();
         Ok(Self {
             projection: linear(weights, &format!("{prefix}_fn.weight"), device)?,
             base,
@@ -264,18 +262,9 @@ impl HcMix {
             hidden_dim,
             sinkhorn_iterations: md.hyperconnection_sinkhorn_iterations.max(1),
             eps: md.hyperconnection_epsilon.max(1e-6),
-            fused_sinkhorn: fused_hc_enabled(
-                std::env::var_os("DINF_DEEPSEEK4_FUSED_HC").as_deref(),
-                cfg!(all(target_os = "macos", target_arch = "aarch64")) && device.is_metal(),
-            ),
-            fused_post: fused_hc_enabled(
-                std::env::var_os("DINF_DEEPSEEK4_FUSED_HC_POST").as_deref(),
-                cfg!(all(target_os = "macos", target_arch = "aarch64")) && device.is_metal(),
-            ),
-            fused_pre: fused_hc_enabled(
-                std::env::var_os("DINF_DEEPSEEK4_FUSED_HC_PRE").as_deref(),
-                cfg!(all(target_os = "macos", target_arch = "aarch64")) && device.is_metal(),
-            ),
+            fused_sinkhorn: apple_silicon_metal,
+            fused_post: apple_silicon_metal,
+            fused_pre: apple_silicon_metal,
         })
     }
 
@@ -511,10 +500,8 @@ impl V4Moe {
             normalize_weights: md.expert_weights_norm,
             clamp,
             shared_clamp,
-            group_experts: routed_experts::enabled(
-                std::env::var_os("DINF_DEEPSEEK4_GROUP_EXPERTS").as_deref(),
-                cfg!(all(target_os = "macos", target_arch = "aarch64")) && device.is_metal(),
-            ),
+            group_experts: cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                && device.is_metal(),
         })
     }
 
@@ -801,10 +788,8 @@ impl DeepSeek4Stage {
             None
         };
 
-        let decode_batch_enabled = decode_batch::enabled(
-            std::env::var_os("DINF_DEEPSEEK4_DECODE_BATCH").as_deref(),
-            cfg!(all(target_os = "macos", target_arch = "aarch64")) && device.is_metal(),
-        );
+        let decode_batch_enabled =
+            cfg!(all(target_os = "macos", target_arch = "aarch64")) && device.is_metal();
         tracing::info!(
             decode_batch = decode_batch_enabled && stage.range.is_head() && stage.range.is_tail(),
             group_experts = blocks.iter().any(|block| block.moe.group_experts),

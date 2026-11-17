@@ -3,10 +3,6 @@
 use anyhow::Result;
 use candle_core::{D, Tensor};
 
-pub(super) fn enabled(configured: Option<&std::ffi::OsStr>, apple_silicon_metal: bool) -> bool {
-    configured.map_or(apple_silicon_metal, |value| value == "1")
-}
-
 pub(super) fn normalize(
     matrix: Tensor,
     iterations: usize,

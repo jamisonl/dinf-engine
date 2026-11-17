@@ -374,7 +374,7 @@ fn grouped_iq1_contract_cpu() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 mod metal {
-    use super::super::metal::{KernelKind, forward_with_kernel, simd_enabled};
+    use super::super::metal::{KernelKind, forward_with_kernel};
     use super::*;
 
     #[test]
@@ -920,9 +920,8 @@ mod metal {
     }
 
     fn grouped_iq1_require_simd() {
-        let configured = std::env::var_os("DINF_DEEPSEEK4_SIMD");
         assert!(
-            simd_enabled(configured.as_deref(), cfg!(target_arch = "aarch64")),
+            DeepSeek4QMatMul::iq1_simd_enabled(),
             "grouped IQ1 real-Metal qualification requires SIMD enabled"
         );
     }
@@ -1390,8 +1389,7 @@ mod metal {
                 (tokens, width),
                 &device,
             )?;
-            let configured = std::env::var_os("DINF_DEEPSEEK4_SIMD");
-            let enabled = simd_enabled(configured.as_deref(), cfg!(target_arch = "aarch64"));
+            let enabled = cfg!(target_arch = "aarch64");
             let expected_kind = if enabled && tokens == 1 && width >= 1024 {
                 KernelKind::Simd
             } else {

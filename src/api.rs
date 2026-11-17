@@ -5,6 +5,7 @@ use anyhow::{Result, ensure};
 use candle_core::Device;
 
 use crate::gguf_loader::{GgufMetadata, LayerRange, read_gguf_metadata};
+use crate::options::EngineOptions;
 use crate::sampling::SamplingParams;
 use crate::tokenizer::{ChatTemplateMessage, ChatTemplateOptions, GgufTokenizer};
 use crate::{PipelineStage, StagePosition};
@@ -39,6 +40,7 @@ pub struct EngineBuilder {
     layers: Option<Range<usize>>,
     kv_quant_bits: Option<u8>,
     max_kv_tokens: Option<usize>,
+    options: EngineOptions,
 }
 
 /// Tokens and decoded text returned by a generation call.
@@ -267,6 +269,7 @@ impl EngineBuilder {
             layers: None,
             kv_quant_bits: None,
             max_kv_tokens: None,
+            options: EngineOptions::default(),
         }
     }
 
@@ -319,6 +322,21 @@ impl EngineBuilder {
         self
     }
 
+    /// Set the runtime options the loaded stage applies to requests.
+    ///
+    /// Validation is deferred until [`EngineBuilder::build`]. The options can
+    /// be changed later with [`PipelineStage::set_options`] through
+    /// [`Engine::stage_mut`].
+    ///
+    /// # Errors
+    ///
+    /// [`EngineBuilder::build`] returns an error when
+    /// [`EngineOptions::validate`] rejects `options`.
+    pub fn options(mut self, options: EngineOptions) -> Self {
+        self.options = options;
+        self
+    }
+
     /// Read the GGUF header/tokenizer and materialize the configured stage.
     ///
     /// This is the first builder operation that performs I/O and allocates
@@ -338,6 +356,7 @@ impl EngineBuilder {
         if let Some(max) = self.max_kv_tokens {
             ensure!(max > 0, "max_kv_tokens must be positive");
         }
+        self.options.validate()?;
 
         let metadata = read_gguf_metadata(&self.path)?;
         let total_layers = metadata.num_layers;
@@ -360,6 +379,7 @@ impl EngineBuilder {
         if let Some(max) = self.max_kv_tokens {
             stage.set_max_kv_tokens(max);
         }
+        stage.set_options(self.options)?;
 
         Ok(Engine {
             path: self.path,

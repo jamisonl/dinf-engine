@@ -1,5 +1,5 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::qmatmul::QMatMul;
@@ -22,10 +22,9 @@ static FFN_UP_NS: AtomicU64 = AtomicU64::new(0);
 static FFN_ACTIVATION_NS: AtomicU64 = AtomicU64::new(0);
 static FFN_DOWN_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
-static PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn layer_profile_enabled() -> bool {
-    *PROFILE_ENABLED.get_or_init(|| std::env::var_os("DINF_PROFILE_LAYERS").is_some())
+    super::profiling::layer_profiling_enabled()
 }
 
 fn finish_profile_region(device: &Device, started: Instant, counter: &AtomicU64) -> Result<()> {
@@ -341,20 +340,18 @@ impl Attention {
             (q, k, v)
         } else {
             #[cfg(target_os = "macos")]
-            if std::env::var_os("DINF_DISABLE_FUSED_SEPARATE_QKV_LAYOUT").is_none()
-                && let Some(layout) = super::qkv_layout_metal::try_fused_separate_qkv_layout(
-                    &q,
-                    &k,
-                    &v,
-                    super::qkv_layout_metal::QkvLayoutDimensions {
-                        batch: b_sz,
-                        seq_len,
-                        num_heads: self.num_heads,
-                        num_kv_heads: self.num_kv_heads,
-                        head_dim: self.head_dim,
-                    },
-                )?
-            {
+            if let Some(layout) = super::qkv_layout_metal::try_fused_separate_qkv_layout(
+                &q,
+                &k,
+                &v,
+                super::qkv_layout_metal::QkvLayoutDimensions {
+                    batch: b_sz,
+                    seq_len,
+                    num_heads: self.num_heads,
+                    num_kv_heads: self.num_kv_heads,
+                    head_dim: self.head_dim,
+                },
+            )? {
                 layout
             } else {
                 self.portable_qkv_layout(q, k, v, b_sz, seq_len)?
@@ -396,10 +393,8 @@ impl Attention {
         let attn_output = super::restore_quantized_attention_output(attn_output, rotation)?;
 
         #[cfg(target_os = "macos")]
-        let attn_output = if std::env::var_os("DINF_DISABLE_FUSED_ATTENTION_OUTPUT_LAYOUT")
-            .is_none()
-            && let Some(output) =
-                super::qkv_layout_metal::try_fused_attention_output_layout(&attn_output)?
+        let attn_output = if let Some(output) =
+            super::qkv_layout_metal::try_fused_attention_output_layout(&attn_output)?
         {
             output
         } else {
@@ -632,26 +627,16 @@ impl Attention {
     }
 }
 
-fn silu_mul(gate: &Tensor, up: &Tensor, _fuse_metal: bool) -> Result<Tensor> {
+fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     // Keep CUDA's exact epilogue: the shared MoE helper uses a different
     // CUDA implementation, so it cannot replace this path unchanged.
     #[cfg(feature = "cuda")]
-    if gate.device().is_cuda() && std::env::var_os("DINF_DISABLE_CUDA_SILU_MUL").is_none() {
+    if gate.device().is_cuda() {
         return super::indexed_moe_epilogue_cuda::silu_mul_exact(gate, up);
     }
-    #[cfg(target_os = "macos")]
-    if _fuse_metal
-        && gate.device().is_metal()
-        && gate.dtype() == DType::F32
-        && up.dtype() == DType::F32
-        && gate.is_contiguous()
-        && up.is_contiguous()
-        && gate.shape() == up.shape()
-        && gate.elem_count() > 0
-    {
-        return super::indexed_moe_metal::fused_silu_mul(gate, up).map_err(Into::into);
-    }
-    // Preserve the native dtype and strided-tensor behavior on other paths.
+    // Metal stays unfused: full-model controls showed a small Coder gain but
+    // slower sampled Llama/Distill runs with the fused SiLU kernel. This also
+    // preserves the native dtype and strided-tensor behavior.
     (candle_nn::Activation::Silu.forward(gate)? * up).map_err(Into::into)
 }
 
@@ -711,15 +696,7 @@ impl Mlp {
             return Ok(down);
         }
         let started = Instant::now();
-        // Full-model controls show a small Coder gain but slower sampled
-        // Llama/Distill runs. Keep Metal fusion opt-in until that is resolved.
-        #[cfg(target_os = "macos")]
-        let fuse_metal = gate.device().is_metal()
-            && std::env::var("DINF_LLAMA_FUSED_SILU_MUL").as_deref() == Ok("1")
-            && std::env::var_os("DINF_DISABLE_FUSED_SILU_MUL").is_none();
-        #[cfg(not(target_os = "macos"))]
-        let fuse_metal = false;
-        let activated = silu_mul(&gate, &up, fuse_metal)?;
+        let activated = silu_mul(&gate, &up)?;
         if profile {
             finish_profile_region(x.device(), started, &FFN_ACTIVATION_NS)?;
         }
@@ -1899,21 +1876,16 @@ mod tests {
                     (gate.transpose(1, 2)?, up.transpose(1, 2)?.contiguous()?),
                 ] {
                     let expected = (gate.silu()? * &up)?;
-                    for fuse_metal in [false, true] {
-                        let actual = silu_mul(&gate, &up, fuse_metal)?;
-                        assert_close(&actual, &expected, 2e-6)?;
-                    }
+                    assert_close(&silu_mul(&gate, &up)?, &expected, 2e-6)?;
                 }
             }
         }
         let gate = Tensor::zeros((1, 8), DType::F32, device)?;
         let wrong_shape = Tensor::zeros((2, 8), DType::F32, device)?;
         let empty = Tensor::zeros((0, 8), DType::F32, device)?;
-        for fuse_metal in [false, true] {
-            assert!(silu_mul(&gate, &wrong_shape, fuse_metal).is_err());
-            assert!(silu_mul(&gate, &gate.to_dtype(DType::F16)?, fuse_metal).is_err());
-            assert_close(&silu_mul(&empty, &empty, fuse_metal)?, &empty, 0.)?;
-        }
+        assert!(silu_mul(&gate, &wrong_shape).is_err());
+        assert!(silu_mul(&gate, &gate.to_dtype(DType::F16)?).is_err());
+        assert_close(&silu_mul(&empty, &empty)?, &empty, 0.)?;
         Ok(())
     }
 

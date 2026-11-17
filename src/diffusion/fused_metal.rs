@@ -15,11 +15,6 @@ use objc2_metal::{MTLCompileOptions, MTLSize};
 #[cfg(target_arch = "aarch64")]
 use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLGPUFamily};
 
-pub(super) fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("DINF_DIFFUSION_FUSED").as_deref() != Ok("0"))
-}
-
 struct Programs {
     library: Library,
     pipelines: HashMap<String, ComputePipeline>,

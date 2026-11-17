@@ -1,31 +1,5 @@
 use super::*;
 
-#[test]
-fn v4_decode_batch_policy_defaults_only_to_apple_silicon_metal() {
-    use std::ffi::OsStr;
-    assert!(enabled(None, true));
-    assert!(!enabled(None, false));
-    for native in [true, false] {
-        assert!(enabled(Some(OsStr::new("1")), native));
-        for value in ["0", "false", "invalid", ""] {
-            assert!(!enabled(Some(OsStr::new(value)), native));
-        }
-    }
-}
-
-#[test]
-fn v4_hc_fusion_defaults_only_to_apple_silicon_metal() {
-    use std::ffi::OsStr;
-    assert!(fused_hc_enabled(None, true));
-    assert!(!fused_hc_enabled(None, false));
-    for native in [true, false] {
-        assert!(fused_hc_enabled(Some(OsStr::new("1")), native));
-        for value in ["0", "false", "invalid", ""] {
-            assert!(!fused_hc_enabled(Some(OsStr::new(value)), native));
-        }
-    }
-}
-
 fn matrix(rows: usize, width: usize, seed: usize, device: &Device) -> Result<DeepSeek4QMatMul> {
     let bytes = (0..rows * width)
         .flat_map(|i| ((((i * 17 + seed * 7) % 71) as f32 - 35.) / 300.).to_le_bytes())

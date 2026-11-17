@@ -10,7 +10,11 @@
 //! DINF_BENCH_DRAFT=DRAFT.gguf attaches a DFlash draft and reports its pass
 //! statistics; DINF_BENCH_DRAFT_MAX caps the drafted tokens per pass. Greedy
 //! requests keep the exact scalar path unless
-//! DINF_ALLOW_APPROXIMATE_SPECULATIVE=1 is also set.
+//! DINF_ALLOW_APPROXIMATE_SPECULATIVE=1 is also set, which this example turns
+//! into `SpeculativeOptions::allow_approximate`.
+//!
+//! DINF_PROFILE_LAYERS=1 turns on layer profiling and prints the Qwen3.5
+//! layer profile for prefill and decode.
 //!
 //! DINF_BENCH_TOOLS=1 sends one `save_file` tool with the request and samples
 //! under the engine's tool-call grammar (temperature 0.7). The
@@ -24,7 +28,9 @@ use candle_core::Device;
 use dinf_engine::continuous::GenerationSession;
 use dinf_engine::sampling::SamplingParams;
 use dinf_engine::tokenizer::GgufTokenizer;
-use dinf_engine::{LayerRange, PipelineStage, read_gguf_metadata};
+use dinf_engine::{
+    EngineOptions, LayerRange, PipelineStage, SpeculativeOptions, read_gguf_metadata,
+};
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -43,6 +49,8 @@ fn main() -> Result<()> {
     let device = match backend.as_str() {
         "cpu" => Device::Cpu,
         "metal" => Device::new_metal(0)?,
+        #[cfg(feature = "cuda")]
+        "cuda" => Device::new_cuda(0)?,
         other => anyhow::bail!("unknown backend {other}"),
     };
     let metadata = read_gguf_metadata(&path)?;
@@ -117,6 +125,21 @@ fn main() -> Result<()> {
         if let Some(max) = std::env::var_os("DINF_BENCH_DRAFT_MAX") {
             stage.set_speculative_draft_max_tokens(max.to_str().context("draft max")?.parse()?)?;
         }
+        stage.set_options(EngineOptions {
+            speculative: SpeculativeOptions {
+                allow_approximate: std::env::var("DINF_ALLOW_APPROXIMATE_SPECULATIVE").as_deref()
+                    == Ok("1"),
+                ..Default::default()
+            },
+            ..Default::default()
+        })?;
+    }
+    // DINF_CUDA_GRAPH_DECODE=0 issues CUDA decode launches one by one
+    // instead of as captured graphs, which is the default.
+    if std::env::var_os("DINF_CUDA_GRAPH_DECODE").is_some_and(|value| value == "0") {
+        let mut options = stage.options().clone();
+        options.cuda_graph_decode = false;
+        stage.set_options(options)?;
     }
     device.synchronize()?;
     eprintln!("load {:.1}s", load.elapsed().as_secs_f64());
@@ -144,17 +167,26 @@ fn main() -> Result<()> {
         warm.discard_cache(&mut stage);
     }
 
+    // DINF_PROFILE_REGIONS=1 times named regions of the production CUDA
+    // decode path without changing which code runs.
+    let regions = std::env::var_os("DINF_PROFILE_REGIONS").is_some();
     let profile = std::env::var_os("DINF_PROFILE_LAYERS").is_some();
+    dinf_engine::architectures::profiling::set_layer_profiling(profile);
     let mut pp = Vec::new();
     let mut tg = Vec::new();
     for _ in 0..repeats {
         let mut session = GenerationSession::new(&stage, prompt.clone(), params.clone(), vec![]);
-        session.set_speculative_decoding_enabled(draft.is_some());
+        session.set_speculative_decoding_enabled(&stage, draft.is_some());
         if profile {
             dinf_engine::architectures::qwen35::reset_layer_profile();
+            dinf_engine::architectures::gemma4::reset_layer_profile();
         }
         let prefill_timing = std::env::var_os("DINF_BENCH_GPU_TIMING")
             .map(|_| dinf_engine::architectures::deepseek41::profile::GpuTimingGuard::enable());
+        if regions {
+            dinf_engine::architectures::profiling::reset_regions();
+            dinf_engine::architectures::profiling::set_region_profiling(true);
+        }
         let start = Instant::now();
         while session
             .step_with_prefill_budget(&mut stage, prefill_chunk)?
@@ -162,6 +194,11 @@ fn main() -> Result<()> {
         {}
         device.synchronize()?;
         let prefill = start.elapsed().as_secs_f64();
+        if regions {
+            dinf_engine::architectures::profiling::set_region_profiling(false);
+            eprintln!("prefill regions ({prompt_tokens} tokens):");
+            dinf_engine::architectures::profiling::report_regions();
+        }
         if prefill_timing.is_some() {
             let timing = dinf_engine::architectures::deepseek41::profile::gpu_timing_snapshot();
             eprintln!(
@@ -175,10 +212,16 @@ fn main() -> Result<()> {
         if profile {
             eprintln!("prefill profile:");
             dinf_engine::architectures::qwen35::report_layer_profile();
+            dinf_engine::architectures::gemma4::report_layer_profile();
             dinf_engine::architectures::qwen35::reset_layer_profile();
+            dinf_engine::architectures::gemma4::reset_layer_profile();
         }
         let gpu_timing = std::env::var_os("DINF_BENCH_GPU_TIMING")
             .map(|_| dinf_engine::architectures::deepseek41::profile::GpuTimingGuard::enable());
+        if regions {
+            dinf_engine::architectures::profiling::reset_regions();
+            dinf_engine::architectures::profiling::set_region_profiling(true);
+        }
         let start = Instant::now();
         while !session.is_finished() {
             session.step(&mut stage)?;
@@ -196,9 +239,15 @@ fn main() -> Result<()> {
             );
         }
         drop(gpu_timing);
+        if regions {
+            dinf_engine::architectures::profiling::set_region_profiling(false);
+            eprintln!("decode regions ({} tokens):", decode_tokens - 1);
+            dinf_engine::architectures::profiling::report_regions();
+        }
         if profile {
             eprintln!("decode profile:");
             dinf_engine::architectures::qwen35::report_layer_profile();
+            dinf_engine::architectures::gemma4::report_layer_profile();
         }
         ensure!(
             session.generated().len() == decode_tokens,
@@ -235,6 +284,22 @@ fn main() -> Result<()> {
         );
     }
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    #[cfg(feature = "cuda")]
+    {
+        let stats = stage.cuda_graph_decode_stats();
+        if stats.steps > 0 {
+            let per_step = |ns: u64| ns as f64 / stats.steps as f64 / 1e6;
+            eprintln!(
+                "cuda graph decode: {} steps, {} segments, {} instantiations, {:.0} nodes per step; per step: record {:.3} ms, submit {:.3} ms",
+                stats.steps,
+                stats.segments,
+                stats.instantiations,
+                stats.nodes as f64 / stats.steps as f64,
+                per_step(stats.record_ns),
+                per_step(stats.submit_ns)
+            );
+        }
+    }
     println!(
         "{{\"model\":{:?},\"backend\":{backend:?},\"pp_tokens\":{prompt_tokens},\"tg_tokens\":{decode_tokens},\"pp_tok_s\":{:.2},\"tg_tok_s\":{:.3}}}",
         path,

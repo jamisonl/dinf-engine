@@ -574,11 +574,10 @@ fn prefill_pipeline(
 
 fn supports_tensor_prefill(device: &candle_core::MetalDevice) -> bool {
     use objc2_metal::{MTLDevice, MTLGPUFamily};
-    std::env::var_os("DINF_DISABLE_F16KV_PREFILL_ATTENTION").is_none()
-        && device
-            .metal_device()
-            .as_ref()
-            .supportsFamily(MTLGPUFamily::Metal4)
+    device
+        .metal_device()
+        .as_ref()
+        .supportsFamily(MTLGPUFamily::Metal4)
 }
 
 /// Causal attention for a prompt chunk of `q_len` rows over an F16 cache of

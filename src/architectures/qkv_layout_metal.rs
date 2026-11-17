@@ -1151,11 +1151,7 @@ pub(super) fn try_fused_qwen35_decode_qkv_norm_rope_layout(
                     .is_some_and(|end| end <= u32::MAX as usize)
         },
     );
-    if std::env::var_os("DINF_DISABLE_QWEN35_FUSED_DECODE_QKV_NORM_ROPE").is_some()
-        || std::env::var_os("DINF_DISABLE_QWEN35_FUSED_GATED_QKV_LAYOUT").is_some()
-        || std::env::var_os("DINF_DISABLE_FUSED_RMSNORM").is_some()
-        || std::env::var_os("DINF_DISABLE_FUSED_HEAD_RMSNORM").is_some()
-        || !q_full.device().is_metal()
+    if !q_full.device().is_metal()
         || q_full.dtype() != DType::F32
         || k.dtype() != DType::F32
         || v.dtype() != DType::F32

@@ -862,49 +862,37 @@ pub(super) fn precompile(device: &Device) -> anyhow::Result<()> {
         return Ok(());
     }
     let device = device.as_cuda_device()?;
-    if std::env::var_os("DINF_DISABLE_CUDA_SILU_DOWN").is_none() {
-        device.get_or_load_custom_func(
-            SILU_QUANT_KERNEL_NAME,
-            SILU_QUANT_MODULE_NAME,
-            silu_quant_ptx()?,
-        )?;
-    }
-    if std::env::var_os("DINF_DISABLE_CUDA_RELU_SQUARED_DOWN").is_none() {
-        device.get_or_load_custom_func(
-            RELU_SQUARED_QUANT_KERNEL_NAME,
-            SILU_QUANT_MODULE_NAME,
-            silu_quant_ptx()?,
-        )?;
-    }
-    if std::env::var_os("DINF_DISABLE_CUDA_Q8_FUSION").is_none() {
-        device.get_or_load_custom_func(
-            Q8_GROUP_KERNEL_NAME,
-            Q8_FUSION_MODULE_NAME,
-            q8_fusion_ptx()?,
-        )?;
-        device.get_or_load_custom_func(
-            Q8_SWIGLU_KERNEL_NAME,
-            Q8_FUSION_MODULE_NAME,
-            q8_fusion_ptx()?,
-        )?;
-    }
-    if std::env::var_os("DINF_DISABLE_CUDA_KQUANT_FUSION").is_none() {
-        for kernel in [
-            Q4_0_GROUP_KERNEL_NAME,
-            Q4_0_GATED_KERNEL_NAME,
-            Q2_K_GROUP_KERNEL_NAME,
-            Q2_K_GATED_KERNEL_NAME,
-            Q2_K_INDEXED_GATED_KERNEL_NAME,
-            Q4_K_GROUP_KERNEL_NAME,
-            Q4_K_GATED_KERNEL_NAME,
-            Q4_K_INDEXED_GATED_KERNEL_NAME,
-        ] {
-            device.get_or_load_custom_func(
-                kernel,
-                KQUANT_FUSION_MODULE_NAME,
-                kquant_fusion_ptx()?,
-            )?;
-        }
+    device.get_or_load_custom_func(
+        SILU_QUANT_KERNEL_NAME,
+        SILU_QUANT_MODULE_NAME,
+        silu_quant_ptx()?,
+    )?;
+    device.get_or_load_custom_func(
+        RELU_SQUARED_QUANT_KERNEL_NAME,
+        SILU_QUANT_MODULE_NAME,
+        silu_quant_ptx()?,
+    )?;
+    device.get_or_load_custom_func(
+        Q8_GROUP_KERNEL_NAME,
+        Q8_FUSION_MODULE_NAME,
+        q8_fusion_ptx()?,
+    )?;
+    device.get_or_load_custom_func(
+        Q8_SWIGLU_KERNEL_NAME,
+        Q8_FUSION_MODULE_NAME,
+        q8_fusion_ptx()?,
+    )?;
+    for kernel in [
+        Q4_0_GROUP_KERNEL_NAME,
+        Q4_0_GATED_KERNEL_NAME,
+        Q2_K_GROUP_KERNEL_NAME,
+        Q2_K_GATED_KERNEL_NAME,
+        Q2_K_INDEXED_GATED_KERNEL_NAME,
+        Q4_K_GROUP_KERNEL_NAME,
+        Q4_K_GATED_KERNEL_NAME,
+        Q4_K_INDEXED_GATED_KERNEL_NAME,
+    ] {
+        device.get_or_load_custom_func(kernel, KQUANT_FUSION_MODULE_NAME, kquant_fusion_ptx()?)?;
     }
     Ok(())
 }
@@ -1008,14 +996,6 @@ fn fusion_ptx(dtype: GgmlDType) -> candle_core::Result<&'static str> {
     }
 }
 
-fn fusion_disabled(dtype: GgmlDType) -> bool {
-    if dtype == GgmlDType::Q8_0 {
-        std::env::var_os("DINF_DISABLE_CUDA_Q8_FUSION").is_some()
-    } else {
-        std::env::var_os("DINF_DISABLE_CUDA_KQUANT_FUSION").is_some()
-    }
-}
-
 fn ensure_workspace(
     device: &candle_core::CudaDevice,
     bytes: usize,
@@ -1051,6 +1031,15 @@ fn ensure_workspace_in(
         }
     }
     Ok(guard)
+}
+
+/// The device address of the Q8_1 form a producer kernel already wrote for
+/// the single F32 row at `input`, if there is one.
+fn published_q8_1(input: cuda_sys::CUdeviceptr, input_dim: usize, rows: usize) -> Option<u64> {
+    if rows != 1 {
+        return None;
+    }
+    candle_core::quantized::q8_1_memo::lookup(input, input_dim)
 }
 
 fn checked_f32_view<'a>(
@@ -1123,6 +1112,7 @@ impl candle_core::CustomOp1 for GroupedQMatMul {
             .slice;
 
         let (workspace_ptr, _workspace_sync) = workspace.device_ptr(&stream);
+        let mut quantized_address = workspace_ptr;
         let mut output = unsafe { device.alloc::<f32>(self.output_dim * self.batch_size)? };
         let stream_ptr = stream.cu_stream() as *mut c_void;
 
@@ -1152,97 +1142,101 @@ impl candle_core::CustomOp1 for GroupedQMatMul {
                 }
                 let input = input.slice(input_start..input_end);
                 let (input_ptr, _input_sync) = input.device_ptr(&stream);
-                unsafe {
-                    kernels::ffi::launch_mmvq_gguf_quantize_q8_1_f32(
-                        input_ptr as *const c_void,
-                        workspace_ptr as *mut c_void,
-                        self.input_dim as i32,
-                        input_dim_padded as i32,
-                        self.batch_size as i32,
-                        stream_ptr,
-                    );
+                // An input whose producer already wrote its Q8_1 form skips
+                // the quantization launch.
+                match published_q8_1(input_ptr, self.input_dim, self.batch_size) {
+                    Some(address) => quantized_address = address,
+                    None => unsafe {
+                        kernels::ffi::launch_mmvq_gguf_quantize_q8_1_f32(
+                            input_ptr as *const c_void,
+                            workspace_ptr as *mut c_void,
+                            self.input_dim as i32,
+                            input_dim_padded as i32,
+                            self.batch_size as i32,
+                            stream_ptr,
+                        );
+                    },
                 }
             }
             _ => unreachable!("dtype eligibility checked above"),
         }
 
-        let fused_dtype = self
-            .weights
-            .first()
-            .map(|weight| weight.dtype())
-            .filter(|dtype| {
-                self.batch_size == 1
-                    && self.weights.len() <= 3
-                    && self.weights.iter().all(|weight| weight.dtype() == *dtype)
-                    && fused_group_kernel(*dtype).is_some()
-                    && !fusion_disabled(*dtype)
-            });
+        // Consecutive projections with one fusable quantization share a
+        // launch, up to three at a time; the rest launch one by one. Gemma 4
+        // 26B-A4B's K and V are one such run beside a differently quantized Q.
+        let stride_col_y = (input_dim_padded / Q8_1_BLOCK_SIZE) as i32;
         let mut output_offset = 0usize;
-        if let Some(dtype) = fused_dtype {
-            let mut addresses = Vec::with_capacity(self.weights.len());
-            let mut weight_syncs = Vec::with_capacity(self.weights.len());
-            for weight in &self.weights {
-                let (weight_ptr, weight_sync) = weight.device_ptr_with_guard(&stream)?;
-                addresses.push(weight_ptr as u64);
-                weight_syncs.push(weight_sync);
+        let mut first = 0usize;
+        while first < self.weights.len() {
+            let dtype = self.weights[first].dtype();
+            let mut end = first + 1;
+            if self.batch_size == 1 && fused_group_kernel(dtype).is_some() {
+                while end < self.weights.len()
+                    && end - first < 3
+                    && self.weights[end].dtype() == dtype
+                {
+                    end += 1;
+                }
             }
-            while addresses.len() < 3 {
-                addresses.push(addresses[0]);
-            }
-            let (module_name, kernel_name) =
-                fused_group_kernel(dtype).expect("fused dtype was checked above");
-            let function =
-                device.get_or_load_custom_func(kernel_name, module_name, fusion_ptx(dtype)?)?;
-            let config = LaunchConfig {
-                grid_dim: (self.output_dim as u32, 1, 1),
-                block_dim: (32, 4, 1),
-                shared_mem_bytes: 0,
-            };
-            let input_dim = self.input_dim as i32;
-            let rows0 = self.rows.first().copied().unwrap_or(0) as i32;
-            let rows1 = self.rows.get(1).copied().unwrap_or(0) as i32;
-            let rows2 = self.rows.get(2).copied().unwrap_or(0) as i32;
-            let mut builder = function.builder();
-            builder
-                .arg(&addresses[0])
-                .arg(&addresses[1])
-                .arg(&addresses[2])
-                .arg(workspace)
-                .arg(&mut output)
-                .arg(&input_dim)
-                .arg(&rows0)
-                .arg(&rows1)
-                .arg(&rows2);
-            // SAFETY: All matrices share the validated quantization and
-            // geometry, and the Q8_1 activation/output allocations stay live.
-            unsafe { builder.launch(config) }.w()?;
-            drop(weight_syncs);
-            output_offset = self.output_dim;
-            if dtype == GgmlDType::Q8_0 {
-                Q8_FUSION_LOGGED.get_or_init(|| {
-                    tracing::info!("CUDA fused Q8_0 projection grids enabled");
-                });
+            let run_rows = self.rows[first..end].iter().sum::<usize>();
+            if end - first >= 2 {
+                let mut addresses = Vec::with_capacity(3);
+                let mut weight_syncs = Vec::with_capacity(3);
+                for weight in &self.weights[first..end] {
+                    let (weight_ptr, weight_sync) = weight.device_ptr_with_guard(&stream)?;
+                    addresses.push(weight_ptr as u64);
+                    weight_syncs.push(weight_sync);
+                }
+                while addresses.len() < 3 {
+                    addresses.push(addresses[0]);
+                }
+                let (module_name, kernel_name) =
+                    fused_group_kernel(dtype).expect("fused dtype was checked above");
+                let function =
+                    device.get_or_load_custom_func(kernel_name, module_name, fusion_ptx(dtype)?)?;
+                let config = LaunchConfig {
+                    grid_dim: (run_rows as u32, 1, 1),
+                    block_dim: (32, 4, 1),
+                    shared_mem_bytes: 0,
+                };
+                let input_dim = self.input_dim as i32;
+                let run = &self.rows[first..end];
+                let rows0 = run[0] as i32;
+                let rows1 = run[1] as i32;
+                let rows2 = run.get(2).copied().unwrap_or(0) as i32;
+                let mut run_output = output.slice_mut(output_offset..output_offset + run_rows);
+                let mut builder = function.builder();
+                builder
+                    .arg(&addresses[0])
+                    .arg(&addresses[1])
+                    .arg(&addresses[2])
+                    .arg(&quantized_address)
+                    .arg(&mut run_output)
+                    .arg(&input_dim)
+                    .arg(&rows0)
+                    .arg(&rows1)
+                    .arg(&rows2);
+                // SAFETY: The run's matrices share the validated quantization
+                // and geometry, the kernel writes `run_rows` outputs into a
+                // view of that length, and the Q8_1 activation stays live.
+                unsafe { builder.launch(config) }.w()?;
+                drop(weight_syncs);
+                if dtype == GgmlDType::Q8_0 {
+                    Q8_FUSION_LOGGED.get_or_init(|| {
+                        tracing::info!("CUDA fused Q8_0 projection grids enabled");
+                    });
+                } else {
+                    KQUANT_FUSION_LOGGED.get_or_init(|| {
+                        tracing::info!("CUDA fused Q4_0/Q2_K/Q4_K projection grids enabled");
+                    });
+                }
             } else {
-                KQUANT_FUSION_LOGGED.get_or_init(|| {
-                    tracing::info!("CUDA fused Q4_0/Q2_K/Q4_K projection grids enabled");
-                });
-            }
-        } else {
-            let stride_col_y = (input_dim_padded / Q8_1_BLOCK_SIZE) as i32;
-            let (output_ptr, output_sync) = output.device_ptr(&stream);
-            for ((weight, rows), weight_index) in self
-                .weights
-                .iter()
-                .zip(self.rows.iter().copied())
-                .zip(0usize..)
-            {
-                let Some(launch) = launcher(weight.dtype()) else {
-                    candle_core::bail!(
-                        "grouped MMVQ weight {weight_index} uses unsupported {:?}",
-                        weight.dtype()
-                    )
+                let weight = &self.weights[first];
+                let Some(launch) = launcher(dtype) else {
+                    candle_core::bail!("grouped MMVQ weight {first} uses unsupported {dtype:?}")
                 };
                 let (weight_ptr, _weight_sync) = weight.device_ptr_with_guard(&stream)?;
+                let (output_ptr, _output_sync) = output.device_ptr(&stream);
                 let destination = (output_ptr as usize)
                     .checked_add(output_offset * std::mem::size_of::<f32>())
                     .ok_or_else(|| {
@@ -1251,19 +1245,19 @@ impl candle_core::CustomOp1 for GroupedQMatMul {
                 unsafe {
                     launch(
                         weight_ptr as *const c_void,
-                        workspace_ptr as *const c_void,
+                        quantized_address as *const c_void,
                         destination,
                         self.input_dim as i32,
-                        rows as i32,
+                        run_rows as i32,
                         stride_col_y,
                         self.output_dim as i32,
                         self.batch_size as i32,
                         stream_ptr,
                     );
                 }
-                output_offset += rows;
             }
-            drop(output_sync);
+            output_offset += run_rows;
+            first = end;
         }
         debug_assert_eq!(output_offset, self.output_dim);
 
@@ -1350,16 +1344,24 @@ impl candle_core::CustomOp1 for FusedKQuantGated {
         let input = input.slice(input_start..input_end);
         let (input_ptr, _input_sync) = input.device_ptr(&stream);
         let (workspace_ptr, _workspace_sync) = workspace.device_ptr(&stream);
-        unsafe {
-            kernels::ffi::launch_mmvq_gguf_quantize_q8_1_f32(
-                input_ptr as *const c_void,
-                workspace_ptr as *mut c_void,
-                self.input_dim as i32,
-                input_dim_padded as i32,
-                1,
-                stream.cu_stream() as *mut c_void,
-            );
-        }
+        // An input whose producer already wrote its Q8_1 form skips the
+        // quantization launch.
+        let quantized_address = match published_q8_1(input_ptr, self.input_dim, 1) {
+            Some(address) => address,
+            None => {
+                unsafe {
+                    kernels::ffi::launch_mmvq_gguf_quantize_q8_1_f32(
+                        input_ptr as *const c_void,
+                        workspace_ptr as *mut c_void,
+                        self.input_dim as i32,
+                        input_dim_padded as i32,
+                        1,
+                        stream.cu_stream() as *mut c_void,
+                    );
+                }
+                workspace_ptr
+            }
+        };
 
         let (gate_ptr, _gate_sync) = self.gate.device_ptr_with_guard(&stream)?;
         let (up_ptr, _up_sync) = self.up.device_ptr_with_guard(&stream)?;
@@ -1382,7 +1384,7 @@ impl candle_core::CustomOp1 for FusedKQuantGated {
         builder
             .arg(&gate_address)
             .arg(&up_address)
-            .arg(workspace)
+            .arg(&quantized_address)
             .arg(&mut output)
             .arg(&input_dim)
             .arg(&output_dim)
@@ -1578,16 +1580,24 @@ impl candle_core::CustomOp1 for FusedQ8SwiGlu {
         let input = input.slice(input_start..input_end);
         let (input_ptr, _input_sync) = input.device_ptr(&stream);
         let (workspace_ptr, _workspace_sync) = workspace.device_ptr(&stream);
-        unsafe {
-            kernels::ffi::launch_mmvq_gguf_quantize_q8_1_f32(
-                input_ptr as *const c_void,
-                workspace_ptr as *mut c_void,
-                self.input_dim as i32,
-                input_dim_padded as i32,
-                1,
-                stream.cu_stream() as *mut c_void,
-            );
-        }
+        // An input whose producer already wrote its Q8_1 form skips the
+        // quantization launch.
+        let quantized_address = match published_q8_1(input_ptr, self.input_dim, 1) {
+            Some(address) => address,
+            None => {
+                unsafe {
+                    kernels::ffi::launch_mmvq_gguf_quantize_q8_1_f32(
+                        input_ptr as *const c_void,
+                        workspace_ptr as *mut c_void,
+                        self.input_dim as i32,
+                        input_dim_padded as i32,
+                        1,
+                        stream.cu_stream() as *mut c_void,
+                    );
+                }
+                workspace_ptr
+            }
+        };
 
         let (gate_ptr, _gate_sync) = self.gate.device_ptr_with_guard(&stream)?;
         let (up_ptr, _up_sync) = self.up.device_ptr_with_guard(&stream)?;
@@ -1610,7 +1620,7 @@ impl candle_core::CustomOp1 for FusedQ8SwiGlu {
         builder
             .arg(&gate_address)
             .arg(&up_address)
-            .arg(workspace)
+            .arg(&quantized_address)
             .arg(&mut output)
             .arg(&input_dim)
             .arg(&output_dim);
@@ -1900,7 +1910,6 @@ fn forward_mmq_grouped(
                 || mmq_ds_layout(weight.dtype()).is_none()
                 || mmq_qk(weight.dtype()).is_none_or(|qk| !input_dim.is_multiple_of(qk))
         })
-        || std::env::var_os("DINF_DISABLE_CUDA_GROUPED_MMQ").is_some()
     {
         return Ok(None);
     }
@@ -2079,15 +2088,7 @@ fn gated_projection(
     up: &QMatMul,
     activation: GatedActivation,
 ) -> anyhow::Result<Option<Tensor>> {
-    let activation_disabled = match activation {
-        GatedActivation::Silu => std::env::var_os("DINF_DISABLE_CUDA_SILU_MUL").is_some(),
-        GatedActivation::Gelu => std::env::var_os("DINF_DISABLE_CUDA_GELU_MUL").is_some(),
-    };
-    if activation_disabled
-        || !input.device().is_cuda()
-        || input.dtype() != DType::F32
-        || !input.is_contiguous()
-    {
+    if !input.device().is_cuda() || input.dtype() != DType::F32 || !input.is_contiguous() {
         return Ok(None);
     }
     let input_dim = input.dim(candle_core::D::Minus1)?;
@@ -2105,7 +2106,6 @@ fn gated_projection(
     let dtype = gate.dtype();
     if up.dtype() != dtype
         || fused_gated_kernel(dtype).is_none()
-        || fusion_disabled(dtype)
         || matches!(activation, GatedActivation::Gelu) && dtype == GgmlDType::Q8_0
         || gate_rows == 0
         || gate_rows > i32::MAX as usize
@@ -2161,9 +2161,7 @@ pub(super) fn indexed_silu_gate_up(
     output_dim: usize,
     input_dim: usize,
 ) -> anyhow::Result<Option<Tensor>> {
-    if std::env::var_os("DINF_DISABLE_CUDA_KQUANT_FUSION").is_some()
-        || std::env::var_os("DINF_DISABLE_CUDA_SILU_MUL").is_some()
-        || !input.device().is_cuda()
+    if !input.device().is_cuda()
         || input.dtype() != DType::F32
         || expert_ids.dtype() != DType::U32
         || !input.is_contiguous()
@@ -2225,9 +2223,7 @@ pub(super) fn silu_mul_down(
     up: &Tensor,
     down: &QMatMul,
 ) -> anyhow::Result<Option<Tensor>> {
-    if std::env::var_os("DINF_DISABLE_CUDA_SILU_DOWN").is_some()
-        || std::env::var_os("DINF_DISABLE_CUDA_SILU_MUL").is_some()
-        || !gate.device().is_cuda()
+    if !gate.device().is_cuda()
         || gate.dtype() != DType::F32
         || up.dtype() != DType::F32
         || gate.shape() != up.shape()
@@ -2273,11 +2269,7 @@ pub(super) fn silu_mul_down(
 
 /// Compute ReLU-squared, quantize it to Q8_1, and run a decode down projection.
 pub(super) fn relu_squared_down(input: &Tensor, down: &QMatMul) -> anyhow::Result<Option<Tensor>> {
-    if std::env::var_os("DINF_DISABLE_CUDA_RELU_SQUARED_DOWN").is_some()
-        || !input.device().is_cuda()
-        || input.dtype() != DType::F32
-        || !input.is_contiguous()
-    {
+    if !input.device().is_cuda() || input.dtype() != DType::F32 || !input.is_contiguous() {
         return Ok(None);
     }
     let input_dim = input.dim(candle_core::D::Minus1)?;
@@ -2356,8 +2348,7 @@ fn forward_impl(
     weights: &[&QMatMul],
     qkv_epilogue: Option<QkvDecodeEpilogue>,
 ) -> anyhow::Result<Option<Vec<Tensor>>> {
-    if std::env::var_os("DINF_DISABLE_CUDA_GROUPED_QMATMUL").is_some()
-        || !input.device().is_cuda()
+    if !input.device().is_cuda()
         || !matches!(input.dtype(), DType::F16 | DType::F32)
         || weights.is_empty()
     {

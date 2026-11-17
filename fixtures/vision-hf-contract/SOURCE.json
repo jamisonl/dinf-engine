@@ -27,61 +27,12 @@
     "llama.cpp": "b8920 / 15fa3c493bfcd040b5f4dcb29e1c998a0846de16",
     "ggml": "0.10.0"
   },
-  "observed_runtime_pins": [
-    {
-      "name": "libmtmd.0.0.8920.dylib",
-      "sha256": "20372260b350fc1a8f9b7b8b88cfff5ed558b166ac63f5e081656daf564fb83c",
-      "size_bytes": 898768
-    },
-    {
-      "name": "libggml.0.10.0.dylib",
-      "sha256": "681e21748654d5400107edd2b7b6fe0071952314fd9ccd94052fdf2df3021d9b",
-      "size_bytes": 77936
-    },
-    {
-      "name": "libggml-base.0.10.0.dylib",
-      "sha256": "54424d67d0d1ce3f685f5f6a179a6340316dd2c1f76bb39eecef0acdd037fc73",
-      "size_bytes": 499808
-    },
-    {
-      "name": "libggml-blas.so",
-      "sha256": "3ea3ba3453656dc990a22b5eb9a38f538b089df1f0aaf1eefa6fec0053661dcb",
-      "size_bytes": 58752
-    },
-    {
-      "name": "libggml-cpu-apple_m4.so",
-      "sha256": "ef94935f27f98d5ead3c65a61dff0f2730713c62acc2ab607b5f970d6c86e699",
-      "size_bytes": 548848
-    },
-    {
-      "name": "libggml-cpu-apple_m2_m3.so",
-      "sha256": "20e07e79c56c55a33ca45965a32c83b549a3cb920217d680190557c2b3bca1ad",
-      "size_bytes": 548864
-    },
-    {
-      "name": "libggml-cpu-apple_m1.so",
-      "sha256": "acf353abfc8cf9ba77b68fa7655070fcda384ce4eecf6babbb0ef7fc74f6fe2b",
-      "size_bytes": 532432
-    },
-    {
-      "name": "libggml-metal.so",
-      "sha256": "798980cb0c635d0c63737005bfe8aed85cd2ff0299d98dc8f10afe911b8968de",
-      "size_bytes": 806256
-    },
-    {
-      "name": "libllama.0.0.8920.dylib",
-      "sha256": "aa15156d7b89a5fb2d58d230c11fb0d8f5b6ad497ba22d11b7bbe0713ad53e61",
-      "size_bytes": 2180464
-    }
-  ],
   "producer_source_sha256": "09a77ce6a16a9a1ecd15cf05bd718296bfa9690365c5187931d37cded502a8a7",
   "fixture_rgb_sha256": {
     "64": "30782b3b60a49a004cb918c0a651ff7d7a65a588b5cbfadacae3bed94a86a129",
     "256": "7c11746547bef08703076d8edcad7d35bd5c8b73df75252833ea80701562d329",
     "768": "f081b102996eedb840ef25294057cbd71a77de272d36c5a6030e1b8311580b07"
   },
-  "patch_dry_run_and_patched_source_hash_check": "passed",
-  "model_runs": 0,
   "hf_contract_sources": [
     {
       "url": "https://raw.githubusercontent.com/huggingface/transformers/d203390173fc074638e2268c6becd140fca5d92b/src/transformers/models/qwen3_5/modeling_qwen3_5.py",

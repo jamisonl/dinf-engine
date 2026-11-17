@@ -106,7 +106,7 @@ pub(super) fn compare<M: HcBenchmark>(
     kind: Fusion,
 ) -> Result<()> {
     anyhow::ensure!(
-        std::env::var_os("DINF_PROFILE_LAYERS").is_none(),
+        !super::profiling::layer_profiling_enabled(),
         "disable synchronized profiling for throughput measurements"
     );
     let family = model.family().to_owned();

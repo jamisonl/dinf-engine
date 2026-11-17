@@ -180,7 +180,7 @@ fn ptx() -> candle_core::Result<&'static str> {
 }
 
 pub(super) fn precompile(device: &Device) -> anyhow::Result<()> {
-    if !device.is_cuda() || std::env::var_os("DINF_DISABLE_CUDA_QKV_EPILOGUE").is_some() {
+    if !device.is_cuda() {
         return Ok(());
     }
     let device = device.as_cuda_device()?;
@@ -223,12 +223,7 @@ impl QkvDecodeEpilogue {
         head_dim: usize,
         allow_f16_output: bool,
     ) -> anyhow::Result<Option<Self>> {
-        if std::env::var_os("DINF_DISABLE_CUDA_QKV_EPILOGUE").is_some()
-            || num_heads == 0
-            || num_kv_heads == 0
-            || head_dim == 0
-            || !head_dim.is_multiple_of(2)
-        {
+        if num_heads == 0 || num_kv_heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(2) {
             return Ok(None);
         }
 
@@ -279,8 +274,6 @@ impl QkvDecodeEpilogue {
         }
 
         let output_f16 = allow_f16_output
-            && std::env::var_os("DINF_DISABLE_CUDA_QKV_F16_EPILOGUE").is_none()
-            && std::env::var_os("DINF_DISABLE_CUDA_FLASH_ATTN").is_none()
             && head_dim <= 512
             && head_dim.is_multiple_of(8)
             && num_heads.is_multiple_of(num_kv_heads)

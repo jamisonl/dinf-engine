@@ -1373,7 +1373,7 @@ static EPILOGUE_PIPELINES: OnceLock<Mutex<HashMap<(DeviceId, &'static str), Comp
 static COMPACT_MOE_LIBRARIES: OnceLock<Mutex<HashMap<DeviceId, Library>>> = OnceLock::new();
 static COMPACT_MOE_PIPELINES: OnceLock<Mutex<HashMap<(DeviceId, &'static str), ComputePipeline>>> =
     OnceLock::new();
-type Metal4IndexedQ4PipelineKey = (DeviceId, GgmlDType, bool, bool, usize, bool, bool);
+type Metal4IndexedQ4PipelineKey = (DeviceId, GgmlDType, usize, bool, bool);
 type Metal4IndexedQ4PipelineCache = Mutex<HashMap<Metal4IndexedQ4PipelineKey, ComputePipeline>>;
 
 static METAL4_INDEXED_Q4_PIPELINES: OnceLock<Metal4IndexedQ4PipelineCache> = OnceLock::new();
@@ -1389,23 +1389,13 @@ fn supports_metal4_indexed_moe(device: &candle_core::MetalDevice) -> bool {
 fn metal4_indexed_q4_enabled(device: &candle_core::MetalDevice, dtype: GgmlDType) -> bool {
     supports_metal4_indexed_moe(device)
         && (matches!(dtype, GgmlDType::Q4_0 | GgmlDType::Q4_1)
-            || (metal4_indexed_half_input(dtype)
-                && std::env::var_os("DINF_DISABLE_METAL4_INDEXED_HALF_INPUT").is_none())
+            || metal4_indexed_half_input(dtype)
             || (cfg!(test) && dtype == GgmlDType::F16))
-        && std::env::var_os("DINF_DISABLE_METAL4_INDEXED_MOE").is_none()
-        && (dtype != GgmlDType::Q4_1
-            || std::env::var_os("DINF_DISABLE_METAL4_INDEXED_Q4_1").is_none())
 }
 
-/// Half-input tiles: 128 rows of 32 routes, or 64 rows of 64 routes
-/// (`DINF_INDEXED_MOE_HALF_ROUTE_TILE=64`). 256 rows exceed threadgroup memory.
-fn metal4_indexed_half_input_tile_rows(_batch: usize) -> usize {
-    if std::env::var("DINF_INDEXED_MOE_HALF_ROUTE_TILE").as_deref() == Ok("64") {
-        64
-    } else {
-        128
-    }
-}
+/// Half-input tiles hold 128 rows of 32 routes. 256 rows exceed threadgroup
+/// memory.
+const METAL4_INDEXED_HALF_INPUT_TILE_ROWS: usize = 128;
 
 /// Expert types whose Metal 4 kernel stages activations through half.
 fn metal4_indexed_half_input(dtype: GgmlDType) -> bool {
@@ -1416,17 +1406,7 @@ fn metal4_indexed_half_input(dtype: GgmlDType) -> bool {
 }
 
 fn metal4_indexed_q4_tile_rows(batch: usize) -> usize {
-    match std::env::var("DINF_INDEXED_MOE_TILE_ROWS").as_deref() {
-        Ok("64") => 64,
-        Ok("128") => 128,
-        Ok("256") => 256,
-        _ if batch >= 256 => 256,
-        _ => 128,
-    }
-}
-
-fn metal4_indexed_q4_route_offsets_enabled() -> bool {
-    std::env::var_os("DINF_DISABLE_INDEXED_MOE_ROUTE_OFFSETS").is_none()
+    if batch >= 256 { 256 } else { 128 }
 }
 
 fn metal4_indexed_q4_pipeline(
@@ -1470,40 +1450,16 @@ fn metal4_indexed_pipeline(
     geglu_rows: bool,
 ) -> Result<ComputePipeline> {
     let pipelines = METAL4_INDEXED_Q4_PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
-    let use_packed_dequant = std::env::var_os("DINF_DISABLE_PACKED_Q4_DEQUANT").is_none();
-    let use_route_offsets = metal4_indexed_q4_route_offsets_enabled();
-    let key = (
-        device.id(),
-        dtype,
-        use_packed_dequant,
-        use_route_offsets,
-        tile_rows,
-        gate_up,
-        geglu_rows,
-    );
+    let key = (device.id(), dtype, tile_rows, gate_up, geglu_rows);
     if let Some(pipeline) = pipelines.lock().unwrap().get(&key) {
         return Ok(pipeline.clone());
     }
-    let legacy = if use_packed_dequant {
-        ""
-    } else {
-        "#define DINF_LEGACY_Q4_DEQUANT 1\n"
-    };
     let tile_geometry = match tile_rows {
         256 => "#define DINF_TILE_ROWS_256 1\n",
         128 => "#define DINF_TILE_ROWS_128 1\n",
         _ => "",
     };
-    let route_tile = if tile_rows == 64 && metal4_indexed_half_input(dtype) {
-        "#define DINF_ROUTE_TILE 64\n"
-    } else {
-        ""
-    };
-    let route_offsets = if use_route_offsets {
-        "#define DINF_PRECOMPUTE_ROUTE_OFFSETS 1\n"
-    } else {
-        ""
-    };
+    let route_offsets = "#define DINF_PRECOMPUTE_ROUTE_OFFSETS 1\n";
     let gate_up_define = match (gate_up, geglu_rows) {
         (true, _) => "#define DINF_GATE_UP 1\n",
         (false, true) => "#define DINF_GEGLU_ROWS 1\n",
@@ -1517,42 +1473,40 @@ fn metal4_indexed_pipeline(
             "dinf_metal4_indexed_f16",
         ),
         GgmlDType::Q4_0 => (
-            format!("{legacy}{tile_geometry}{route_offsets}{METAL4_INDEXED_Q4_MSL}"),
+            format!("{tile_geometry}{route_offsets}{METAL4_INDEXED_Q4_MSL}"),
             "dinf_metal4_indexed_q4_0",
         ),
         GgmlDType::Q4_1 => (
-            format!(
-                "{legacy}{tile_geometry}{route_offsets}#define DINF_Q4_1 1\n{METAL4_INDEXED_Q4_MSL}"
-            ),
+            format!("{tile_geometry}{route_offsets}#define DINF_Q4_1 1\n{METAL4_INDEXED_Q4_MSL}"),
             "dinf_metal4_indexed_q4_1",
         ),
         GgmlDType::Q8_0 => (
             format!(
-                "{gate_up_define}{tile_geometry}{route_offsets}{route_tile}#define DINF_HALF_INPUT 1\n#define DINF_Q8_0 1\n{METAL4_INDEXED_Q4_MSL}"
+                "{gate_up_define}{tile_geometry}{route_offsets}#define DINF_HALF_INPUT 1\n#define DINF_Q8_0 1\n{METAL4_INDEXED_Q4_MSL}"
             ),
             "dinf_metal4_indexed_q8_0",
         ),
         GgmlDType::Q5_1 => (
             format!(
-                "{gate_up_define}{tile_geometry}{route_offsets}{route_tile}#define DINF_HALF_INPUT 1\n#define DINF_Q5_1 1\n{METAL4_INDEXED_Q4_MSL}"
+                "{gate_up_define}{tile_geometry}{route_offsets}#define DINF_HALF_INPUT 1\n#define DINF_Q5_1 1\n{METAL4_INDEXED_Q4_MSL}"
             ),
             "dinf_metal4_indexed_q5_1",
         ),
         GgmlDType::Q4K => (
             format!(
-                "{gate_up_define}{tile_geometry}{route_offsets}{route_tile}#define DINF_HALF_INPUT 1\n#define DINF_Q4_K 1\n{METAL4_INDEXED_Q4_MSL}"
+                "{gate_up_define}{tile_geometry}{route_offsets}#define DINF_HALF_INPUT 1\n#define DINF_Q4_K 1\n{METAL4_INDEXED_Q4_MSL}"
             ),
             "dinf_metal4_indexed_q4_K",
         ),
         GgmlDType::Q5K => (
             format!(
-                "{gate_up_define}{tile_geometry}{route_offsets}{route_tile}#define DINF_HALF_INPUT 1\n#define DINF_Q5_K 1\n{METAL4_INDEXED_Q4_MSL}"
+                "{gate_up_define}{tile_geometry}{route_offsets}#define DINF_HALF_INPUT 1\n#define DINF_Q5_K 1\n{METAL4_INDEXED_Q4_MSL}"
             ),
             "dinf_metal4_indexed_q5_K",
         ),
         GgmlDType::Q6K => (
             format!(
-                "{gate_up_define}{tile_geometry}{route_offsets}{route_tile}#define DINF_HALF_INPUT 1\n#define DINF_Q6_K 1\n{METAL4_INDEXED_Q4_MSL}"
+                "{gate_up_define}{tile_geometry}{route_offsets}#define DINF_HALF_INPUT 1\n#define DINF_Q6_K 1\n{METAL4_INDEXED_Q4_MSL}"
             ),
             "dinf_metal4_indexed_q6_K",
         ),
@@ -1667,8 +1621,7 @@ fn dispatch_compact_routes(
     top_k: usize,
 ) -> Result<()> {
     let routes = checked_product(batch, top_k, "compact MoE route count")?;
-    let use_atomic =
-        routes >= 64 && std::env::var_os("DINF_DISABLE_ATOMIC_MOE_ROUTE_COMPACTION").is_none();
+    let use_atomic = routes >= 64;
     let name = if use_atomic {
         "dinf_compact_moe_routes_atomic"
     } else {
@@ -2445,7 +2398,7 @@ pub(super) struct MetalIndexedMoeMatMul {
 
 impl MetalIndexedMoeMatMul {
     pub(super) fn supports_dtype(dtype: GgmlDType) -> bool {
-        mm_kernel_name(dtype).is_ok()
+        compact_mm_kernel_name(dtype).is_ok()
     }
 
     pub(super) fn num_experts(&self) -> usize {
@@ -2468,7 +2421,7 @@ impl MetalIndexedMoeMatMul {
                 packed.shape()
             )
         }
-        mm_kernel_name(packed.dtype())?;
+        compact_mm_kernel_name(packed.dtype())?;
         if !in_dim.is_multiple_of(packed.dtype().block_size()) {
             candle_core::bail!("packed expert input dimension is not quantization aligned")
         }
@@ -2491,23 +2444,21 @@ impl MetalIndexedMoeMatMul {
             candle_core::bail!("packed expert storage has {raw_len} bytes, expected {expected}")
         }
         let weights = Tensor::from_vec(raw, raw_len, device)?;
-        if std::env::var_os("DINF_DISABLE_COMPACT_MOE_METAL").is_none() {
-            let metal = device.as_metal_device()?;
-            compact_moe_pipeline(metal, "dinf_compact_moe_routes")?;
-            compact_moe_pipeline(metal, "dinf_compact_moe_routes_atomic")?;
-            compact_moe_pipeline(metal, "dinf_build_moe_route_tiles")?;
-            compact_moe_pipeline(metal, compact_mm_kernel_name(packed.dtype())?)?;
-            if metal4_indexed_q4_enabled(metal, packed.dtype()) {
-                let rows = if metal4_indexed_half_input(packed.dtype()) {
-                    metal4_indexed_half_input_tile_rows(0)
-                } else {
-                    metal4_indexed_q4_tile_rows(0)
-                };
-                metal4_indexed_q4_pipeline(metal, packed.dtype(), rows)?;
-                METAL4_INDEXED_Q4_LOGGED.get_or_init(|| {
-                    tracing::info!("Metal 4 indexed Q4 MoE matmul enabled");
-                });
-            }
+        let metal = device.as_metal_device()?;
+        compact_moe_pipeline(metal, "dinf_compact_moe_routes")?;
+        compact_moe_pipeline(metal, "dinf_compact_moe_routes_atomic")?;
+        compact_moe_pipeline(metal, "dinf_build_moe_route_tiles")?;
+        compact_moe_pipeline(metal, compact_mm_kernel_name(packed.dtype())?)?;
+        if metal4_indexed_q4_enabled(metal, packed.dtype()) {
+            let rows = if metal4_indexed_half_input(packed.dtype()) {
+                METAL4_INDEXED_HALF_INPUT_TILE_ROWS
+            } else {
+                metal4_indexed_q4_tile_rows(0)
+            };
+            metal4_indexed_q4_pipeline(metal, packed.dtype(), rows)?;
+            METAL4_INDEXED_Q4_LOGGED.get_or_init(|| {
+                tracing::info!("Metal 4 indexed Q4 MoE matmul enabled");
+            });
         }
         Ok(Self {
             weights,
@@ -2517,9 +2468,6 @@ impl MetalIndexedMoeMatMul {
             in_dim,
             native_vector: false,
             prefer_mv: packed.dtype() != GgmlDType::Q6K
-                && std::env::var_os("DINF_DISABLE_INDEXED_MOE_MV").is_none()
-                && (packed.dtype() != GgmlDType::Q4_1
-                    || std::env::var_os("DINF_DISABLE_INDEXED_MOE_Q4_1_MV").is_none())
                 && mv_kernel_name(packed.dtype()).is_ok()
                 && mv_rows_per_threadgroup(packed.dtype())
                     .is_ok_and(|rows| out_dim.is_multiple_of(rows)),
@@ -2652,9 +2600,8 @@ impl MetalIndexedMoeMatMul {
         if self.out_dim.is_multiple_of(2)
             && metal4_indexed_half_input(self.dtype)
             && metal4_indexed_q4_enabled(device, self.dtype)
-            && metal4_indexed_half_input_tile_rows(0) == 128
         {
-            metal4_indexed_geglu_pipeline(device, self.dtype, 128)?;
+            metal4_indexed_geglu_pipeline(device, self.dtype, METAL4_INDEXED_HALF_INPUT_TILE_ROWS)?;
         }
         Ok(())
     }
@@ -2671,9 +2618,6 @@ impl MetalIndexedMoeMatMul {
         if !self.out_dim.is_multiple_of(2)
             || !metal4_indexed_half_input(self.dtype)
             || !metal4_indexed_q4_enabled(device, self.dtype)
-            || metal4_indexed_half_input_tile_rows(0) != 128
-            || std::env::var_os("DINF_DISABLE_COMPACT_MOE_METAL").is_some()
-            || std::env::var_os("DINF_DISABLE_FUSED_EXPERT_GEGLU").is_some()
         {
             return Ok(None);
         }
@@ -2721,9 +2665,6 @@ impl MetalIndexedMoeMatMul {
             || up.in_dim != self.in_dim
             || !metal4_indexed_half_input(self.dtype)
             || !metal4_indexed_q4_enabled(device, self.dtype)
-            || metal4_indexed_half_input_tile_rows(0) != 128
-            || std::env::var_os("DINF_DISABLE_COMPACT_MOE_METAL").is_some()
-            || std::env::var_os("DINF_DISABLE_FUSED_EXPERT_GATE_UP").is_some()
         {
             return Ok(None);
         }
@@ -2800,8 +2741,6 @@ impl MetalIndexedMoeMatMul {
         let (batch, _, _) = input.dims3()?;
         let uses_mv = self.native_vector || (self.prefer_mv && batch < 64);
         let can_fuse = !uses_mv
-            && std::env::var_os("DINF_DISABLE_COMPACT_MOE_METAL").is_none()
-            && std::env::var_os("DINF_DISABLE_INDEXED_MOE_RELU2_FUSION").is_none()
             && input
                 .device()
                 .as_metal_device()
@@ -2962,10 +2901,7 @@ impl CustomOp3 for IndexedMoe {
         if device.id() != weights.device().id() || device.id() != routing.device().id() {
             candle_core::bail!("indexed MoE tensors are on different Metal devices")
         }
-        let compact_enabled = std::env::var_os("DINF_DISABLE_COMPACT_MOE_METAL").is_none();
-        if self.route_plan
-            && ((self.native_vector || (self.prefer_mv && batch < 64)) || !compact_enabled)
-        {
+        if self.route_plan && (self.native_vector || (self.prefer_mv && batch < 64)) {
             candle_core::bail!("indexed MoE route plans require compact matrix dispatch")
         }
         let output = device
@@ -3082,7 +3018,7 @@ impl CustomOp3 for IndexedMoe {
                     depth: 1,
                 },
             );
-        } else if compact_enabled {
+        } else {
             let routing_offset = checked_buffer_offset(
                 routing_layout,
                 DType::U32.size_in_bytes(),
@@ -3152,62 +3088,50 @@ impl CustomOp3 for IndexedMoe {
             if use_metal4 {
                 let half_input = metal4_indexed_half_input(self.dtype);
                 let tile_rows = if half_input {
-                    metal4_indexed_half_input_tile_rows(batch)
+                    METAL4_INDEXED_HALF_INPUT_TILE_ROWS
                 } else {
                     metal4_indexed_q4_tile_rows(batch)
                 };
-                // Half-input 64-row tiles take 64 routes per tile.
-                let route_tile: usize = if half_input && tile_rows == 64 {
-                    64
-                } else {
-                    32
-                };
-                let use_tile_queue =
-                    std::env::var_os("DINF_DISABLE_COMPACT_MOE_TILE_QUEUE").is_none();
+                let route_tile: usize = 32;
                 let tile_capacity = self
                     .num_experts
                     .checked_add(total_ids.div_ceil(route_tile))
                     .ok_or_else(|| {
                         candle_core::Error::Msg("indexed MoE tile capacity overflow".into())
                     })?;
-                let tile_buffers = if use_tile_queue {
-                    let tile_count = device
-                        .new_buffer_builder()
-                        .with_size_for(1, DType::U32)
-                        .with_label("dinf-indexed-moe-tile-count")
-                        .build()?;
-                    let tile_map = device
-                        .new_buffer_builder()
-                        .with_size_for(
-                            checked_product(tile_capacity, 2, "indexed MoE tile-map size")?,
-                            DType::U32,
-                        )
-                        .with_label("dinf-indexed-moe-tile-map")
-                        .build()?;
-                    let pipeline = compact_moe_pipeline(device, "dinf_build_moe_route_tiles")?;
-                    encoder_ref.set_compute_pipeline_state(&pipeline);
-                    encoder_ref.set_input_buffer(0, Some(&expert_counts), counts_offset);
-                    encoder_ref.set_output_buffer(1, Some(&tile_count), 0);
-                    encoder_ref.set_output_buffer(2, Some(&tile_map), 0);
-                    encoder_ref.set_bytes(3, &(self.num_experts as u32));
-                    encoder_ref.set_bytes(4, &(route_tile as u32));
-                    let threads = self.num_experts.clamp(1, 256).next_multiple_of(32);
-                    encoder_ref.dispatch_thread_groups(
-                        objc2_metal::MTLSize {
-                            width: 1,
-                            height: 1,
-                            depth: 1,
-                        },
-                        objc2_metal::MTLSize {
-                            width: threads,
-                            height: 1,
-                            depth: 1,
-                        },
-                    );
-                    Some((tile_count, tile_map))
-                } else {
-                    None
-                };
+                let tile_count = device
+                    .new_buffer_builder()
+                    .with_size_for(1, DType::U32)
+                    .with_label("dinf-indexed-moe-tile-count")
+                    .build()?;
+                let tile_map = device
+                    .new_buffer_builder()
+                    .with_size_for(
+                        checked_product(tile_capacity, 2, "indexed MoE tile-map size")?,
+                        DType::U32,
+                    )
+                    .with_label("dinf-indexed-moe-tile-map")
+                    .build()?;
+                let pipeline = compact_moe_pipeline(device, "dinf_build_moe_route_tiles")?;
+                encoder_ref.set_compute_pipeline_state(&pipeline);
+                encoder_ref.set_input_buffer(0, Some(&expert_counts), counts_offset);
+                encoder_ref.set_output_buffer(1, Some(&tile_count), 0);
+                encoder_ref.set_output_buffer(2, Some(&tile_map), 0);
+                encoder_ref.set_bytes(3, &(self.num_experts as u32));
+                encoder_ref.set_bytes(4, &(route_tile as u32));
+                let threads = self.num_experts.clamp(1, 256).next_multiple_of(32);
+                encoder_ref.dispatch_thread_groups(
+                    objc2_metal::MTLSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                    objc2_metal::MTLSize {
+                        width: threads,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
                 let pipeline = if self.fused_up.is_some() {
                     metal4_indexed_gate_up_pipeline(device, self.dtype, tile_rows)?
                 } else if self.geglu_rows {
@@ -3262,19 +3186,12 @@ impl CustomOp3 for IndexedMoe {
                 encoder_ref.set_bytes(10, &weight_row_bytes_u32);
                 encoder_ref.set_bytes(11, &weight_expert_bytes_u32);
                 encoder_ref.set_bytes(12, &u32::from(self.relu_squared));
-                if let Some((tile_count, tile_map)) = tile_buffers.as_ref() {
-                    encoder_ref.set_input_buffer(13, Some(tile_count), 0);
-                    encoder_ref.set_input_buffer(14, Some(tile_map), 0);
-                } else {
-                    encoder_ref.set_input_buffer(13, Some(&expert_counts), counts_offset);
-                    encoder_ref.set_input_buffer(14, Some(&route_map), route_map_offset);
-                }
-                encoder_ref.set_bytes(15, &u32::from(use_tile_queue));
-                let route_storage = if metal4_indexed_q4_route_offsets_enabled() {
-                    checked_product(32, DType::U32.size_in_bytes(), "indexed MoE route storage")?
-                } else {
-                    0
-                };
+                encoder_ref.set_input_buffer(13, Some(&tile_count), 0);
+                encoder_ref.set_input_buffer(14, Some(&tile_map), 0);
+                // The kernels read their tiles from the queue built above.
+                encoder_ref.set_bytes(15, &1u32);
+                let route_storage =
+                    checked_product(32, DType::U32.size_in_bytes(), "indexed MoE route storage")?;
                 let tile_storage = checked_product(
                     checked_product(tile_rows, 32, "indexed MoE tile storage")?,
                     DType::F16.size_in_bytes(),
@@ -3311,17 +3228,13 @@ impl CustomOp3 for IndexedMoe {
                 encoder_ref.set_threadgroup_memory_length(0, tile_storage.max(result_storage));
                 encoder_ref.dispatch_thread_groups(
                     objc2_metal::MTLSize {
-                        width: if use_tile_queue {
-                            tile_capacity
-                        } else {
-                            batch.div_ceil(route_tile)
-                        },
+                        width: tile_capacity,
                         height: if self.geglu_rows {
                             (self.out_dim / 2).div_ceil(tile_rows / 2)
                         } else {
                             self.out_dim.div_ceil(tile_rows)
                         },
-                        depth: if use_tile_queue { 1 } else { self.num_experts },
+                        depth: 1,
                     },
                     objc2_metal::MTLSize {
                         width: tile_rows * 2,
@@ -3405,119 +3318,12 @@ impl CustomOp3 for IndexedMoe {
                     },
                 );
             }
-        } else {
-            let pipeline = device
-                .kernels()
-                .load_pipeline(
-                    device.device(),
-                    Source::Quantized,
-                    mm_kernel_name(self.dtype)?,
-                )
-                .map_err(candle_core::Error::wrap)?;
-            encoder_ref.set_compute_pipeline_state(&pipeline);
-            let weight_row_bytes = checked_product(
-                self.in_dim / self.dtype.block_size(),
-                self.dtype.type_size(),
-                "indexed MoE weight-row size",
-            )?;
-            let weight_expert_bytes =
-                checked_product(self.out_dim, weight_row_bytes, "indexed MoE expert size")?;
-            let input_element_bytes = DType::F32.size_in_bytes();
-            let ids_row_bytes = checked_product(
-                routing_layout.stride()[0],
-                DType::U32.size_in_bytes(),
-                "indexed MoE ID-row stride",
-            )?;
-            let input_row_bytes = checked_product(
-                self.in_dim,
-                input_element_bytes,
-                "indexed MoE input-row stride",
-            )?;
-            let input_batch_bytes = checked_product(
-                input_rows,
-                input_row_bytes,
-                "indexed MoE input-batch stride",
-            )?;
-            let output_row_bytes = checked_product(
-                self.out_dim,
-                DType::F32.size_in_bytes(),
-                "indexed MoE output-row stride",
-            )?;
-            let parameters = [
-                top_k as u64,
-                batch as u64,
-                ids_row_bytes as u64,
-                self.in_dim as u64,
-                self.num_experts as u64,
-                weight_row_bytes as u64,
-                weight_expert_bytes as u64,
-                input_rows as u64,
-                batch as u64,
-                1,
-                input_element_bytes as u64,
-                input_row_bytes as u64,
-                input_batch_bytes as u64,
-                self.out_dim as u64,
-                top_k as u64,
-                output_row_bytes as u64,
-            ];
-            for (index, value) in parameters.iter().enumerate() {
-                encoder_ref.set_bytes(4 + index, value);
-            }
-
-            // Top-k routing selects each expert at most once per input row, so an
-            // expert can receive no more than `batch` rows. Candle's indexed MM
-            // kernel otherwise launches for `batch * top_k` rows per expert and
-            // most threadgroups only rescan the route IDs before returning.
-            let max_rows_per_expert = batch;
-            let route_bytes = checked_product(
-                max_rows_per_expert,
-                std::mem::size_of::<[u16; 2]>(),
-                "indexed MoE threadgroup route storage",
-            )?;
-            let threadgroup_bytes = 8192usize
-                .checked_add(route_bytes)
-                .ok_or_else(|| {
-                    candle_core::Error::Msg("indexed MoE threadgroup storage overflow".into())
-                })?
-                .next_multiple_of(16);
-            encoder_ref.set_threadgroup_memory_length(0, threadgroup_bytes);
-            encoder_ref.dispatch_thread_groups(
-                objc2_metal::MTLSize {
-                    width: max_rows_per_expert.div_ceil(32),
-                    height: self.out_dim.div_ceil(64),
-                    depth: self.num_experts,
-                },
-                objc2_metal::MTLSize {
-                    width: 128,
-                    height: 1,
-                    depth: 1,
-                },
-            );
         }
 
         Ok((
             MetalStorage::new(output, device.clone(), output_elements, DType::F32),
             output_shape,
         ))
-    }
-}
-
-fn mm_kernel_name(dtype: GgmlDType) -> Result<&'static str> {
-    match dtype {
-        GgmlDType::F32 => Ok("kernel_mul_mm_id_f32_f32"),
-        GgmlDType::F16 => Ok("kernel_mul_mm_id_f16_f32"),
-        GgmlDType::Q4_0 => Ok("kernel_mul_mm_id_q4_0_f32"),
-        GgmlDType::Q4_1 => Ok("kernel_mul_mm_id_q4_1_f32"),
-        GgmlDType::Q5_0 => Ok("kernel_mul_mm_id_q5_0_f32"),
-        GgmlDType::Q5_1 => Ok("kernel_mul_mm_id_q5_1_f32"),
-        GgmlDType::Q8_0 => Ok("kernel_mul_mm_id_q8_0_f32"),
-        GgmlDType::Q2K => Ok("kernel_mul_mm_id_q2_K_f32"),
-        GgmlDType::Q3K => Ok("kernel_mul_mm_id_q3_K_f32"),
-        GgmlDType::Q4K => Ok("kernel_mul_mm_id_q4_K_f32"),
-        GgmlDType::Q5K => Ok("kernel_mul_mm_id_q5_K_f32"),
-        GgmlDType::Q6K => Ok("kernel_mul_mm_id_q6_K_f32"),
-        other => candle_core::bail!("indexed MoE does not support {other:?}"),
     }
 }
 
@@ -3535,7 +3341,7 @@ fn compact_mm_kernel_name(dtype: GgmlDType) -> Result<&'static str> {
         GgmlDType::Q4K => Ok("dinf_kernel_mul_mm_id_q4_K_f32"),
         GgmlDType::Q5K => Ok("dinf_kernel_mul_mm_id_q5_K_f32"),
         GgmlDType::Q6K => Ok("dinf_kernel_mul_mm_id_q6_K_f32"),
-        other => candle_core::bail!("compact indexed MoE does not support {other:?}"),
+        other => candle_core::bail!("indexed MoE does not support {other:?}"),
     }
 }
 

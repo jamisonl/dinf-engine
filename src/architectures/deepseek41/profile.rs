@@ -1,10 +1,7 @@
 //! Prefill tile planning and opt-in, process-local diagnostics for Maya.
 //!
-//! Tile planning (`prefill_tile_plan`) and the scalar opt-out are always active.
-//! The only environment variable read here is `DINF_DEEPSEEK41_TILED_PREFILL`:
-//! setting it to exactly `0` forces scalar (one-row) prefill. It is latched on
-//! first use. All profiling and validation modes are default off and are only
-//! enabled programmatically.
+//! Tile planning (`prefill_tile_plan`) is always active. All profiling and
+//! validation modes are default off and are only enabled programmatically.
 //!
 //! Synchronized region timings add GPU fences and therefore change scheduling;
 //! they are not production throughput. HOST mode reuses the same regions without
@@ -21,9 +18,8 @@
 //! Disabled regions cost only the opt-in branch (no clock, allocation or fence).
 //! Callers must serialize enable/reset/report with model execution.
 
-use std::ffi::OsStr;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -46,12 +42,10 @@ pub const FIXED_CACHE_BYTES: usize = super::cache::FIXED_CACHE_BYTES;
 pub const DYNAMIC_BYTES_PER_TOKEN: usize = super::cache::DYNAMIC_BYTES_PER_TOKEN;
 static PREFILL_TILE: AtomicU64 = AtomicU64::new(DEFAULT_PREFILL_TILE as u64);
 static PREFILL_PLANNER_LIMIT: AtomicU64 = AtomicU64::new(FIXED_CACHE_BYTES as u64);
-static SCALAR_PREFILL_OPT_OUT: OnceLock<bool> = OnceLock::new();
 static TILE_VALIDATION: AtomicBool = AtomicBool::new(false);
 
 /// Request scalar through MAX_PREFILL_TILE; reject invalid sizes without mutation.
-/// Serialize changes between requests. The scalar environment opt-out wins over
-/// all operator requests; otherwise effective size may be smaller for memory.
+/// Serialize changes between requests. Effective size may be smaller for memory.
 pub fn set_prefill_tile(size: usize) -> Result<()> {
     anyhow::ensure!(
         (1..=MAX_PREFILL_TILE).contains(&size),
@@ -61,7 +55,7 @@ pub fn set_prefill_tile(size: usize) -> Result<()> {
     Ok(())
 }
 
-/// Raw operator request, before the environment policy. Capture this for restore.
+/// Raw operator request. Capture this for restore.
 pub fn requested_prefill_tile() -> usize {
     PREFILL_TILE.load(Ordering::Relaxed) as usize
 }
@@ -106,28 +100,9 @@ impl Drop for PrefillGuard {
     }
 }
 
-/// Only exact OS-string "0" disables tiling; missing/non-Unicode values do not.
-/// Pure policy parser: no process environment mutation or device initialization.
-pub fn scalar_prefill_opt_out(value: Option<&OsStr>) -> bool {
-    value == Some(OsStr::new("0"))
-}
-
-/// Read-only production opt-out, latched on first use; configure before startup.
-/// No repeated environment reads/allocations, logs, clocks or fences per forward.
-pub fn scalar_prefill_opt_out_enabled() -> bool {
-    *SCALAR_PREFILL_OPT_OUT.get_or_init(|| {
-        scalar_prefill_opt_out(std::env::var_os("DINF_DEEPSEEK41_TILED_PREFILL").as_deref())
-    })
-}
-
-/// Environment-effective request, NOT the adaptive effective size of a forward.
-/// Exact DINF_DEEPSEEK41_TILED_PREFILL=0 forces scalar even after operator overrides.
+/// Requested tile, NOT the adaptive effective size of a forward.
 pub fn prefill_tile() -> usize {
-    if scalar_prefill_opt_out_enabled() {
-        1
-    } else {
-        requested_prefill_tile()
-    }
+    requested_prefill_tile()
 }
 
 /// Static rounded allowances; retained tile tensors enforce these against actual
@@ -348,7 +323,7 @@ pub(super) fn prefill_tile_plan_with_limit(
         effective -= 1;
     }
     let reason = if requested == 1 {
-        "scalar_requested_or_environment_opt_out"
+        "scalar_requested"
     } else if count == 1 {
         "single_token_decode_or_tail"
     } else if effective == 1 {
@@ -510,7 +485,7 @@ pub fn prefill_tile_evidence() -> Value {
     json!({"requested": prefill_tile(), "raw_requested": requested_prefill_tile(),
         "default_tile": DEFAULT_PREFILL_TILE,
         "max_tile": MAX_PREFILL_TILE, "planner_limit_bytes": prefill_planner_limit(),
-        "scalar_environment_opt_out": scalar_prefill_opt_out_enabled(), "forwards": s.forwards,
+        "forwards": s.forwards,
         "tiled_forwards": s.tiled_forwards, "tiled_rows": s.tiled_rows,
         "scalar_rows": s.scalar_rows, "planned_router_readbacks": s.router_readbacks,
         "max_effective": s.max_effective, "min_prefill_effective": s.min_prefill_effective,
@@ -1010,7 +985,7 @@ pub fn set_cache_diagnostics_enabled(enabled: bool) {
 /// Bounded same-load native token/logit replay passed; not universal certification.
 /// Operator MUST serialize changes between requests; no weight/cache reset,
 /// environment mutation or fence.
-/// DINF_DEEPSEEK4_SIMD opt-out always overrides this requested mode.
+/// Devices without the native SIMD kernels always override this requested mode.
 pub fn set_grouped_iq1_enabled(enabled: bool) {
     GROUPED_IQ1.store(enabled, Ordering::Relaxed);
 }
@@ -1020,7 +995,7 @@ pub fn grouped_iq1_enabled() -> bool {
     GROUPED_IQ1.load(Ordering::Relaxed)
 }
 
-/// Existing native SIMD policy, including DINF_DEEPSEEK4_SIMD opt-out.
+/// Existing native SIMD policy (Apple Silicon Metal only).
 pub fn grouped_iq1_simd_enabled() -> bool {
     super::Linear::iq1_simd_enabled()
 }
@@ -1138,7 +1113,7 @@ pub fn report() -> Value {
         "enabled": ENABLED.load(Ordering::Relaxed), "regions": regions,
         "prefill_tile_control": {
             "default_tile": DEFAULT_PREFILL_TILE, "raw_requested": requested_prefill_tile(),
-            "requested": prefill_tile(), "scalar_environment_opt_out": scalar_prefill_opt_out_enabled(),
+            "requested": prefill_tile(),
         },
         "warning": "synchronized diagnostic timings alter scheduling, not production throughput",
         "scope": "whole request including story prefill; scalar native regions; attention project/cache/attend/output combined",

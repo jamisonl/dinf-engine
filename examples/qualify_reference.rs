@@ -7,6 +7,13 @@
 //! Optional `teacher_forcing_tokens` selects the history independently of each
 //! row's recorded argmax. An optional final CLI path writes actual F32LE rows
 //! with create_new and flushes each row, including when comparison later fails.
+//! Optional `second_reference_logits_file` names logits for the same rows from
+//! a second run of the reference implementation, for example its other
+//! backend. Some models are sensitive enough that two backends of the same
+//! implementation differ by more than the fixed limits. With a second
+//! reference, a row may differ from the first reference by as much as the
+//! second one does, and the mean by as much as the second one's mean, where
+//! that exceeds the fixed limit. The fixed limits stay the floor.
 //! DINF_QUALIFY_PREFILL_CHUNK optionally bounds engine prefill tokens per call;
 //! it must be a positive integer. The default processes the whole prompt.
 //! Optional reference `context_tokens` also sets the stage KV limit. Without
@@ -45,6 +52,10 @@ struct Reference {
     #[serde(default)]
     context_tokens: Option<usize>,
     logits_file: String,
+    #[serde(default)]
+    second_reference_logits_file: Option<String>,
+    #[serde(default)]
+    second_reference_backend: Option<String>,
     prompt_tokens: Vec<u32>,
     continuation_tokens: Vec<u32>,
     #[serde(default)]
@@ -336,6 +347,36 @@ fn compare(reference: &[f32], actual: &[f32]) -> Result<(usize, usize, f64, f64,
     ))
 }
 
+/// Fixed limits on a comparison: these are regression bounds, not proof of
+/// task accuracy.
+const MIN_ARGMAX_FRACTION: f64 = 0.95;
+const MEAN_KL_LIMIT: f64 = 0.02;
+const MAX_KL_LIMIT: f64 = 0.1;
+
+/// The mean limit and each row's limit. `spread` is each row's divergence
+/// between the reference and a second run of the same implementation; a
+/// limit rises to it and never drops below the fixed one.
+fn kl_limits(rows: usize, spread: Option<&[f64]>) -> (f64, Vec<f64>) {
+    match spread {
+        Some(spread) if !spread.is_empty() => (
+            MEAN_KL_LIMIT.max(spread.iter().sum::<f64>() / spread.len() as f64),
+            spread.iter().map(|kl| MAX_KL_LIMIT.max(*kl)).collect(),
+        ),
+        _ => (MEAN_KL_LIMIT, vec![MAX_KL_LIMIT; rows]),
+    }
+}
+
+/// Whether a comparison passes: enough matching top tokens, the mean
+/// divergence within its limit, and every row within its own.
+fn comparison_passes(matches: usize, kl: &[f64], mean_limit: f64, row_limits: &[f64]) -> bool {
+    let rows = kl.len();
+    rows > 0
+        && rows == row_limits.len()
+        && matches as f64 / rows as f64 >= MIN_ARGMAX_FRACTION
+        && kl.iter().sum::<f64>() / rows as f64 <= mean_limit
+        && kl.iter().zip(row_limits).all(|(kl, limit)| kl <= limit)
+}
+
 fn sha256(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hash = Sha256::new();
@@ -386,6 +427,18 @@ fn run(
         file.get_ref().metadata()?.len() == expected_bytes as u64,
         "reference logits length mismatch"
     );
+    let mut second_file = match &reference.second_reference_logits_file {
+        Some(name) => {
+            let path = reference_path.parent().unwrap_or(Path::new(".")).join(name);
+            let file = BufReader::new(File::open(path)?);
+            ensure!(
+                file.get_ref().metadata()?.len() == expected_bytes as u64,
+                "second reference logits length mismatch"
+            );
+            Some(file)
+        }
+        None => None,
+    };
     let chunk_env = match std::env::var("DINF_QUALIFY_PREFILL_CHUNK") {
         Ok(value) => Some(value),
         Err(std::env::VarError::NotPresent) => None,
@@ -397,6 +450,8 @@ fn run(
         "cpu" => Device::Cpu,
         #[cfg(target_os = "macos")]
         "metal" => Device::new_metal(0)?,
+        #[cfg(feature = "cuda")]
+        "cuda" => Device::new_cuda(0)?,
         _ => anyhow::bail!("backend is unavailable"),
     };
     let mut stage = PipelineStage::from_gguf(
@@ -405,15 +460,26 @@ fn run(
         &device,
         None,
     )?;
+    // DINF_CUDA_GRAPH_DECODE=0 issues CUDA decode launches one by one
+    // instead of as captured graphs, which is the default.
+    if std::env::var_os("DINF_CUDA_GRAPH_DECODE").is_some_and(|value| value == "0") {
+        let mut options = stage.options().clone();
+        options.cuda_graph_decode = false;
+        stage.set_options(options)?;
+    }
     if let Some(limit) = reference.context_tokens {
         stage.set_max_kv_tokens(limit);
     }
     let chunk_size = prefill_chunk.unwrap_or(reference.prompt_tokens.len());
     let context = TextRequestContext::new(reference.prompt_tokens.len())?;
-    stage.prepare_text_request(context);
+    // A session, as generation uses, so the comparison covers the same decode
+    // path, including graph-captured steps when they are enabled.
+    let mut session = stage.new_session_state();
+    stage.prepare_text_request_with_session(&mut session, context)?;
     let mut prefill_output = None;
     for (index, tokens) in reference.prompt_tokens.chunks(chunk_size).enumerate() {
-        prefill_output = Some(stage.prefill_text(
+        prefill_output = Some(stage.prefill_text_with_session(
+            &mut session,
             StageInput::Tokens(tokens.to_vec()),
             tokens.len(),
             index * chunk_size,
@@ -424,8 +490,8 @@ fn run(
     let mut results = Vec::new();
     let mut bytes = vec![0; row_bytes];
     let mut matches = 0;
-    let mut sum_kl = 0.0;
-    let mut max_kl: f64 = 0.0;
+    let mut row_kl = Vec::new();
+    let mut spread = Vec::new();
     for (row, &token) in reference.continuation_tokens.iter().enumerate() {
         let StageOutput::Logits(tensor) = output else {
             anyhow::bail!("expected logits")
@@ -454,13 +520,25 @@ fn run(
             "reference token does not match its logits at row {row}"
         );
         matches += usize::from(reference_top == actual_top);
-        sum_kl += kl;
-        max_kl = max_kl.max(kl);
-        results.push(json!({"row": row, "reference_top": reference_top, "actual_top": actual_top, "kl": kl, "max_abs": max_abs, "rms": rms}));
+        row_kl.push(kl);
+        let mut result = json!({"row": row, "reference_top": reference_top, "actual_top": actual_top, "kl": kl, "max_abs": max_abs, "rms": rms});
+        if let Some(second_file) = second_file.as_mut() {
+            second_file.read_exact(&mut bytes)?;
+            let second: Vec<_> = bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            let (_, second_top, second_kl, _, _) = compare(&expected, &second)?;
+            spread.push(second_kl);
+            result["second_reference_top"] = json!(second_top);
+            result["second_reference_kl"] = json!(second_kl);
+        }
+        results.push(result);
         if row + 1 == reference.continuation_tokens.len() {
             break;
         }
-        output = stage.forward_text(
+        output = stage.forward_text_with_session(
+            &mut session,
             StageInput::Tokens(vec![teacher[row]]),
             1,
             reference.prompt_tokens.len() + row,
@@ -468,10 +546,29 @@ fn run(
         )?;
     }
     let rows = results.len();
-    let mean_kl = sum_kl / rows as f64;
-    // Match the selected-model distribution gates used by qualify_kv. These are
-    // regression bounds, not proof of task accuracy or universal model support.
-    let passed = matches as f64 / rows as f64 >= 0.95 && mean_kl <= 0.02 && max_kl <= 0.1;
+    let mean_kl = row_kl.iter().sum::<f64>() / rows as f64;
+    let max_kl = row_kl.iter().copied().fold(0.0, f64::max);
+    let spread = second_file.is_some().then_some(spread);
+    let (mean_limit, row_limits) = kl_limits(rows, spread.as_deref());
+    for (result, limit) in results.iter_mut().zip(&row_limits) {
+        result["kl_limit"] = json!(limit);
+    }
+    let second_reference = spread.as_ref().map(|spread| {
+        json!({
+            "logits_file": reference.second_reference_logits_file,
+            "backend": reference.second_reference_backend,
+            "mean_kl": spread.iter().sum::<f64>() / spread.len().max(1) as f64,
+            "max_kl": spread.iter().copied().fold(0.0, f64::max),
+        })
+    });
+    #[cfg(feature = "cuda")]
+    let graph_steps = stage.cuda_graph_decode_stats().steps;
+    #[cfg(not(feature = "cuda"))]
+    let graph_steps = 0u64;
+    // The fixed limits match the selected-model distribution gates used by
+    // qualify_kv. These are regression bounds, not proof of task accuracy or
+    // universal model support.
+    let passed = comparison_passes(matches, &row_kl, mean_limit, &row_limits);
     println!(
         "{}",
         json!({"passed": passed, "backend": backend, "source": reference.source,
@@ -482,8 +579,11 @@ fn run(
         "teacher_forcing_tokens": reference.teacher_forcing_tokens,
         "actual_logits_file": actual_logits_path.map(|path| path.display().to_string()),
         "prefill_chunk_tokens": prefill_chunk,
+        "cuda_graph_decode_steps": graph_steps,
         "rows": rows, "matching_argmax": matches, "mean_kl": mean_kl, "max_kl": max_kl,
-        "limits": {"min_argmax_fraction": 0.95, "mean_kl": 0.02, "max_kl": 0.1}, "comparisons": results})
+        "limits": {"min_argmax_fraction": MIN_ARGMAX_FRACTION, "mean_kl": mean_limit,
+            "max_kl": MAX_KL_LIMIT, "max_kl_is_per_row": spread.is_some()},
+        "second_reference": second_reference, "comparisons": results})
     );
     ensure!(passed, "reference comparison failed");
     Ok(())
@@ -491,12 +591,14 @@ fn run(
 
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() == 2 && args[0] == "--emit-prompt" {
+    if (2..=3).contains(&args.len()) && args[0] == "--emit-prompt" {
         let tokenizer = GgufTokenizer::from_gguf(Path::new(&args[1]))?;
-        let tokens = tokenizer.encode_chat(&[(
-            "user".into(),
-            "Write a Rust function to merge two sorted slices. Include tests.".into(),
-        )])?;
+        // An optional text file replaces the built-in user message.
+        let message = match args.get(2) {
+            Some(path) => std::fs::read_to_string(path)?,
+            None => "Write a Rust function to merge two sorted slices. Include tests.".into(),
+        };
+        let tokens = tokenizer.encode_chat(&[("user".into(), message)])?;
         println!(
             "{}",
             tokens
@@ -509,7 +611,7 @@ fn main() -> Result<()> {
     }
     ensure!(
         (3..=4).contains(&args.len()),
-        "usage: qualify_reference MODEL cpu|metal REFERENCE.json [ACTUAL.f32]; or --emit-prompt MODEL"
+        "usage: qualify_reference MODEL cpu|metal|cuda REFERENCE.json [ACTUAL.f32]; or --emit-prompt MODEL [MESSAGE.txt]"
     );
     run(
         Path::new(&args[0]),
@@ -525,6 +627,71 @@ mod tests {
     use candle_core::Tensor;
     use candle_core::quantized::{GgmlDType, QTensor, gguf_file};
     use std::io::{Seek, SeekFrom, Write};
+
+    #[test]
+    fn fixed_limits_apply_without_a_second_reference() {
+        let (mean_limit, row_limits) = kl_limits(3, None);
+        assert_eq!((mean_limit, row_limits.as_slice()), (0.02, &[0.1; 3][..]));
+        assert!(comparison_passes(
+            3,
+            &[0.01, 0.02, 0.03],
+            mean_limit,
+            &row_limits
+        ));
+        // One row over the fixed row limit.
+        assert!(!comparison_passes(
+            3,
+            &[0.0, 0.0, 0.11],
+            mean_limit,
+            &row_limits
+        ));
+        // Mean over the fixed mean limit with every row inside its own.
+        assert!(!comparison_passes(
+            3,
+            &[0.03, 0.03, 0.03],
+            mean_limit,
+            &row_limits
+        ));
+        // Too few matching top tokens.
+        assert!(!comparison_passes(
+            2,
+            &[0.0, 0.0, 0.0],
+            mean_limit,
+            &row_limits
+        ));
+        assert!(!comparison_passes(0, &[], mean_limit, &[]));
+    }
+
+    #[test]
+    fn a_second_reference_raises_limits_only_where_it_differs_more() {
+        let spread = [0.001, 0.25, 0.05];
+        let (mean_limit, row_limits) = kl_limits(3, Some(&spread));
+        assert_eq!(row_limits, [0.1, 0.25, 0.1]);
+        assert!((mean_limit - (0.001 + 0.25 + 0.05) / 3.0).abs() < 1e-12);
+        // The unstable row may differ as much as the second reference does.
+        assert!(comparison_passes(
+            3,
+            &[0.0, 0.2, 0.0],
+            mean_limit,
+            &row_limits
+        ));
+        // A stable row still has the fixed limit.
+        assert!(!comparison_passes(
+            3,
+            &[0.2, 0.0, 0.0],
+            mean_limit,
+            &row_limits
+        ));
+        // Nor may the unstable row exceed the second reference.
+        assert!(!comparison_passes(
+            3,
+            &[0.0, 0.26, 0.0],
+            mean_limit,
+            &row_limits
+        ));
+        // A quiet second reference leaves the fixed limits in place.
+        assert_eq!(kl_limits(2, Some(&[0.001, 0.002])), (0.02, vec![0.1, 0.1]));
+    }
 
     fn token_reference(teacher: Option<serde_json::Value>) -> Result<Reference> {
         let mut value = json!({"source":"test","backend":"cpu","model_sha256":"0".repeat(64),

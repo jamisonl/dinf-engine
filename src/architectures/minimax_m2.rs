@@ -8,8 +8,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::qmatmul::QMatMul;
@@ -233,10 +233,6 @@ fn prompt_tail_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Resu
         .map_err(Into::into)
 }
 
-static VALIDATE_FINITE: OnceLock<bool> = OnceLock::new();
-static PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
-#[cfg(any(target_os = "macos", feature = "cuda"))]
-static GPU_ROUTING_ENABLED: OnceLock<bool> = OnceLock::new();
 static ATTN_NORM_NS: AtomicU64 = AtomicU64::new(0);
 static ATTN_NS: AtomicU64 = AtomicU64::new(0);
 static ATTN_RESIDUAL_NS: AtomicU64 = AtomicU64::new(0);
@@ -252,17 +248,8 @@ static ATTN_SDPA_NS: AtomicU64 = AtomicU64::new(0);
 static ATTN_O_PROJ_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
 
-fn finite_validation_enabled() -> bool {
-    *VALIDATE_FINITE.get_or_init(|| std::env::var_os("DINF_VALIDATE_FINITE").is_some())
-}
-
 fn layer_profile_enabled() -> bool {
-    *PROFILE_ENABLED.get_or_init(|| std::env::var_os("DINF_PROFILE_LAYERS").is_some())
-}
-
-#[cfg(any(target_os = "macos", feature = "cuda"))]
-fn gpu_routing_enabled() -> bool {
-    *GPU_ROUTING_ENABLED.get_or_init(|| std::env::var_os("DINF_DISABLE_GPU_ROUTING").is_none())
+    super::profiling::layer_profiling_enabled()
 }
 
 fn finish_profile_region(device: &Device, started: Instant, counter: &AtomicU64) -> Result<()> {
@@ -318,21 +305,6 @@ pub fn report_layer_profile() {
         ms_per_call(&ATTN_SDPA_NS),
         ms_per_call(&ATTN_O_PROJ_NS),
     );
-}
-
-fn validate_finite(tensor: &Tensor, context: &str) -> Result<()> {
-    if !finite_validation_enabled() {
-        return Ok(());
-    }
-    let values = tensor
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?;
-    anyhow::ensure!(
-        values.iter().all(|value| value.is_finite()),
-        "non-finite MiniMax tensor after {context}"
-    );
-    Ok(())
 }
 
 fn expert_input_with_m1_padding(x: &Tensor, pad_single_token: bool) -> Result<(Tensor, bool)> {
@@ -405,7 +377,6 @@ impl Attention {
     ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let matrix_tail = prefill && seq_len == 1 && x.device().is_metal();
-        validate_finite(x, "attention input")?;
         let n_rep = self.num_heads / self.num_kv_heads;
         let profile = seq_len == 1 && layer_profile_enabled();
 
@@ -455,9 +426,6 @@ impl Attention {
         if let Some(started) = started {
             finish_profile_region(x.device(), started, &ATTN_QK_NORM_NS)?;
         }
-        validate_finite(&q, "Q projection and normalization")?;
-        validate_finite(&k, "K projection and normalization")?;
-        validate_finite(&v, "V projection before layout")?;
         let (q, k, v) = if seq_len == 1 {
             (
                 q.reshape((b, self.num_heads, 1, self.head_dim))?,
@@ -466,20 +434,18 @@ impl Attention {
             )
         } else {
             #[cfg(target_os = "macos")]
-            if std::env::var_os("DINF_DISABLE_FUSED_SEPARATE_QKV_LAYOUT").is_none()
-                && let Some(layout) = super::qkv_layout_metal::try_fused_separate_qkv_layout(
-                    &q,
-                    &k,
-                    &v,
-                    super::qkv_layout_metal::QkvLayoutDimensions {
-                        batch: b,
-                        seq_len: s,
-                        num_heads: self.num_heads,
-                        num_kv_heads: self.num_kv_heads,
-                        head_dim: self.head_dim,
-                    },
-                )?
-            {
+            if let Some(layout) = super::qkv_layout_metal::try_fused_separate_qkv_layout(
+                &q,
+                &k,
+                &v,
+                super::qkv_layout_metal::QkvLayoutDimensions {
+                    batch: b,
+                    seq_len: s,
+                    num_heads: self.num_heads,
+                    num_kv_heads: self.num_kv_heads,
+                    head_dim: self.head_dim,
+                },
+            )? {
                 layout
             } else {
                 self.portable_qkv_layout(q, k, v, b, s)?
@@ -487,7 +453,6 @@ impl Attention {
             #[cfg(not(target_os = "macos"))]
             self.portable_qkv_layout(q, k, v, b, s)?
         };
-        validate_finite(&v, "V projection")?;
 
         let started = profile.then(Instant::now);
         let (q, k) = if seq_len == 1 && !matrix_tail {
@@ -580,8 +545,8 @@ impl Attention {
             finish_profile_region(x.device(), started, &ATTN_SDPA_NS)?;
         }
         #[cfg(target_os = "macos")]
-        let out = if std::env::var_os("DINF_DISABLE_FUSED_ATTENTION_OUTPUT_LAYOUT").is_none()
-            && let Some(output) = super::qkv_layout_metal::try_fused_attention_output_layout(&out)?
+        let out = if let Some(output) =
+            super::qkv_layout_metal::try_fused_attention_output_layout(&out)?
         {
             output
         } else {
@@ -599,7 +564,6 @@ impl Attention {
         if !profile
             && let Some(output) = super::dense_qmatmul_cuda::forward_one_to_f32(&out, &self.o_proj)?
         {
-            validate_finite(&output, "attention output projection")?;
             return Ok(output);
         }
         #[cfg(not(target_os = "macos"))]
@@ -616,7 +580,6 @@ impl Attention {
         if let Some(started) = started {
             finish_profile_region(x.device(), started, &ATTN_O_PROJ_NS)?;
         }
-        validate_finite(&output, "attention output projection")?;
         Ok(output)
     }
 
@@ -713,7 +676,6 @@ impl Attention {
             self.num_heads * self.head_dim,
         ))?;
         let output = self.o_proj.forward(&out)?;
-        validate_finite(&output, "ragged attention output projection")?;
         Ok(output)
     }
 }
@@ -730,13 +692,9 @@ impl MoeExpert {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (x, padded) = expert_input_with_m1_padding(x, x.device().is_metal())?;
         let gate = self.gate_proj.forward(&x)?;
-        validate_finite(&gate, "expert gate projection")?;
         let up = self.up_proj.forward(&x)?;
-        validate_finite(&up, "expert up projection")?;
         let activated = (candle_nn::Activation::Silu.forward(&gate)? * up)?;
-        validate_finite(&activated, "expert gated activation")?;
         let output = self.down_proj.forward(&activated)?;
-        validate_finite(&output, "expert down projection")?;
         if padded {
             output.narrow(D::Minus2, 0, 1).map_err(Into::into)
         } else {
@@ -788,19 +746,9 @@ impl IndexedMoeExperts {
             };
             let gate = project(&self.gate_proj, &input)?;
             let up = project(&self.up_proj, &input)?;
-            let use_fused_epilogue = std::env::var_os("DINF_DISABLE_FUSED_MOE_EPILOGUE").is_none();
-            let activated = if use_fused_epilogue {
-                silu_mul(&gate, &up)?
-            } else {
-                (candle_nn::Activation::Silu.forward(&gate)? * up)?
-            };
+            let activated = silu_mul(&gate, &up)?;
             let output = project(&self.down_proj, &activated)?;
-            validate_finite(&output, "indexed expert FFN")?;
-            outputs.push(if use_fused_epilogue {
-                weighted_route_sum(&output, &route_weights)?
-            } else {
-                output.broadcast_mul(&route_weights.unsqueeze(2)?)?.sum(1)?
-            });
+            outputs.push(weighted_route_sum(&output, &route_weights)?);
         }
         let output_refs = outputs.iter().collect::<Vec<_>>();
         Tensor::cat(&output_refs, 0).map_err(Into::into)
@@ -877,16 +825,11 @@ impl MoeLayer {
 
         #[cfg(target_os = "macos")]
         let fused_indexed_routing = match (&self.experts, &self.expert_bias) {
-            (MoeExperts::Indexed(_), Some(bias))
-                if gpu_routing_enabled()
-                    && std::env::var_os("DINF_DISABLE_FUSED_TOPK_ROUTING").is_none() =>
-            {
-                Some(fused_sigmoid_topk_route(
-                    &router_logits,
-                    bias,
-                    self.num_active,
-                )?)
-            }
+            (MoeExperts::Indexed(_), Some(bias)) => Some(fused_sigmoid_topk_route(
+                &router_logits,
+                bias,
+                self.num_active,
+            )?),
             _ => None,
         };
         #[cfg(not(target_os = "macos"))]
@@ -914,7 +857,7 @@ impl MoeLayer {
             Some(routing)
         } else {
             match &self.experts {
-                MoeExperts::Indexed(_) if gpu_routing_enabled() => {
+                MoeExperts::Indexed(_) => {
                     let selection_scores = selection_scores
                         .as_ref()
                         .context("missing MiniMax selection scores")?;
@@ -926,26 +869,10 @@ impl MoeLayer {
                         .arg_sort_last_dim(false)?
                         .narrow(D::Minus1, 0, self.num_active)?
                         .contiguous()?;
-                    let expert_weights = if std::env::var_os("DINF_DISABLE_FUSED_GPU_ROUTING")
-                        .is_none()
-                    {
-                        normalized_route_weights(router_probs, &expert_ids)?
-                    } else {
-                        let expert_weights = router_probs.gather(&expert_ids, D::Minus1)?;
-                        // Keep the same left-to-right f32 accumulation as the host
-                        // fallback. A parallel reduction changes the low bits enough
-                        // to perturb greedy decode over 62 MoE layers.
-                        let mut weight_sum = expert_weights.narrow(D::Minus1, 0, 1)?;
-                        for route in 1..self.num_active {
-                            weight_sum =
-                                (&weight_sum + expert_weights.narrow(D::Minus1, route, 1)?)?;
-                        }
-                        let weight_sum = weight_sum.clamp(6.103_515_6e-5f64, f32::MAX as f64)?;
-                        expert_weights.broadcast_div(&weight_sum)?
-                    };
+                    let expert_weights = normalized_route_weights(router_probs, &expert_ids)?;
                     Some((expert_ids, expert_weights))
                 }
-                MoeExperts::Indexed(_) | MoeExperts::Split(_) => None,
+                MoeExperts::Split(_) => None,
             }
         };
         #[cfg(not(any(target_os = "macos", feature = "cuda")))]
@@ -1007,7 +934,6 @@ impl MoeLayer {
                 let mut outputs = Vec::with_capacity(selected.len());
                 for (expert_idx, weight) in selected {
                     let expert_out = experts[expert_idx].forward(&flat_x)?;
-                    validate_finite(&expert_out, "selected expert FFN")?;
                     outputs.push((expert_out.to_dtype(DType::F32)? * weight as f64)?);
                 }
                 let output_refs = outputs.iter().collect::<Vec<_>>();
@@ -1041,7 +967,6 @@ impl MoeLayer {
                     let indices = Tensor::new(token_indices.as_slice(), x.device())?;
                     let expert_input = flat_x.index_select(&indices, 0)?;
                     let expert_out = experts[expert_idx].forward(&expert_input)?;
-                    validate_finite(&expert_out, "grouped expert FFN")?;
                     let weights = expert_assignments
                         .iter()
                         .map(|(_, _, weight)| *weight)
@@ -1761,7 +1686,7 @@ fn build_moe_layer(
             .remove(&format!("{prefix}.ffn_down_exps.weight"))
             .context("missing ffn_down_exps")?;
 
-        if layer_idx == 0 || std::env::var_os("DINF_LOG_MOE_DTYPES").is_some() {
+        if layer_idx == 0 {
             tracing::info!(
                 layer_idx,
                 gate = ?gate_exps.dtype(),

@@ -9,8 +9,8 @@
 //! explicitly enabled (the normal inference default remains F16).
 //!
 //! Metal keeps packed records on the GPU and uses native kernels for head
-//! widths up to 1024 unless `DINF_DISABLE_TURBOQUANT_METAL` is set. Larger heads,
-//! CPU, and CUDA use the portable CPU implementation. Stored-size
+//! widths up to 1024. Larger heads, CPU, and CUDA use the portable CPU
+//! implementation. Stored-size
 //! compression does not describe peak memory: attention still needs a dense
 //! reconstruction of the active layer.
 
@@ -417,7 +417,6 @@ impl QuantizedKvCache {
         {
             if k.device().is_metal()
                 && self.config.head_dim <= crate::turboquant_metal::MAX_METAL_HEAD_DIM
-                && std::env::var_os("DINF_DISABLE_TURBOQUANT_METAL").is_none()
             {
                 return self.update_metal(k, v, output_dtype, rotated);
             }
@@ -574,9 +573,7 @@ impl QuantizedKvCache {
     /// upload when this read-only diagnostic is called on a CPU-owned cache.
     #[cfg(target_os = "macos")]
     fn dequantize_all_metal(&self, device: &Device) -> Result<(Tensor, Tensor)> {
-        if self.config.head_dim > crate::turboquant_metal::MAX_METAL_HEAD_DIM
-            || std::env::var_os("DINF_DISABLE_TURBOQUANT_METAL").is_some()
-        {
+        if self.config.head_dim > crate::turboquant_metal::MAX_METAL_HEAD_DIM {
             return self.dequantize_all_cpu(device);
         }
         let uploaded;

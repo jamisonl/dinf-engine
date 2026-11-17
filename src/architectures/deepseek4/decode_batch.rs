@@ -3,10 +3,6 @@
 
 use super::*;
 
-pub(super) fn enabled(configured: Option<&std::ffi::OsStr>, apple_silicon_metal: bool) -> bool {
-    configured.map_or(apple_silicon_metal, |value| value == "1")
-}
-
 impl DeepSeek4Stage {
     pub(super) fn decode_batch(
         &self,

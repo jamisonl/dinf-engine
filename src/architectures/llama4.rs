@@ -411,20 +411,18 @@ impl Attention {
             )
         } else {
             #[cfg(target_os = "macos")]
-            if std::env::var_os("DINF_DISABLE_FUSED_SEPARATE_QKV_LAYOUT").is_none()
-                && let Some(layout) = super::qkv_layout_metal::try_fused_separate_qkv_layout(
-                    &q,
-                    &k,
-                    &v,
-                    super::qkv_layout_metal::QkvLayoutDimensions {
-                        batch: b,
-                        seq_len: s,
-                        num_heads: self.num_heads,
-                        num_kv_heads: self.num_kv_heads,
-                        head_dim: self.head_dim,
-                    },
-                )?
-            {
+            if let Some(layout) = super::qkv_layout_metal::try_fused_separate_qkv_layout(
+                &q,
+                &k,
+                &v,
+                super::qkv_layout_metal::QkvLayoutDimensions {
+                    batch: b,
+                    seq_len: s,
+                    num_heads: self.num_heads,
+                    num_kv_heads: self.num_kv_heads,
+                    head_dim: self.head_dim,
+                },
+            )? {
                 layout
             } else {
                 self.portable_qkv_layout(q, k, v, b, s)?
@@ -468,8 +466,8 @@ impl Attention {
         let out = super::restore_quantized_attention_output(out, rotation)?;
 
         #[cfg(target_os = "macos")]
-        let out = if std::env::var_os("DINF_DISABLE_FUSED_ATTENTION_OUTPUT_LAYOUT").is_none()
-            && let Some(output) = super::qkv_layout_metal::try_fused_attention_output_layout(&out)?
+        let out = if let Some(output) =
+            super::qkv_layout_metal::try_fused_attention_output_layout(&out)?
         {
             output
         } else {
@@ -687,10 +685,7 @@ impl MoeLayer {
 
         #[cfg(target_os = "macos")]
         let fused_indexed_routing = match &self.experts {
-            MoeExperts::Indexed(_)
-                if std::env::var_os("DINF_DISABLE_LLAMA4_GPU_ROUTING").is_none()
-                    && std::env::var_os("DINF_DISABLE_FUSED_SOFTMAX_ROUTING").is_none() =>
-            {
+            MoeExperts::Indexed(_) => {
                 Some(fused_llama4_topk_route(&router_logits.contiguous()?, 1)?)
             }
             _ => None,
@@ -706,7 +701,7 @@ impl MoeLayer {
             );
             let (expert_ids, weights) = if let Some(routing) = fused_indexed_routing {
                 routing
-            } else if std::env::var_os("DINF_DISABLE_LLAMA4_GPU_ROUTING").is_none() {
+            } else {
                 let expert_ids = router_logits
                     .contiguous()?
                     .arg_sort_last_dim(false)?
@@ -715,19 +710,6 @@ impl MoeLayer {
                 let selected_logits = router_logits.gather(&expert_ids, D::Minus1)?;
                 let weights = candle_nn::Activation::Sigmoid.forward(&selected_logits)?;
                 (expert_ids, weights)
-            } else {
-                let rows = router_logits.to_vec2::<f32>()?;
-                let mut ids = Vec::with_capacity(num_tokens);
-                let mut weights = Vec::with_capacity(num_tokens);
-                for row in rows {
-                    let selected = self.selected_experts(&row)?;
-                    ids.push(selected[0].0 as u32);
-                    weights.push(selected[0].1);
-                }
-                (
-                    Tensor::from_vec(ids, (num_tokens, 1), x.device())?,
-                    Tensor::from_vec(weights, (num_tokens, 1), x.device())?,
-                )
             };
             Some(experts.forward(&flat_x, &expert_ids, &weights)?)
         } else {

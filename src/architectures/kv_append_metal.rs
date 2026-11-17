@@ -417,7 +417,7 @@ fn metal_buffer(tensor: &Tensor) -> Option<candle_metal_kernels::metal::Buffer> 
 }
 
 pub(super) fn precompile(device: &candle_core::Device) -> anyhow::Result<()> {
-    if std::env::var_os("DINF_DISABLE_FUSED_METAL_KV_APPEND").is_some() || !device.is_metal() {
+    if !device.is_metal() {
         return Ok(());
     }
     let _ = pipelines(device.as_metal_device()?)?;
@@ -431,8 +431,7 @@ pub(super) fn try_cast_append_pair(
     source_v: &Tensor,
     start: usize,
 ) -> anyhow::Result<bool> {
-    if std::env::var_os("DINF_DISABLE_FUSED_METAL_KV_APPEND").is_some()
-        || !destination_k.device().is_metal()
+    if !destination_k.device().is_metal()
         || source_k.dtype() != DType::F32
         || source_v.dtype() != DType::F32
         || !destination_k.device().same_device(destination_v.device())
@@ -485,8 +484,7 @@ pub(super) fn try_cast_append_ragged_pair(
     source_v: &Tensor,
     positions: &[usize],
 ) -> anyhow::Result<bool> {
-    if std::env::var_os("DINF_DISABLE_FUSED_METAL_KV_APPEND").is_some()
-        || !destination_k.device().is_metal()
+    if !destination_k.device().is_metal()
         || source_k.dtype() != DType::F32
         || source_v.dtype() != DType::F32
         || !destination_k.device().same_device(destination_v.device())

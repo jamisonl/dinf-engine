@@ -114,8 +114,7 @@ The structural checks are split across these paths:
   Typed Qwen Q4 Metal requests may use the existing indexed vector kernels for
   actual Q4K gate/up and Q4K/Q6K down weights. The native QKV/cache and request
   guards, expert-ID checks, same-device checks and input/output extent bounds
-  still apply. `DINF_DISABLE_INDEXED_MOE_MV` declines that request policy.
-  Raw calls without a request policy keep default dispatch, including ordinary
+  still apply. Raw calls without a request policy keep default dispatch, including ordinary
   Q6 matrix dispatch; FULL/Q8 Metal types do not enter this Q4 path. Raw/default
   APIs do not claim the request-aware qualification. Arithmetic and memory
   checks alone do not establish full-model numerical qualification.
@@ -282,11 +281,13 @@ failure rule above still applies.
 2. Load the exact intended layer range and run a short deterministic prompt on
    the target backend. Compare against the CPU path or a trusted reference for
    representative prefill and single-token decode shapes.
-3. Exercise both the optimized backend path and any fallback that will be
-   enabled in production. Environment variables named `DINF_DISABLE_*` select
-   diagnostics/fallbacks; they are not a substitute for input validation.
-4. Keep diagnostic logit dumps and verbose tracing private. They can contain
-   prompts, token IDs, local paths, tensor metadata, and complete logit vectors.
+3. Exercise the backend path that production will use. The engine reads no
+   environment variables to choose kernels or fallbacks; a fallback runs only
+   where the optimized kernel's device, shape or dtype checks reject the input.
+   Runtime policy, such as speculative decoding, is set explicitly through
+   `EngineOptions`.
+4. Keep profiling output and verbose tracing private. They can contain
+   prompts, token IDs, local paths and tensor metadata.
 
 ## Backend test gates
 

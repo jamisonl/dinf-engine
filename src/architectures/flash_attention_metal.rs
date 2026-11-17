@@ -367,8 +367,7 @@ pub(super) fn try_flash_attention(
     scale: f32,
 ) -> Result<Option<Tensor>> {
     let (_, _, q_seq, dim) = q.dims4()?;
-    if std::env::var_os("DINF_DISABLE_METAL_FLASH_ATTENTION").is_some()
-        || !matches!(dim, 256 | 512)
+    if !matches!(dim, 256 | 512)
         || q_seq < 2
         || window > u32::MAX as usize
         || !super::tensor_qmatmul_metal::supports_tensor_batch_attention(q.device())?

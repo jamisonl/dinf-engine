@@ -165,7 +165,7 @@ fn argmax_groups(vocab: usize) -> usize {
 struct GreedyArgmaxFinite;
 
 pub(crate) fn precompile(device: &candle_core::Device) -> anyhow::Result<()> {
-    if device.is_metal() && std::env::var_os("DINF_DISABLE_FUSED_METAL_GREEDY").is_none() {
+    if device.is_metal() {
         pipelines(device.as_metal_device()?)?;
     }
     Ok(())
@@ -274,10 +274,7 @@ pub(crate) fn greedy_argmax(logits: &Tensor) -> anyhow::Result<u32> {
 /// `None` before any command is encoded so callers can retain their scalar
 /// sampling path without partially executing a batch.
 pub(crate) fn try_greedy_argmax_batch(logits: &[Tensor]) -> anyhow::Result<Option<Vec<u32>>> {
-    if logits.len() < 2
-        || std::env::var_os("DINF_DISABLE_FUSED_METAL_GREEDY").is_some()
-        || std::env::var_os("DINF_DISABLE_BATCHED_METAL_GREEDY").is_some()
-    {
+    if logits.len() < 2 {
         return Ok(None);
     }
     let device = logits[0].device();

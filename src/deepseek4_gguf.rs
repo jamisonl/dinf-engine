@@ -5,6 +5,8 @@
 //! `RawGgufSource` owns the validated file for bounded, positional expert/Engram
 //! reads. It never maps the file, reads dead gaps, or allocates a whole disk table.
 
+#[cfg(test)]
+use crate::verified_file::SparseSetLen;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -2039,7 +2041,7 @@ mod tests {
             verify(&pin)?;
         }
         for length in [pin.expected_bytes - 1, pin.expected_bytes + 1] {
-            file.set_len(length)?;
+            file.set_len_sparse(length)?;
             let passes = fixtures::sha_passes();
             assert!(
                 verify(&pin)
@@ -2048,7 +2050,7 @@ mod tests {
                     .contains("length mismatch")
             );
             assert_eq!(fixtures::sha_passes(), passes);
-            file.set_len(pin.expected_bytes)?;
+            file.set_len_sparse(pin.expected_bytes)?;
             file.write_at(&[37], pin.expected_bytes - 1)?;
         }
         verify(&pin)?;
@@ -2388,7 +2390,7 @@ pub(crate) mod fixtures {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(&bytes).unwrap();
         file.as_file()
-            .set_len(data.checked_add(extent).unwrap_or(data))
+            .set_len_sparse(data.checked_add(extent).unwrap_or(data))
             .unwrap();
         (file, data)
     }

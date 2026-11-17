@@ -5,6 +5,8 @@
 //! tensors and tokenizer values per layer without allowing a forged count to
 //! request an unbounded allocation.
 
+#[cfg(test)]
+use crate::verified_file::SparseSetLen;
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::fs::File;
 use std::hash::Hasher;
@@ -112,7 +114,10 @@ struct ValueBudget(u64);
 
 impl ValueBudget {
     fn charge(&mut self, values: u64) -> Result<()> {
-        self.0 = self.0.checked_add(values).context("GGUF metadata value count overflow")?;
+        self.0 = self
+            .0
+            .checked_add(values)
+            .context("GGUF metadata value count overflow")?;
         anyhow::ensure!(
             self.0 <= MAX_GGUF_METADATA_VALUES,
             "GGUF metadata values ({}) exceed application limit ({MAX_GGUF_METADATA_VALUES})",
@@ -320,8 +325,10 @@ pub(crate) fn validate_gguf_header_budget(file: &mut File) -> Result<GgufHeaderS
                     tensor_offset.is_multiple_of(alignment),
                     "unaligned DeepSeek V4.1 tensor offset"
                 );
-                spans.push((tensor_offset, tensor_end));
             }
+            // Every file: tensors must not share bytes, so the total declared
+            // tensor data cannot exceed the file size.
+            spans.push((tensor_offset, tensor_end));
         }
         spans.sort_unstable();
         for adjacent in spans.windows(2) {
@@ -352,7 +359,9 @@ pub(crate) fn validate_gguf_header_budget(file: &mut File) -> Result<GgufHeaderS
     match (result, restore) {
         (Err(error), _) => Err(error),
         (Ok(()), Err(error)) => Err(error.into()),
-        (Ok(()), Ok(_)) => Ok(GgufHeaderStats { metadata_values: values.0 }),
+        (Ok(()), Ok(_)) => Ok(GgufHeaderStats {
+            metadata_values: values.0,
+        }),
     }
 }
 
@@ -787,6 +796,15 @@ mod tests {
     use tempfile::NamedTempFile;
 
     fn v3_fixture(metadata_keys: &[&[u8]], tensor_names: &[&[u8]]) -> Vec<u8> {
+        v3_fixture_with_offset_step(metadata_keys, tensor_names, 32)
+    }
+
+    /// One-element F32 tensors placed `offset_step` bytes apart.
+    fn v3_fixture_with_offset_step(
+        metadata_keys: &[&[u8]],
+        tensor_names: &[&[u8]],
+        offset_step: u64,
+    ) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
         bytes.extend_from_slice(&3u32.to_le_bytes());
@@ -798,16 +816,17 @@ mod tests {
             bytes.extend_from_slice(&0u32.to_le_bytes()); // U8
             bytes.push(1);
         }
-        for name in tensor_names {
+        for (index, name) in tensor_names.iter().enumerate() {
             bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
             bytes.extend_from_slice(name);
             bytes.extend_from_slice(&1u32.to_le_bytes()); // one dimension
             bytes.extend_from_slice(&1u64.to_le_bytes());
             bytes.extend_from_slice(&0u32.to_le_bytes()); // F32
-            bytes.extend_from_slice(&0u64.to_le_bytes());
+            bytes.extend_from_slice(&(index as u64 * offset_step).to_le_bytes());
         }
         let aligned_header = (bytes.len() + 31) & !31;
-        bytes.resize(aligned_header + 4, 0); // one F32 tensor at offset zero
+        let last_offset = tensor_names.len().saturating_sub(1) * offset_step as usize;
+        bytes.resize(aligned_header + last_offset + 4, 0);
         bytes
     }
 
@@ -836,6 +855,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("duplicate GGUF tensor name"), "{error}");
+    }
+
+    #[test]
+    fn rejects_tensors_that_share_file_bytes() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&v3_fixture_with_offset_step(&[], &[b"first", b"second"], 0))
+            .unwrap();
+        let error = validate_gguf_header_budget(file.as_file_mut())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overlapping GGUF tensor spans"), "{error}");
     }
 
     #[test]
@@ -1033,7 +1063,7 @@ mod tests {
         let name = "per_layer_token_embd.weight";
         let (mut file, _) = sparse(&md, &[(name, &[768022850, 256], 20, 0)]);
         file.as_file()
-            .set_len(crate::gsq_coder::PARTS[5].0)
+            .set_len_sparse(crate::gsq_coder::PARTS[5].0)
             .unwrap();
         validate_gguf_header_budget(file.as_file_mut()).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
@@ -1053,7 +1083,7 @@ mod tests {
             changed.insert(key.into(), Value::U32(value));
             let (mut file, _) = sparse(&changed, &[(name, &[768022850, 256], 20, 0)]);
             file.as_file()
-                .set_len(crate::gsq_coder::PARTS[5].0)
+                .set_len_sparse(crate::gsq_coder::PARTS[5].0)
                 .unwrap();
             assert!(
                 validate_gguf_header_budget(file.as_file_mut()).is_err(),
@@ -1067,13 +1097,13 @@ mod tests {
         ] {
             let (mut file, _) = sparse(&md, &[(name, &shape, dtype, 0)]);
             file.as_file()
-                .set_len(crate::gsq_coder::PARTS[5].0)
+                .set_len_sparse(crate::gsq_coder::PARTS[5].0)
                 .unwrap();
             assert!(validate_gguf_header_budget(file.as_file_mut()).is_err());
         }
         let (mut file, _) = sparse(&md, &[(name, &[768022850, 256], 20, 0)]);
         file.as_file()
-            .set_len(crate::gsq_coder::PARTS[5].0 + 1)
+            .set_len_sparse(crate::gsq_coder::PARTS[5].0 + 1)
             .unwrap();
         assert!(validate_gguf_header_budget(file.as_file_mut()).is_err());
     }
@@ -1166,7 +1196,7 @@ mod tests {
         let (mut truncated, data) = sparse(&md, &[(name, &[384006168, 264], 24, 0)]);
         truncated
             .as_file()
-            .set_len(data + 384006168 * 264 - 1)
+            .set_len_sparse(data + 384006168 * 264 - 1)
             .unwrap();
         assert!(
             validate_gguf_header_budget(truncated.as_file_mut())

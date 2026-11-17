@@ -9,6 +9,8 @@ mod cpu_math;
 mod text_context;
 pub use text_context::{TextArithmeticPolicy, TextRequestContext};
 
+#[cfg(feature = "cuda")]
+mod decode_sdpa_cuda;
 /// DeepSeek V3/R1 multi-head latent-attention stage.
 pub mod deepseek2;
 /// DeepSeek V4 Flash stage and packed-weight support.
@@ -37,6 +39,10 @@ mod fused_norm_metal;
 mod fused_route_metal;
 /// Gemma 4 text decoder stage.
 pub mod gemma4;
+#[cfg(feature = "cuda")]
+mod gemma4_moe_decode_cuda;
+#[cfg(feature = "cuda")]
+mod gemma4_norm_fusion_cuda;
 pub mod glm5_next;
 #[cfg(target_os = "macos")]
 mod glm5_next_context_metal;
@@ -62,6 +68,8 @@ mod indexed_moe_cuda;
 mod indexed_moe_epilogue_cuda;
 #[cfg(target_os = "macos")]
 mod indexed_moe_metal;
+#[cfg(feature = "cuda")]
+mod kv_append_cuda;
 #[cfg(target_os = "macos")]
 mod kv_append_metal;
 /// Llama-family decoder stage, including Llama, Mistral, and Qwen2 layouts.
@@ -78,12 +86,18 @@ mod nemotron_mamba;
 mod nemotron_mamba_cuda;
 /// Phi-3 decoder stage.
 pub mod phi3;
+/// Process-wide layer profiling switches.
+pub mod profiling;
+#[cfg(feature = "cuda")]
+mod q8_1_epilogue_cuda;
 #[cfg(feature = "cuda")]
 mod qkv_decode_cuda;
 #[cfg(target_os = "macos")]
 mod qkv_layout_metal;
 /// Qwen 3.5 decoder stage.
 pub mod qwen35;
+#[cfg(feature = "cuda")]
+mod qwen35_decode_layout_cuda;
 #[cfg(feature = "cuda")]
 mod qwen35_deltanet_cuda;
 #[cfg(any(feature = "cuda", test))]
@@ -565,6 +579,11 @@ impl PreallocatedKvCache {
                 self.len += k_incoming;
                 return Ok(());
             }
+            #[cfg(feature = "cuda")]
+            if kv_append_cuda::try_cast_append_pair(&self.k, &self.v, k, v, append_start)? {
+                self.len += k_incoming;
+                return Ok(());
+            }
 
             let k = k.to_dtype(DType::F16)?.contiguous()?;
             let v = v.to_dtype(DType::F16)?.contiguous()?;
@@ -706,6 +725,23 @@ impl PreallocatedKvCache {
         self.capacity = capacity;
         self.allocation_lanes = k_batch;
         Ok(())
+    }
+
+    /// The caches and the sequence position at which `incoming` more rows
+    /// fit without growing the allocation, for a kernel that writes the
+    /// rows itself. Follow a successful write with [`Self::commit_append`].
+    #[cfg(feature = "cuda")]
+    pub(crate) fn append_slot(&self, incoming: usize) -> Option<(Tensor, Tensor, usize)> {
+        let start = self.start.checked_add(self.len)?;
+        (incoming > 0 && start.checked_add(incoming)? <= self.capacity)
+            .then(|| (self.k.clone(), self.v.clone(), start))
+    }
+
+    /// Count `incoming` rows written at [`Self::append_slot`].
+    #[cfg(feature = "cuda")]
+    pub(crate) fn commit_append(&mut self, incoming: usize) {
+        debug_assert!(self.start + self.len + incoming <= self.capacity);
+        self.len += incoming;
     }
 
     pub(crate) fn active_f16(&self) -> Result<(Tensor, Tensor)> {
@@ -1512,7 +1548,6 @@ pub(crate) fn prepare_quantized_attention(
     if q.device().is_metal()
         && matches!(q.dtype(), candle_core::DType::F16 | candle_core::DType::F32)
         && q.dim(2)? == 1
-        && std::env::var_os("DINF_DISABLE_TURBOQUANT_METAL").is_none()
         && let Some(config) = quant
         && config.bits() == 8
         && config.head_dim() <= crate::turboquant_metal::MAX_METAL_HEAD_DIM
@@ -1877,6 +1912,56 @@ pub fn try_fused_f16_sdpa_native(
     try_metal_f16_sdpa_native(q, k, v, causal, scale)
 }
 
+/// One-launch CUDA attention for a single query token over a native F16
+/// cache. Unlike [`try_fused_f16_sdpa_native`] it keeps the query in F32 and
+/// returns F32, so callers opt in. Returns `None` off CUDA or outside the
+/// kernel's geometry.
+pub(crate) fn try_cuda_decode_sdpa(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+) -> Result<Option<Tensor>> {
+    #[cfg(feature = "cuda")]
+    {
+        decode_sdpa_cuda::try_forward(q, k, v, scale)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (q, k, v, scale);
+        Ok(None)
+    }
+}
+
+/// [`try_cuda_decode_sdpa`] with the output multiplied by `sigmoid(gate)`,
+/// where `gate` is F32 `[batch, heads, 1, v_dim]`.
+pub(crate) fn try_cuda_decode_sdpa_gated(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    gate: &Tensor,
+    scale: f32,
+) -> Result<Option<Tensor>> {
+    #[cfg(feature = "cuda")]
+    {
+        decode_sdpa_cuda::try_forward_gated(q, k, v, Some(gate), scale)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (q, k, v, gate, scale);
+        Ok(None)
+    }
+}
+
+/// Compile the single-token CUDA attention kernel ahead of the first request.
+pub(crate) fn precompile_cuda_decode_sdpa(device: &candle_core::Device) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    decode_sdpa_cuda::precompile(device)?;
+    #[cfg(not(feature = "cuda"))]
+    let _ = device;
+    Ok(())
+}
+
 /// Use fused CUDA or Metal SDPA for causal attention limited to a left window.
 pub fn try_fused_f16_sdpa_windowed(
     q: &Tensor,
@@ -2082,8 +2167,7 @@ fn try_cuda_f16_sdpa_native_inner(
     {
         use candle_core::DType;
 
-        if std::env::var_os("DINF_DISABLE_CUDA_FLASH_ATTN").is_some()
-            || !q.device().is_cuda()
+        if !q.device().is_cuda()
             || !q.device().same_device(k.device())
             || !q.device().same_device(v.device())
             || k.dtype() != DType::F16
@@ -2276,18 +2360,13 @@ fn try_metal_f16_sdpa_native_inner(
     // kv_seq - q_seq), as cached chunked prefill needs, and skips key blocks
     // past the diagonal. A left window that reaches the first key of the
     // (possibly trimmed) cache for every query is the same causal mask, so
-    // only narrower windows and the opt-out need an explicit mask.
+    // only narrower windows need an explicit mask.
     let window_is_causal = window.is_some_and(|window| window >= geometry.kv_seq);
-    let explicit_causal_mask = std::env::var_os("DINF_DISABLE_METAL_SDPA_KERNEL_CAUSAL").is_some();
     let mask_values = match window {
-        Some(window) if !window_is_causal || explicit_causal_mask => {
+        Some(window) if !window_is_causal => {
             sliding_window_mask_values(geometry.q_seq, geometry.kv_seq, window)
         }
-        Some(_) => None,
-        None if causal && geometry.q_seq != geometry.kv_seq && explicit_causal_mask => {
-            causal_mask_values(geometry.q_seq, geometry.kv_seq)
-        }
-        None => None,
+        _ => None,
     };
     let mask = if let Some(values) = mask_values {
         Some(
@@ -2353,8 +2432,7 @@ pub fn try_cuda_f16_ragged_sdpa(
     {
         use candle_core::DType;
 
-        if std::env::var_os("DINF_DISABLE_CUDA_FLASH_ATTN").is_some()
-            || !q.device().is_cuda()
+        if !q.device().is_cuda()
             || !q.device().same_device(k.device())
             || !q.device().same_device(v.device())
             || k.dtype() != DType::F16
@@ -2583,23 +2661,24 @@ pub fn try_metal_ragged_rope(
 }
 
 /// Helper: temporarily extract KvCache from a LayerCache slot, run a closure, and put it back.
-/// If the slot is None or Attention, works correctly. Panics on DeltaNet.
+/// If the slot is None or Attention, works correctly.
+///
+/// # Panics
+///
+/// Panics if the slot holds any other cache kind. The check runs before the
+/// slot is touched, so the caller's cache is left intact.
 pub fn with_kv_cache<F, R>(slot: &mut Option<LayerCache>, f: F) -> R
 where
     F: FnOnce(&mut Option<KvCache>) -> R,
 {
     assert!(
-        !matches!(slot, Some(LayerCache::DeepSeek41(_))),
-        "V4.1 model cache is not an attention-only cache"
+        matches!(slot, None | Some(LayerCache::Attention(_))),
+        "expected an attention cache or an empty slot"
     );
     // Extract existing KvCache if present
     let mut kv = match slot.take() {
         Some(LayerCache::Attention(kv)) => Some(kv),
-        Some(LayerCache::DeltaNet(_)) => panic!("expected Attention cache, got DeltaNet"),
-        Some(LayerCache::Mamba2(_)) => panic!("expected Attention cache, got Mamba2"),
-        Some(LayerCache::DeepSeek4(_)) => panic!("expected Attention cache, got DeepSeek4"),
-        Some(LayerCache::DeepSeek41(_)) => unreachable!("rejected before taking slot"),
-        None => None,
+        _ => None,
     };
     let result = f(&mut kv);
     // Put it back
@@ -2670,7 +2749,8 @@ pub fn from_stage_tensors(
         }
         arch => anyhow::bail!(
             "Unsupported model architecture: '{arch}'. \
-             Supported: llama, mistral, qwen2, phi3, qwen3moe, qwen35, nemotron_h_moe, deepseek2, deepseek4, glm-dsa, glm5next, llama4, gemma4, minimax-m2, muse-spark"
+             Recognized: llama, mistral, qwen2, phi3, qwen3moe, qwen35, nemotron_h_moe, deepseek2, deepseek4, glm-dsa, glm5next, llama4, gemma4, minimax-m2, muse-spark \
+             (glm-dsa and muse-spark are unvalidated)"
         ),
     }
 }

@@ -1079,26 +1079,7 @@ fn routed_post_guard_defaults_off_and_restores_nested_error() -> Result<()> {
 
 // These filters are CPU-only: no Device::new_metal and no model/source loads.
 #[test]
-fn native_tile_cpu_default_request_and_scalar_environment_policy() -> Result<()> {
-    use std::ffi::OsStr;
-    assert!(!profile::scalar_prefill_opt_out(None));
-    for value in ["", "1", "7", "false", "00", " 0", "0 "] {
-        assert!(
-            !profile::scalar_prefill_opt_out(Some(OsStr::new(value))),
-            "{value:?}"
-        );
-    }
-    assert!(profile::scalar_prefill_opt_out(Some(OsStr::new("0"))));
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        assert!(!profile::scalar_prefill_opt_out(Some(OsStr::from_bytes(
-            b"\xff"
-        ))));
-        assert!(!profile::scalar_prefill_opt_out(Some(OsStr::from_bytes(
-            b"0\xff"
-        ))));
-    }
+fn native_tile_cpu_default_request_and_scalar_policy() -> Result<()> {
     let scalar = profile::prefill_tile_plan(1, 5291, 7)?;
     assert_eq!(
         (

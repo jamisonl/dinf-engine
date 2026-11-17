@@ -45,21 +45,23 @@ static ATTN_SDPA_OUTPUT_NS: AtomicU64 = AtomicU64::new(0);
 static ATTN_FFN_NS: AtomicU64 = AtomicU64::new(0);
 static DN_PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
 static ATTN_PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
-static PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
 static DECODE_BATCH_LOGGED: OnceLock<()> = OnceLock::new();
 
 fn layer_profile_enabled() -> bool {
-    *PROFILE_ENABLED.get_or_init(|| std::env::var_os("DINF_PROFILE_LAYERS").is_some())
+    super::profiling::layer_profiling_enabled()
 }
 
-fn finish_profile_region(device: &Device, started: Instant, counter: &AtomicU64) -> Result<()> {
-    device.synchronize()?;
-    counter.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    Ok(())
+fn finish_profile_region(
+    device: &Device,
+    started: Instant,
+    counter: &'static AtomicU64,
+) -> Result<()> {
+    super::profiling::finish_region(device, started, counter)
 }
 
 /// Reset the process-local Qwen 3.5 layer profiling counters.
 pub fn reset_layer_profile() {
+    super::profiling::clear_device_regions();
     for counter in [
         &DN_NORM_NS,
         &DN_PROJECTIONS_NS,
@@ -80,6 +82,7 @@ pub fn reset_layer_profile() {
 
 /// Print the process-local Qwen 3.5 layer profiling counters to stderr.
 pub fn report_layer_profile() {
+    super::profiling::drain_device_regions();
     let report = |name: &str, calls: &AtomicU64, counters: &[(&str, &AtomicU64)]| {
         let calls_value = calls.load(Ordering::Relaxed);
         let divisor = calls_value.max(1) as f64 * 1_000_000.0;
@@ -150,6 +153,16 @@ pub struct Qwen35Stage {
 enum Qwen35Block {
     DeltaNet(DeltaNetBlock),
     GatedAttention(GatedAttentionBlock),
+}
+
+impl Qwen35Block {
+    /// The norm applied to the layer's input.
+    fn attn_norm(&self) -> &RmsNorm {
+        match self {
+            Self::DeltaNet(block) => &block.attn_norm,
+            Self::GatedAttention(block) => &block.attn_norm,
+        }
+    }
 }
 
 // ── DeltaNet block ───────────────────────────────────────────────────────
@@ -292,12 +305,10 @@ fn qmatmul_source_on_device(tensor: Arc<QTensor>, device: &Device) -> Result<Arc
 impl Qwen35QMatMul {
     fn from_qtensor(qt: Arc<QTensor>, _device: &Device) -> Result<Self> {
         #[cfg(target_os = "macos")]
-        if std::env::var_os("DINF_DISABLE_METAL4_QMM").is_none()
-            && let Some(matmul) = super::tensor_qmatmul_metal::MetalTensorQMatMul::try_from_qtensor(
-                Arc::clone(&qt),
-                _device,
-            )?
-        {
+        if let Some(matmul) = super::tensor_qmatmul_metal::MetalTensorQMatMul::try_from_qtensor(
+            Arc::clone(&qt),
+            _device,
+        )? {
             let profile = matmul.profile_label();
             METAL4_QMM_LOGGED.get_or_init(|| {
                 tracing::info!(
@@ -315,9 +326,6 @@ impl Qwen35QMatMul {
 
     #[cfg(target_os = "macos")]
     fn try_grouped(qts: &[Arc<QTensor>], device: &Device) -> Result<Option<Self>> {
-        if std::env::var_os("DINF_DISABLE_METAL4_QMM").is_some() {
-            return Ok(None);
-        }
         Ok(
             super::tensor_qmatmul_metal::MetalTensorQMatMul::try_from_qtensors(qts, device)?
                 .map(Self::MetalTensor),
@@ -429,8 +437,7 @@ fn l2_normalize(x: &Tensor) -> Result<Tensor> {
 
 fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     #[cfg(target_os = "macos")]
-    if std::env::var_os("DINF_DISABLE_FUSED_SILU_MUL").is_none()
-        && gate.device().is_metal()
+    if gate.device().is_metal()
         && gate.dtype() == DType::F32
         && up.dtype() == DType::F32
         && gate.is_contiguous()
@@ -738,6 +745,13 @@ impl RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let dtype = x.dtype();
         let x_f32 = x.to_dtype(DType::F32)?;
+        // One fused kernel instead of six elementwise launches.
+        #[cfg(feature = "cuda")]
+        if x.device().is_cuda() {
+            return candle_nn::ops::rms_norm(&x_f32.contiguous()?, &self.weight, self.eps as f32)?
+                .to_dtype(dtype)
+                .map_err(Into::into);
+        }
         #[cfg(target_os = "macos")]
         if let Some(result) =
             super::fused_norm_metal::try_fused_rms_norm(&x_f32, &self.weight, self.eps as f32)?
@@ -796,9 +810,7 @@ impl Mlp {
             } => {
                 let all = projection.forward_decode_rows(x)?;
                 #[cfg(target_os = "macos")]
-                if x.device().is_metal()
-                    && std::env::var_os("DINF_DISABLE_FUSED_SILU_MUL").is_none()
-                {
+                if x.device().is_metal() {
                     super::indexed_moe_metal::fused_swiglu(&all)?
                 } else {
                     silu_mul(
@@ -835,13 +847,7 @@ impl Mlp {
                 "grouped Qwen3.5 MLP output width changed"
             );
             #[cfg(target_os = "macos")]
-            let activated = if std::env::var_os("DINF_DISABLE_FUSED_SILU_MUL").is_none() {
-                super::indexed_moe_metal::fused_swiglu(&gate_up)?
-            } else {
-                let gate = gate_up.narrow(D::Minus1, 0, *intermediate_dim)?;
-                let up = gate_up.narrow(D::Minus1, *intermediate_dim, *intermediate_dim)?;
-                silu_mul(&gate, &up)?
-            };
+            let activated = super::indexed_moe_metal::fused_swiglu(&gate_up)?;
             #[cfg(not(target_os = "macos"))]
             let activated = {
                 let gate = gate_up.narrow(D::Minus1, 0, *intermediate_dim)?;
@@ -887,6 +893,37 @@ impl Mlp {
         }
         let activated = silu_mul(&gate, &up)?;
         self.down_proj.forward(&activated)
+    }
+
+    /// [`Self::forward_residual`], and when `next` is given also `next` of
+    /// the result where one kernel can write both. On CUDA the residual
+    /// addition is the last step of the layer and the next layer's first
+    /// step is that norm.
+    fn forward_residual_next_norm(
+        &self,
+        x: &Tensor,
+        residual: &Tensor,
+        next: Option<&RmsNorm>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        #[cfg(feature = "cuda")]
+        if let Some(next) = next
+            && x.device().is_cuda()
+        {
+            // On CUDA `forward_residual` is this projection and one addition.
+            let projected = self.forward(x)?;
+            return match super::residual_norm_cuda::forward(
+                residual,
+                &projected,
+                &next.weight,
+                next.eps as f32,
+            )? {
+                Some((sum, normed)) => Ok((sum, Some(normed))),
+                None => Ok(((residual + projected)?, None)),
+            };
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = next;
+        Ok((self.forward_residual(x, residual)?, None))
     }
 
     fn forward_residual(&self, x: &Tensor, residual: &Tensor) -> Result<Tensor> {
@@ -1139,14 +1176,20 @@ impl AttentionInputProjections {
 // ── DeltaNet block forward ───────────────────────────────────────────────
 
 impl DeltaNetBlock {
+    /// One layer. `normed` is `attn_norm(x)` when the previous layer already
+    /// produced it; with `next_norm`, the result also carries `next_norm`
+    /// of the output when a fused kernel can write it, for the next layer.
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         x: &Tensor,
+        normed: Option<Tensor>,
+        next_norm: Option<&RmsNorm>,
         cache: &mut Option<DeltaNetCache>,
         _seq_len: usize,
         _start_pos: usize,
         keep_speculative_snapshots: bool,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let (b_sz, seq_len, _hidden_dim) = x.dims3()?;
         anyhow::ensure!(
             b_sz == 1,
@@ -1160,7 +1203,10 @@ impl DeltaNetBlock {
         // These projections depend only on this layer's input, so run them as
         // prompt-sized GEMMs before the recurrent scan rather than as GEMVs.
         let started = profile.then(Instant::now);
-        let normed = self.attn_norm.forward(x)?;
+        let normed = match normed {
+            Some(normed) => normed,
+            None => self.attn_norm.forward(x)?,
+        };
         if let Some(started) = started {
             finish_profile_region(x.device(), started, &DN_NORM_NS)?;
         }
@@ -1181,7 +1227,7 @@ impl DeltaNetBlock {
             cache,
             keep_speculative_snapshots,
         )?;
-        self.output_and_ffn(x, &gated, false)
+        self.output_and_ffn(x, &gated, false, next_norm)
     }
 
     /// Only the scan reads or advances a request's recurrent state. Decode
@@ -1196,12 +1242,6 @@ impl DeltaNetBlock {
         let seq_len = qkv_all.dim(0)?;
         let device = qkv_all.device();
         let profile = layer_profile_enabled();
-        #[cfg(target_os = "macos")]
-        let metal_scan_enabled = if seq_len == 1 {
-            std::env::var_os("DINF_DISABLE_QWEN35_FUSED_DECODE_METAL").is_none()
-        } else {
-            std::env::var_os("DINF_DISABLE_QWEN35_PREFILL_METAL").is_none()
-        };
         let started = profile.then(Instant::now);
         let (conv_state, rec_state) = match cache.take() {
             Some(c) => (c.conv_state, c.recurrent_state),
@@ -1220,8 +1260,6 @@ impl DeltaNetBlock {
         #[cfg(feature = "cuda")]
         let cuda_prefill = if !keep_speculative_snapshots
             && device.is_cuda()
-            && std::env::var_os("DINF_DISABLE_QWEN35_DELTANET_CUDA").is_none()
-            && (seq_len == 1 || std::env::var_os("DINF_DISABLE_QWEN35_PREFILL_CUDA").is_none())
             && super::qwen35_deltanet_cuda::supports(
                 seq_len,
                 self.conv_dim,
@@ -1258,8 +1296,6 @@ impl DeltaNetBlock {
             && device.is_metal()
             && self.conv_kernel <= 8
             && self.key_head_dim <= 256
-            && std::env::var_os("DINF_DISABLE_QWEN35_DELTANET_METAL").is_none()
-            && metal_scan_enabled
             && (!keep_speculative_snapshots || seq_len > 1)
         {
             let fuse_scan_gate = seq_len == 1
@@ -1273,11 +1309,7 @@ impl DeltaNetBlock {
                 && self.ssm_norm.weight.is_contiguous()
                 && self.ssm_norm.weight.dims() == [self.value_head_dim]
                 && (self.ssm_norm.eps as f32).is_finite()
-                && self.ssm_norm.eps >= 0.0
-                && std::env::var_os("DINF_DISABLE_QWEN35_FUSED_DELTANET_EPILOGUE").is_none()
-                && std::env::var_os("DINF_DISABLE_QWEN35_FUSED_SSM_GATE").is_none()
-                && std::env::var_os("DINF_DISABLE_FUSED_RMSNORM").is_none()
-                && std::env::var_os("DINF_DISABLE_FUSED_HEAD_RMSNORM").is_none();
+                && self.ssm_norm.eps >= 0.0;
             let scan = super::qwen35_deltanet_metal::prefill(
                 &qkv_all.contiguous()?,
                 &conv_state,
@@ -1352,9 +1384,7 @@ impl DeltaNetBlock {
                     let q = (q * scale)?;
 
                     #[cfg(target_os = "macos")]
-                    let metal_result = if device.is_metal()
-                        && std::env::var_os("DINF_DISABLE_QWEN35_DELTANET_METAL").is_none()
-                    {
+                    let metal_result = if device.is_metal() {
                         Some(super::qwen35_deltanet_metal::step(
                             &rec_state,
                             &q.contiguous()?,
@@ -1485,7 +1515,13 @@ impl DeltaNetBlock {
         Ok(gated)
     }
 
-    fn output_and_ffn(&self, x: &Tensor, gated: &Tensor, decode_rows: bool) -> Result<Tensor> {
+    fn output_and_ffn(
+        &self,
+        x: &Tensor,
+        gated: &Tensor,
+        decode_rows: bool,
+        next_norm: Option<&RmsNorm>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let input_dtype = x.dtype();
         let residual = x.to_dtype(DType::F32)?;
         let profile = layer_profile_enabled();
@@ -1521,17 +1557,19 @@ impl DeltaNetBlock {
         // FFN
         let started = profile.then(Instant::now);
         let residual = &residual_accum;
-        let result = if decode_rows {
-            self.ffn.forward_decode_rows(&ffn_in, residual)?
+        let (result, next_normed) = if decode_rows {
+            (self.ffn.forward_decode_rows(&ffn_in, residual)?, None)
         } else {
-            self.ffn.forward_residual(&ffn_in, residual)?
-        }
-        .to_dtype(input_dtype)?;
+            self.ffn
+                .forward_residual_next_norm(&ffn_in, residual, next_norm)?
+        };
+        let result = result.to_dtype(input_dtype)?;
         if let Some(started) = started {
             finish_profile_region(x.device(), started, &DN_FFN_NS)?;
         }
 
-        Ok(result)
+        // The carried norm is of the F32 result; another dtype recomputes it.
+        Ok((result, next_normed.filter(|_| input_dtype == DType::F32)))
     }
 
     fn forward_decode_batch(
@@ -1576,21 +1614,26 @@ impl DeltaNetBlock {
                 false,
             )?);
         }
-        self.output_and_ffn(x, &Tensor::cat(&gated, 1)?, true)
+        self.output_and_ffn(x, &Tensor::cat(&gated, 1)?, true, None)
+            .map(|(output, _)| output)
     }
 }
 
 // ── Gated Attention block forward ────────────────────────────────────────
 
 impl GatedAttentionBlock {
+    /// One layer; `normed` and `next_norm` as in [`DeltaNetBlock::forward`].
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         x: &Tensor,
+        normed: Option<Tensor>,
+        next_norm: Option<&RmsNorm>,
         kv_cache: &mut Option<KvCache>,
         seq_len: usize,
         start_pos: usize,
         positions: Option<&MropePositionIds>,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let profile = layer_profile_enabled();
         if profile {
             ATTN_PROFILE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -1598,7 +1641,10 @@ impl GatedAttentionBlock {
 
         // Pre-norm
         let started = profile.then(Instant::now);
-        let normed = self.attn_norm.forward(x)?;
+        let normed = match normed {
+            Some(normed) => normed,
+            None => self.attn_norm.forward(x)?,
+        };
         if let Some(started) = started {
             finish_profile_region(x.device(), started, &ATTN_NORM_NS)?;
         }
@@ -1618,7 +1664,7 @@ impl GatedAttentionBlock {
         }
         let gated_output =
             self.attention_and_gate((q_full, k, v), kv_cache, start_pos, positions)?;
-        self.output_and_ffn(x, &gated_output, false)
+        self.output_and_ffn(x, &gated_output, false, next_norm)
     }
 
     fn attention_and_gate(
@@ -1662,7 +1708,33 @@ impl GatedAttentionBlock {
             } else {
                 None
             };
-        #[cfg(not(target_os = "macos"))]
+        // CUDA prepares a prompt of consecutive text positions the same way.
+        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+        let fused_decode_layout = if let Some(position) = positions.is_none().then_some(start_pos) {
+            super::qwen35_decode_layout_cuda::try_forward(
+                &q_full,
+                &k,
+                &v,
+                &self.q_norm.weight,
+                &self.k_norm.weight,
+                &self.rope_cos,
+                &self.rope_sin,
+                self.q_norm.eps as f32,
+                self.k_norm.eps as f32,
+                super::qwen35_decode_layout_cuda::DecodeQkvDimensions {
+                    batch: b_sz,
+                    num_heads: self.num_heads,
+                    num_kv_heads: self.num_kv_heads,
+                    head_dim: self.head_dim,
+                    rope_dims: self.rope_dims,
+                    position,
+                },
+                seq_len,
+            )?
+        } else {
+            None
+        };
+        #[cfg(not(any(target_os = "macos", feature = "cuda")))]
         let fused_decode_layout: Option<(Tensor, Tensor, Tensor, Tensor)> = None;
         let qk_prepared = fused_decode_layout.is_some();
         let (query, k, v, gate) = if let Some(layout) = fused_decode_layout {
@@ -1685,20 +1757,18 @@ impl GatedAttentionBlock {
             (q, k, v, g)
         } else {
             #[cfg(target_os = "macos")]
-            if std::env::var_os("DINF_DISABLE_QWEN35_FUSED_GATED_QKV_LAYOUT").is_none()
-                && let Some(layout) = super::qkv_layout_metal::try_fused_gated_qkv_layout(
-                    &q_full,
-                    &k,
-                    &v,
-                    super::qkv_layout_metal::QkvLayoutDimensions {
-                        batch: b_sz,
-                        seq_len,
-                        num_heads: self.num_heads,
-                        num_kv_heads: self.num_kv_heads,
-                        head_dim: self.head_dim,
-                    },
-                )?
-            {
+            if let Some(layout) = super::qkv_layout_metal::try_fused_gated_qkv_layout(
+                &q_full,
+                &k,
+                &v,
+                super::qkv_layout_metal::QkvLayoutDimensions {
+                    batch: b_sz,
+                    seq_len,
+                    num_heads: self.num_heads,
+                    num_kv_heads: self.num_kv_heads,
+                    head_dim: self.head_dim,
+                },
+            )? {
                 layout
             } else {
                 self.portable_gated_qkv_layout(q_full, k, v, b_sz, seq_len)?
@@ -1748,6 +1818,20 @@ impl GatedAttentionBlock {
         }
         let started = profile.then(Instant::now);
         let scale = 1.0 / (self.head_dim as f64).sqrt();
+        // One token on CUDA: attention, the sigmoid gate and the output
+        // layout in two launches. One token's `[batch, heads, 1, dim]` rows
+        // already have the output order.
+        if seq_len == 1
+            && rotation.is_none()
+            && let Some(gated) =
+                super::try_cuda_decode_sdpa_gated(&query, &k, &v, &gate, scale as f32)?
+        {
+            let gated_output = gated.reshape((b_sz, 1, ()))?;
+            if let Some(started) = started {
+                finish_profile_region(&device, started, &ATTN_SDPA_OUTPUT_NS)?;
+            }
+            return Ok(gated_output);
+        }
         let attn_output = if let Some(output) =
             super::try_fused_f16_sdpa_native(&query, &k, &v, seq_len > 1, scale as f32)?
         {
@@ -1769,15 +1853,11 @@ impl GatedAttentionBlock {
 
         // Output gating: attn_out * sigmoid(gate)
         #[cfg(target_os = "macos")]
-        let gated_output = if std::env::var_os(
-            "DINF_DISABLE_QWEN35_FUSED_GATED_ATTENTION_OUTPUT_LAYOUT",
-        )
-        .is_none()
-            && let Some(output) =
-                super::qkv_layout_metal::try_fused_sigmoid_gated_attention_output_layout(
-                    &attn_output,
-                    &gate,
-                )? {
+        let gated_output = if let Some(output) =
+            super::qkv_layout_metal::try_fused_sigmoid_gated_attention_output_layout(
+                &attn_output,
+                &gate,
+            )? {
             output
         } else {
             let gate_sigmoid = candle_nn::Activation::Sigmoid.forward(&gate)?;
@@ -1806,7 +1886,8 @@ impl GatedAttentionBlock {
         x: &Tensor,
         gated_output: &Tensor,
         decode_rows: bool,
-    ) -> Result<Tensor> {
+        next_norm: Option<&RmsNorm>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let profile = layer_profile_enabled();
         let started = profile.then(Instant::now);
         let projected = if decode_rows {
@@ -1822,16 +1903,17 @@ impl GatedAttentionBlock {
         // FFN
         let started = profile.then(Instant::now);
         let residual = &x;
-        let result = if decode_rows {
-            self.ffn.forward_decode_rows(&ffn_in, residual)?
+        let (result, next_normed) = if decode_rows {
+            (self.ffn.forward_decode_rows(&ffn_in, residual)?, None)
         } else {
-            self.ffn.forward_residual(&ffn_in, residual)?
+            self.ffn
+                .forward_residual_next_norm(&ffn_in, residual, next_norm)?
         };
         if let Some(started) = started {
             finish_profile_region(result.device(), started, &ATTN_FFN_NS)?;
         }
 
-        Ok(result)
+        Ok((result, next_normed))
     }
 
     fn forward_decode_batch(
@@ -1883,7 +1965,8 @@ impl GatedAttentionBlock {
                 None,
             )?);
         }
-        self.output_and_ffn(x, &Tensor::cat(&gated, 1)?, true)
+        self.output_and_ffn(x, &Tensor::cat(&gated, 1)?, true, None)
+            .map(|(output, _)| output)
     }
 
     fn portable_gated_qkv_layout(
@@ -1959,6 +2042,8 @@ impl Qwen35Stage {
         {
             super::qwen35_deltanet_cuda::precompile(&device)?;
             super::dense_qmatmul_cuda::precompile(&device)?;
+            super::qwen35_decode_layout_cuda::precompile(&device)?;
+            super::precompile_cuda_decode_sdpa(&device)?;
         }
 
         let full_attention_interval = if md.full_attention_interval > 0 {
@@ -2178,11 +2263,7 @@ impl ModelArchitecture for Qwen35Stage {
             // Portable scans also retain every row for prefix rollback.
             let copies = if verification_rows == 0 {
                 1
-            } else if self.device.is_metal()
-                && block.conv_kernel <= 8
-                && block.key_head_dim <= 256
-                && std::env::var_os("DINF_DISABLE_QWEN35_DELTANET_METAL").is_none()
-                && std::env::var_os("DINF_DISABLE_QWEN35_PREFILL_METAL").is_none()
+            } else if self.device.is_metal() && block.conv_kernel <= 8 && block.key_head_dim <= 256
             {
                 2
             } else {
@@ -2216,10 +2297,6 @@ impl ModelArchitecture for Qwen35Stage {
     }
 
     fn supports_speculative_batch(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        if self.device.is_metal() && !super::tensor_qmatmul_metal::supports_shared_verification() {
-            return false;
-        }
         self.supports_decode_batch()
     }
 
@@ -2302,7 +2379,6 @@ impl ModelArchitecture for Qwen35Stage {
     fn supports_decode_batch(&self) -> bool {
         self.is_head
             && self.is_tail
-            && std::env::var_os("DINF_DISABLE_QWEN35_DECODE_BATCH").is_none()
             && (self.device.is_cpu() || self.has_metal_decode_rows())
             && self.blocks.iter().all(|block| match block {
                 Qwen35Block::GatedAttention(block) => block.quant_config.is_none(),
@@ -2523,7 +2599,22 @@ impl Qwen35Stage {
 
         let mut captures = Vec::with_capacity(layer_ids.len());
         let mut next_capture = 0usize;
+        // CUDA, one token: a layer's last kernel also writes the next
+        // layer's input norm. The profile keeps the separate steps.
+        let carry_norm = cfg!(feature = "cuda")
+            && seq_len == 1
+            && hidden_states.device().is_cuda()
+            && !layer_profile_enabled();
+        let mut normed: Option<Tensor> = None;
         for (i, block) in self.blocks.iter().enumerate() {
+            let next_norm = self
+                .blocks
+                .get(i + 1)
+                .filter(|_| carry_norm)
+                .map(Qwen35Block::attn_norm);
+            if seq_len == 1 {
+                crate::decode_layer_boundary(i);
+            }
             let layer_id = self.layer_indices[i];
             // GGUF stores each trained output layer as `layer_id + 1`, so the
             // requested feature is the input entering this stored layer.
@@ -2531,7 +2622,7 @@ impl Qwen35Stage {
                 captures.push(hidden_states.squeeze(0)?.to_dtype(DType::F32)?);
                 next_capture += 1;
             }
-            hidden_states = match block {
+            (hidden_states, normed) = match block {
                 Qwen35Block::DeltaNet(dn_block) => {
                     // Extract or create DeltaNet cache
                     let mut dn_cache = match cache[i].take() {
@@ -2541,6 +2632,8 @@ impl Qwen35Stage {
                     };
                     let result = dn_block.forward(
                         &hidden_states,
+                        normed.take(),
+                        next_norm,
                         &mut dn_cache,
                         seq_len,
                         start_pos,
@@ -2558,6 +2651,8 @@ impl Qwen35Stage {
                     };
                     let result = attn_block.forward(
                         &hidden_states,
+                        normed.take(),
+                        next_norm,
                         &mut kv_cache,
                         seq_len,
                         start_pos,
@@ -2616,11 +2711,7 @@ fn build_mlp(
     );
 
     #[cfg(target_os = "macos")]
-    let grouped = if std::env::var_os("DINF_DISABLE_QWEN35_FUSED_MLP").is_none() {
-        Qwen35QMatMul::try_grouped(&[Arc::clone(&gate), Arc::clone(&up)], device)?
-    } else {
-        None
-    };
+    let grouped = Qwen35QMatMul::try_grouped(&[Arc::clone(&gate), Arc::clone(&up)], device)?;
     #[cfg(not(target_os = "macos"))]
     let grouped: Option<Qwen35QMatMul> = None;
 
@@ -2664,18 +2755,11 @@ fn build_deltanet_block(
         eps: md.rms_norm_eps,
     };
 
-    #[cfg(target_os = "macos")]
-    let grouped_projections = std::env::var_os("DINF_DISABLE_QWEN35_GROUPED_PROJECTIONS").is_none()
-        && std::env::var_os("DINF_DISABLE_QWEN35_GROUPED_DELTANET").is_none();
     let qkv_gate = {
         let qkv = take_qtensor(tensors, prefix, "attn_qkv.weight")?;
         let gate = take_qtensor(tensors, prefix, "attn_gate.weight")?;
         #[cfg(target_os = "macos")]
-        let grouped = if grouped_projections {
-            Qwen35QMatMul::try_grouped(&[Arc::clone(&qkv), Arc::clone(&gate)], device)?
-        } else {
-            None
-        };
+        let grouped = Qwen35QMatMul::try_grouped(&[Arc::clone(&qkv), Arc::clone(&gate)], device)?;
         #[cfg(not(target_os = "macos"))]
         let grouped: Option<Qwen35QMatMul> = None;
         match grouped {
@@ -2693,11 +2777,7 @@ fn build_deltanet_block(
         let alpha = take_qtensor(tensors, prefix, "ssm_alpha.weight")?;
         let beta = take_qtensor(tensors, prefix, "ssm_beta.weight")?;
         #[cfg(target_os = "macos")]
-        let grouped = if grouped_projections {
-            Qwen35QMatMul::try_grouped(&[Arc::clone(&alpha), Arc::clone(&beta)], device)?
-        } else {
-            None
-        };
+        let grouped = Qwen35QMatMul::try_grouped(&[Arc::clone(&alpha), Arc::clone(&beta)], device)?;
         #[cfg(not(target_os = "macos"))]
         let grouped: Option<Qwen35QMatMul> = None;
         match grouped {
@@ -2800,13 +2880,8 @@ fn build_gated_attention_block(
         let k = take_qtensor(tensors, prefix, "attn_k.weight")?;
         let v = take_qtensor(tensors, prefix, "attn_v.weight")?;
         #[cfg(target_os = "macos")]
-        let grouped = if std::env::var_os("DINF_DISABLE_QWEN35_GROUPED_PROJECTIONS").is_none()
-            && std::env::var_os("DINF_DISABLE_QWEN35_GROUPED_ATTENTION_PROJECTIONS").is_none()
-        {
-            Qwen35QMatMul::try_grouped(&[Arc::clone(&q), Arc::clone(&k), Arc::clone(&v)], device)?
-        } else {
-            None
-        };
+        let grouped =
+            Qwen35QMatMul::try_grouped(&[Arc::clone(&q), Arc::clone(&k), Arc::clone(&v)], device)?;
         #[cfg(not(target_os = "macos"))]
         let grouped: Option<Qwen35QMatMul> = None;
         match grouped {

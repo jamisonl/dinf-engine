@@ -2,10 +2,6 @@
 
 use super::*;
 
-pub(super) fn enabled(configured: Option<&std::ffi::OsStr>, native_default: bool) -> bool {
-    configured.map_or(native_default, |value| value == "1")
-}
-
 pub(super) fn should_group(enabled: bool, decode_rows: bool, rows: usize) -> bool {
     // Preserve the existing independent-request decode path: full requests
     // showed no clear decode gain. Group only multi-token prompt chunks.

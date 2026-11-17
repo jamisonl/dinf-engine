@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::verified_file::SparseSetLen;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -342,8 +344,8 @@ impl StageMemoryProfile {
             0
         };
         // A stage boundary is materialized at either end of the pipeline, not
-        // both at once.  Keep this in sync with the protocol-side profile
-        // consumer, which uses the larger realized boundary cost for a range.
+        // both at once, so a range is charged the larger realized boundary
+        // cost.
         head.max(tail)
     }
 
@@ -2679,7 +2681,7 @@ fn deepseek41_memory_profile(
         layer_cpu_bytes: vec![0; metadata.num_layers],
         layer_cpu_transient_bytes: vec![0; metadata.num_layers],
         // Full-solo embedding/output storage is already included in common.
-        // Explicit boundaries preserve exact CPU accounting through protocol conversion.
+        // Explicit zero boundaries keep CPU accounting exact for this profile.
         head_embedding_gpu_bytes: Some(0),
         tail_embedding_gpu_bytes: Some(0),
         head_embedding_cpu_bytes: Some(0),
@@ -3365,16 +3367,8 @@ pub fn estimate_stage_memory_profile(
 
     shard_metadata.finish()?;
     if architecture == "qwen35" && device.is_metal() && metal_tensor_qmatmul_available {
-        let mlp_grouped = std::env::var_os("DINF_DISABLE_QWEN35_FUSED_MLP").is_none();
-        let grouped_projections =
-            std::env::var_os("DINF_DISABLE_QWEN35_GROUPED_PROJECTIONS").is_none();
-        let deltanet_grouped = grouped_projections
-            && std::env::var_os("DINF_DISABLE_QWEN35_GROUPED_DELTANET").is_none();
-        let attention_grouped = grouped_projections
-            && std::env::var_os("DINF_DISABLE_QWEN35_GROUPED_ATTENTION_PROJECTIONS").is_none();
         for (layer_idx, construction) in layer_qwen35_grouped_construction.into_iter().enumerate() {
-            let (accelerator_peak, host_peak) =
-                construction.grouped_peaks(mlp_grouped, deltanet_grouped, attention_grouped);
+            let (accelerator_peak, host_peak) = construction.grouped_peaks();
             profile.layer_gpu_transient_bytes[layer_idx] =
                 profile.layer_gpu_transient_bytes[layer_idx].max(accelerator_peak);
             profile.layer_cpu_transient_bytes[layer_idx] =
@@ -4049,38 +4043,22 @@ impl Qwen35GroupedConstructionBytes {
         *slot = slot.saturating_add(bytes);
     }
 
-    fn grouped_peaks(
-        self,
-        mlp_grouped: bool,
-        deltanet_grouped: bool,
-        attention_grouped: bool,
-    ) -> (u64, u64) {
-        let mlp = mlp_grouped.then(|| self.mlp_gate.saturating_add(self.mlp_up));
-        let deltanet_host = deltanet_grouped.then(|| {
-            self.deltanet_qkv
-                .saturating_add(self.deltanet_gate)
-                .max(self.deltanet_alpha.saturating_add(self.deltanet_beta))
-        });
+    /// Peak (accelerator, host) transient bytes while the grouped MLP,
+    /// DeltaNet and attention projections are built.
+    fn grouped_peaks(self) -> (u64, u64) {
+        let mlp = self.mlp_gate.saturating_add(self.mlp_up);
         // The two homogeneous groups are built in separate scopes, so the
         // first pair's source tensors are released before the second upload.
-        let deltanet_accelerator = deltanet_grouped.then(|| {
-            self.deltanet_qkv
-                .saturating_add(self.deltanet_gate)
-                .max(self.deltanet_alpha.saturating_add(self.deltanet_beta))
-        });
-        let attention = attention_grouped.then(|| {
-            self.attention_q
-                .saturating_add(self.attention_k)
-                .saturating_add(self.attention_v)
-        });
-        (
-            mlp.unwrap_or(0)
-                .max(deltanet_accelerator.unwrap_or(0))
-                .max(attention.unwrap_or(0)),
-            mlp.unwrap_or(0)
-                .max(deltanet_host.unwrap_or(0))
-                .max(attention.unwrap_or(0)),
-        )
+        let deltanet = self
+            .deltanet_qkv
+            .saturating_add(self.deltanet_gate)
+            .max(self.deltanet_alpha.saturating_add(self.deltanet_beta));
+        let attention = self
+            .attention_q
+            .saturating_add(self.attention_k)
+            .saturating_add(self.attention_v);
+        let peak = mlp.max(deltanet).max(attention);
+        (peak, peak)
     }
 }
 
@@ -4382,7 +4360,7 @@ fn indexed_headwise_available(is_metal: bool, uses_accelerator: bool, dtype: Ggm
                 | GgmlDType::Q4K
                 | GgmlDType::Q5K
                 | GgmlDType::Q6K
-        ) && std::env::var_os("DINF_DISABLE_INDEXED_MOE_METAL").is_none();
+        );
     }
 
     #[cfg(feature = "cuda")]
@@ -4396,9 +4374,7 @@ fn indexed_headwise_available(is_metal: bool, uses_accelerator: bool, dtype: Ggm
                 | GgmlDType::Q4K
                 | GgmlDType::Q5K
                 | GgmlDType::Q6K
-        ) && std::env::var_os("DINF_DISABLE_INDEXED_MOE_CUDA").is_none()
-            && (dtype != GgmlDType::Q4_0
-                || std::env::var_os("DINF_DISABLE_INDEXED_MOE_Q4_0_CUDA").is_none())
+        )
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -4911,18 +4887,21 @@ mod tests {
             construction.record(name, bytes);
         }
 
-        assert_eq!(
-            construction.grouped_peaks(true, true, true),
-            (38_707_200, 38_707_200)
-        );
-        assert_eq!(
-            construction.grouped_peaks(false, true, false),
-            (25_804_800, 25_804_800)
-        );
-        assert_eq!(
-            construction.grouped_peaks(false, false, true),
-            (21_504_000, 21_504_000)
-        );
+        assert_eq!(construction.grouped_peaks(), (38_707_200, 38_707_200));
+        let without_mlp = Qwen35GroupedConstructionBytes {
+            mlp_gate: 0,
+            mlp_up: 0,
+            ..construction
+        };
+        assert_eq!(without_mlp.grouped_peaks(), (25_804_800, 25_804_800));
+        let attention_only = Qwen35GroupedConstructionBytes {
+            deltanet_qkv: 0,
+            deltanet_gate: 0,
+            deltanet_alpha: 0,
+            deltanet_beta: 0,
+            ..without_mlp
+        };
+        assert_eq!(attention_only.grouped_peaks(), (21_504_000, 21_504_000));
     }
 
     #[test]
@@ -7368,8 +7347,11 @@ mod tests {
                 file.write_all(&0u32.to_le_bytes()).unwrap(); // of u8
                 file.write_all(&crate::gguf_limits::MAX_GGUF_ARRAY_ELEMENTS.to_le_bytes())
                     .unwrap();
-                file.write_all(&vec![0u8; crate::gguf_limits::MAX_GGUF_ARRAY_ELEMENTS as usize])
-                    .unwrap();
+                file.write_all(&vec![
+                    0u8;
+                    crate::gguf_limits::MAX_GGUF_ARRAY_ELEMENTS as usize
+                ])
+                .unwrap();
             }
             // Pad to the default 32-byte alignment where tensor data starts.
             let length = file.metadata().unwrap().len();
@@ -7378,7 +7360,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "dinf-gguf-value-budget-{}-{}.gguf",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test").replace(':', "_")
+            std::thread::current()
+                .name()
+                .unwrap_or("test")
+                .replace(':', "_")
         ));
         // ~9 MiB on disk, but ~300 MiB once every byte becomes a Value.
         byte_arrays(&path, 9);
@@ -7390,7 +7375,10 @@ mod tests {
         let elements = crate::gguf_limits::MAX_GGUF_ARRAY_ELEMENTS;
         assert_eq!(stats.metadata_values, 7 * elements + 7);
         let disk = std::fs::metadata(&path).unwrap().len();
-        assert!(stats.parsed_bytes(disk) > 16 * disk, "split budgets must see parsed size");
+        assert!(
+            stats.parsed_bytes(disk) > 16 * disk,
+            "split budgets must see parsed size"
+        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -7446,7 +7434,7 @@ mod tests {
         file.write_all(&tensor_type.to_le_bytes()).unwrap();
         file.write_all(&tensor_offset.to_le_bytes()).unwrap();
         let minimum_len = file.stream_position().unwrap();
-        file.set_len(file_len.max(minimum_len)).unwrap();
+        file.set_len_sparse(file_len.max(minimum_len)).unwrap();
     }
 
     #[test]

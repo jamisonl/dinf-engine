@@ -22,8 +22,8 @@ relative L2 <= 0.01 and cosine >= 0.9999. They check projected embeddings,
 not caption quality or every image preprocessing policy, and they do not
 assert identical arithmetic across backends.
 
-`SOURCE.json` records the source archive, patch, before/after source hashes,
-runtime files and input fixtures. Patch SHA-256:
+`SOURCE.json` records the source archive, patch, before/after source hashes
+and input fixtures. Patch SHA-256:
 `98a3f2f65673e691a8dc8c92495c6c7462b429685bb6fd2768cb64ed582391b6`.
 `LICENSE.llama.cpp` retains the upstream MIT notice (Copyright (c) 2023-2026
 The ggml authors); keep it with the patch.
@@ -34,8 +34,8 @@ Requirements: a C++17 compiler, CMake 3.20 or newer, Git, Python 3, the pinned
 llama.cpp source, matching b8920 libllama libraries and headers, and ggml
 0.10.0 libraries and headers. The recorded build used macOS arm64 shared
 libraries. The CMake paths are parameters; they do not select or install a
-runtime. The binary and runtime hashes in `SOURCE.json` identify the recorded
-build, so a new build must record its own.
+runtime. Record the binary and runtime hashes of your own build with its
+results.
 
 Set `ORACLE` to this directory, `LLAMA_SOURCE` to a fresh llama.cpp checkout,
 `LLAMA_PREFIX` and `GGML_PREFIX` to the matching installed prefixes, `BUILD` to
@@ -102,8 +102,7 @@ It keeps stored weights and the original F32 activations:
 - F32 GELU operators use F32 tanh-GELU instead of the F16 lookup table. F16
   GELU operators keep the lookup.
 
-Metal keeps the `hf-contract-v1` graph. `CPU_W8A32.json` pins the patches,
-the tested plugin and library, and the saved-input F64 component checks that
+Metal keeps the `hf-contract-v1` graph. Saved-input F64 component checks
 separate these effects. Widened-weight F32 projection reduced local error by a
 factor of 5,010 to 62,005 on the six measured Q8 inputs. No tolerance changed.
 

@@ -172,7 +172,7 @@ fn pipeline_from_source(
 }
 
 pub(super) fn precompile(device: &Device) -> anyhow::Result<()> {
-    if device.is_metal() && std::env::var_os("DINF_DISABLE_GLM5_KDA_METAL").is_none() {
+    if device.is_metal() {
         pipeline(device.as_metal_device()?)?;
     }
     Ok(())

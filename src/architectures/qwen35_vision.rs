@@ -141,7 +141,13 @@ impl VisionImage {
 }
 
 fn decode_still_gif(bytes: &[u8]) -> Result<VisionImage> {
-    let decoder = GifDecoder::new(Cursor::new(bytes)).context("could not inspect GIF image")?;
+    let mut decoder = GifDecoder::new(Cursor::new(bytes)).context("could not inspect GIF image")?;
+    // The logical screen checked below does not bound individual frames. The
+    // decoder's default limits make the frame iterator reject a frame whose
+    // buffer exceeds the allocation cap before allocating it.
+    decoder
+        .set_limits(image::Limits::default())
+        .context("GIF image exceeds decoder limits")?;
     let (width, height) = decoder.dimensions();
     let pixel_count = usize::try_from(width)?
         .checked_mul(usize::try_from(height)?)

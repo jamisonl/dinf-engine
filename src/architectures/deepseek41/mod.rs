@@ -198,12 +198,11 @@ pub(super) fn native_prefill_policy(
     rows: usize,
     grouped: bool,
     simd: bool,
-    scalar: bool,
     phased: bool,
     shared: bool,
     packets: bool,
 ) -> bool {
-    rows > 1 && grouped && simd && !scalar && phased && shared && packets
+    rows > 1 && grouped && simd && phased && shared && packets
 }
 
 #[cfg(target_os = "macos")]
@@ -212,7 +211,6 @@ fn native_prefill_eligible(rows: usize, grouped: bool) -> bool {
         rows,
         grouped,
         Linear::iq1_simd_enabled(),
-        profile::scalar_prefill_opt_out_enabled(),
         phased_attention_enabled(),
         batched_shared_enabled(),
         packet_policy(rows.min(profile::MAX_PREFILL_TILE), grouped),
@@ -244,7 +242,6 @@ pub(super) fn native_prefill_policy_checks(device: &Device) -> Result<serde_json
         "scalar_step",
         "grouped",
         "simd",
-        "scalar_optout",
         "phased",
         "shared",
         "packet",
@@ -254,9 +251,7 @@ pub(super) fn native_prefill_policy_checks(device: &Device) -> Result<serde_json
         SHARED_TILE_REFERENCE.with(|v| v.set(name == "shared"));
         IQ1_PACKET_BATCH.with(|v| v.set(name != "packet"));
         let eligible = if name == "simd" {
-            native_prefill_policy(128, true, false, false, true, true, true)
-        } else if name == "scalar_optout" {
-            native_prefill_policy(128, true, true, true, true, true, true)
+            native_prefill_policy(128, true, false, true, true, true)
         } else {
             native_prefill_eligible(
                 if name == "scalar_step" { 1 } else { 128 },
@@ -639,13 +634,9 @@ impl Drop for CoderBatchScope {
         CODER_BATCH_ACTIVE.with(|v| v.set(self.1));
     }
 }
-/// The Coder's whole-tile attention runs on Metal unless
-/// `DINF_DEEPSEEK41_TILE_ATTENTION=0` keeps the row loop.
+/// The Coder's whole-tile attention runs on Metal.
 fn tile_attention_enabled(device: &Device) -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("DINF_DEEPSEEK41_TILE_ATTENTION").is_none_or(|v| v != "0")
-    });
-    device.is_metal() && *ENABLED
+    device.is_metal()
 }
 fn coder_routed_batch_enabled() -> bool {
     CODER_BATCH_ACTIVE.with(|v| v.get())
@@ -654,9 +645,6 @@ fn coder_routed_batch_enabled() -> bool {
 /// requests the largest tile unless an operator chose a size. The planner
 /// still shrinks it near the fixed scratch reserve.
 fn coder_prefill_tile() -> usize {
-    if profile::scalar_prefill_opt_out_enabled() {
-        return 1;
-    }
     match profile::prefill_tile() {
         profile::DEFAULT_PREFILL_TILE => profile::MAX_PREFILL_TILE,
         requested => requested,
@@ -1116,17 +1104,12 @@ impl DeepSeek41Stage {
     }
 
     /// Tile-level Coder layers apply on qualified Metal devices for
-    /// multi-row tiles, unless tile validation is on or
-    /// `DINF_DEEPSEEK41_TILE_LAYERS=0` keeps the row loop.
+    /// multi-row tiles, unless tile validation is on.
     fn coder_tile_enabled(&self, tokens: usize) -> bool {
-        static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var_os("DINF_DEEPSEEK41_TILE_LAYERS").is_none_or(|v| v != "0")
-        });
         #[cfg(target_os = "macos")]
         {
             self.coder
                 && tokens > 1
-                && *ENABLED
                 && tile_attention_enabled(&self.device)
                 && !profile::prefill_validation_enabled()
                 && !attention_v2_enabled()
@@ -1136,7 +1119,7 @@ impl DeepSeek41Stage {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (tokens, &*ENABLED);
+            let _ = tokens;
             false
         }
     }
@@ -1268,17 +1251,14 @@ impl DeepSeek41Stage {
     /// cache, so each row is an SSD read; issuing them concurrently instead of
     /// one at a time per token hides most of the latency. Bytes and decoding
     /// are those of `Table::read_rows`. `None` keeps per-row reads (one-token
-    /// tiles, or `DINF_DEEPSEEK41_ENGRAM_PREFETCH=0`).
+    /// tiles).
     #[allow(clippy::type_complexity)]
     fn prefetch_engram(
         &self,
         hash: &engram::HashBatch,
     ) -> Result<Option<[Vec<Vec<[f32; engram::DIM]>>; 2]>> {
-        static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var_os("DINF_DEEPSEEK41_ENGRAM_PREFETCH").is_none_or(|v| v != "0")
-        });
         let tokens = hash.rows.len();
-        if !*ENABLED || tokens < 2 {
+        if tokens < 2 {
             return Ok(None);
         }
         let mut tables = [None, None];

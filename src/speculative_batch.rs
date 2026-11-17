@@ -5,13 +5,14 @@ use continuous::DecodeBatchStepError::{self, RetryScalar, Terminal};
 
 impl PipelineStage {
     /// Whether this stage can share target work for draft-enabled requests.
-    /// Opt-in until model-level correctness and speed checks qualify the path.
+    /// Opt-in through [`SpeculativeOptions::shared_verification`] until
+    /// model-level correctness and speed checks qualify the path.
     pub fn supports_speculative_batch(&self) -> bool {
-        self.position == StagePosition::Solo
+        self.options.speculative.shared_verification
+            && self.position == StagePosition::Solo
             && self.speculative.is_some()
             && self.effective_speculative_block_size().ok().flatten() == Some(8)
             && self.arch.supports_speculative_batch()
-            && std::env::var("DINF_ENABLE_SPECULATIVE_BATCH").as_deref() == Ok("1")
     }
 
     pub(crate) fn begin_speculative_batch(
