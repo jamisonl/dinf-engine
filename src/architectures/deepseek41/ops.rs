@@ -577,7 +577,7 @@ kernel void coder_embedding_q5(device const uchar *bytes [[buffer(0)]],
         wide: u32,
     }
 
-    fn tensor_storage(t: &Tensor) -> Result<(std::sync::RwLockReadGuard<'_, Storage>, usize)> {
+    fn tensor_storage(t: &Tensor) -> Result<(candle_core::StorageRef<'_>, usize)> {
         if !t.is_contiguous() {
             candle_core::bail!("Maya cache input must be contiguous");
         }

@@ -91,6 +91,8 @@ pub mod profiling;
 #[cfg(feature = "cuda")]
 mod q8_1_epilogue_cuda;
 #[cfg(feature = "cuda")]
+mod q8_1_memo_cuda;
+#[cfg(feature = "cuda")]
 mod qkv_decode_cuda;
 #[cfg(target_os = "macos")]
 mod qkv_layout_metal;

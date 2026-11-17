@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "cudarc"
-version = "0.19.8"
+version = "0.19.10"
 authors = ["Chelsea Lowman <clowman1993@gmail.com>"]
 build = "build.rs"
 autolib = false
@@ -43,7 +43,7 @@ repository = "https://github.com/chelsea0x3b/cudarc"
 
 [package.metadata.docs.rs]
 features = [
-    "cuda-13030",
+    "cuda-13040",
     "f16",
     "cudnn",
     "nccl",
@@ -79,6 +79,7 @@ cuda-13000 = []
 cuda-13010 = []
 cuda-13020 = []
 cuda-13030 = []
+cuda-13040 = []
 cuda-version-from-build-system = []
 cudnn = ["cudnn-09021"]
 cudnn-08009 = ["driver"]
@@ -148,20 +149,6 @@ std = []
 [lib]
 name = "cudarc"
 path = "src/lib.rs"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 [dependencies.float4]
 version = "0.2.0"

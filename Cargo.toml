@@ -67,7 +67,6 @@ objc2-foundation = "0.3"
 [workspace]
 # Vendored dependency sources are patched in below, not built as members.
 exclude = [
-    "third_party/candle-core",
     "third_party/candle-metal-kernels",
     "third_party/cudaforge",
     "third_party/cudarc",
@@ -75,10 +74,7 @@ exclude = [
 ]
 
 [patch.crates-io]
-# Candle 0.11.0 with the upstream ZIP 9 backport and local CUDA changes.
-# See third_party/candle-core/UPSTREAM.md.
-candle-core = { path = "third_party/candle-core" }
-# cudarc 0.19.8 with a capture window for CUDA graph decode and pooled small
+# cudarc 0.19.10 with a capture window for CUDA graph decode and pooled small
 # allocations. See third_party/cudarc/UPSTREAM.md.
 cudarc = { path = "third_party/cudarc" }
 # Candle Metal kernels 0.11.1 with local attention, synchronization, buffer and

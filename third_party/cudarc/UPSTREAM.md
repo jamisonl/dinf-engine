@@ -1,8 +1,8 @@
 # Vendored cudarc
 
-This directory is `cudarc` 0.19.8 from crates.io (published crate checksum
-`42310153e06cf4cd532901f7096beb27504d681736a29ee90728ae4e2d93b2a8`), the
-version Candle 0.11 depends on. It keeps cudarc's declared `MIT OR Apache-2.0`
+This directory is `cudarc` 0.19.10 from crates.io (published crate checksum
+`7359bf1de037ddada72729c3acec9b040f3468400c6e9e740b01ba0cd2e89562`), the
+version Candle 0.11.1 depends on. It keeps cudarc's declared `MIT OR Apache-2.0`
 license and the upstream license texts. The published crate's `examples/`
 directory and its `[[example]]` manifest entries are omitted.
 

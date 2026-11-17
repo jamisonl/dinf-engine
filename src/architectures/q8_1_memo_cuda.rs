@@ -1,7 +1,5 @@
 //! Activations that already have a Q8_1 form on the device.
 //!
-//! This module is a local addition; see `UPSTREAM.md` at the crate root.
-//!
 //! The quantized matrix-vector kernels read their activation as Q8_1 blocks,
 //! and by default each product first launches a kernel that quantizes it.
 //! A kernel that produces an activation can write the Q8_1 form in the same
@@ -17,12 +15,11 @@
 //! Entries are per thread, and only the last few are kept. A tensor must not
 //! be written in place after it is published.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
-use cudarc::driver::DevicePtr;
-
-use crate::backend::BackendStorage;
-use crate::{DType, Result, Storage, Tensor};
+use candle_core::backend::BackendStorage;
+use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+use candle_core::{DType, Result, Storage, Tensor};
 
 /// Entries kept per thread. A layer publishes at most this many activations
 /// between the products that use them.
@@ -41,23 +38,24 @@ struct Entry {
 
 thread_local! {
     static ENTRIES: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
-    static HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static HITS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Lookups on this thread that found a published form.
-pub fn hits() -> u64 {
-    HITS.with(std::cell::Cell::get)
+#[cfg(test)]
+pub(super) fn hits() -> u64 {
+    HITS.with(Cell::get)
 }
 
 /// Bytes of the Q8_1 form of one activation row of `len` values.
-pub fn quantized_bytes(len: usize) -> usize {
+pub(super) fn quantized_bytes(len: usize) -> usize {
     len.div_ceil(512) * 512 / 32 * 36
 }
 
 /// Record that `packed`, a contiguous F32 CUDA tensor, holds `len`
 /// activation values starting at element `activation_offset` of its storage
 /// and their Q8_1 form starting at element `quantized_offset`.
-pub fn publish(
+pub(super) fn publish(
     packed: &Tensor,
     activation_offset: usize,
     len: usize,
@@ -65,10 +63,10 @@ pub fn publish(
 ) -> Result<()> {
     let (storage, _) = packed.storage_and_layout();
     let Storage::Cuda(storage) = &*storage else {
-        crate::bail!("a published Q8_1 activation must be on CUDA")
+        candle_core::bail!("a published Q8_1 activation must be on CUDA")
     };
     if storage.dtype() != DType::F32 {
-        crate::bail!("a published Q8_1 activation must be F32")
+        candle_core::bail!("a published Q8_1 activation must be F32")
     }
     let slice = storage.as_cuda_slice::<f32>()?;
     let float = std::mem::size_of::<f32>();
@@ -80,7 +78,7 @@ pub fn publish(
         && activation_end.is_some_and(|end| end <= slice.len())
         && quantized_end.is_some_and(|end| end <= slice.len() * float);
     if !fits {
-        crate::bail!("a published Q8_1 activation exceeds its storage")
+        candle_core::bail!("a published Q8_1 activation exceeds its storage")
     }
     let stream = storage.device.cuda_stream();
     let (base, sync) = slice.device_ptr(&stream);
@@ -105,7 +103,7 @@ pub fn publish(
 
 /// The device address of the published Q8_1 form of the `len` F32 values at
 /// device address `activation`, if this thread published one.
-pub fn lookup(activation: u64, len: usize) -> Option<u64> {
+pub(super) fn lookup(activation: u64, len: usize) -> Option<u64> {
     let found = ENTRIES.with(|entries| {
         entries
             .borrow()
@@ -117,9 +115,4 @@ pub fn lookup(activation: u64, len: usize) -> Option<u64> {
         HITS.with(|hits| hits.set(hits.get() + 1));
     }
     found
-}
-
-/// Forget this thread's entries and release the storage they hold.
-pub fn clear() {
-    ENTRIES.with(|entries| entries.borrow_mut().clear());
 }

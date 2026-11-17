@@ -386,7 +386,7 @@ fn captured_view<'a>(
     storage_view(name, storage, layout, elements, device)
 }
 
-type StorageGuard<'a> = (std::sync::RwLockReadGuard<'a, Storage>, &'a Layout);
+type StorageGuard<'a> = (candle_core::StorageRef<'a>, &'a Layout);
 
 fn optional_guard(tensor: &Option<Tensor>) -> Option<StorageGuard<'_>> {
     tensor.as_ref().map(Tensor::storage_and_layout)

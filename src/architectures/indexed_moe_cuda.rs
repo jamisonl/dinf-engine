@@ -173,8 +173,8 @@ mod cuda {
     use candle_core::{CpuStorage, CudaStorage, D, DType, Device, Layout, Shape, Tensor};
 
     use super::{
-        CUDA_PROMPT_OUTPUT_TILE, CUDA_PROMPT_ROUTE_TILE, CUDA_WARP_SIZE, CUDA_WARPS_PER_BLOCK,
-        Q4IndexedGeometry,
+        CUDA_MAX_GRID_Y, CUDA_PROMPT_OUTPUT_TILE, CUDA_PROMPT_ROUTE_TILE, CUDA_WARP_SIZE,
+        CUDA_WARPS_PER_BLOCK, Q4IndexedGeometry,
     };
 
     const CUDA_MODULE_NAME: &str = "dinf_indexed_moe_q4_0_v7";
@@ -1489,6 +1489,226 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
         }
     }
 
+    /// Rows of a quantized product's activation are padded to this many
+    /// values, as in Candle's `MATRIX_ROW_PADDING`.
+    const Q8_1_ROW_PADDING: usize = 512;
+    /// Threads per block of Candle's `quantize_q8_1` kernel.
+    const Q8_1_QUANTIZE_BLOCK: usize = 256;
+
+    /// Candle's indexed K-quant expert kernel, launched from the engine.
+    ///
+    /// The launch is Candle's (`QTensor::indexed_moe_forward`) with two
+    /// differences: an input or ID view that starts inside a larger buffer
+    /// is read from where it starts, and one input row whose producer
+    /// already wrote its Q8_1 form (see `q8_1_memo_cuda`) skips the
+    /// quantization launch. The kernels and their arguments are unchanged,
+    /// so the output has the same bits.
+    struct CandleIndexedKQuant<'a> {
+        weights: &'a QTensor,
+    }
+
+    fn candle_indexed_kernel(dtype: GgmlDType) -> Option<&'static str> {
+        match dtype {
+            GgmlDType::Q2K => Some("indexed_moe_forward_q2k_q8_1"),
+            GgmlDType::Q3K => Some("indexed_moe_forward_q3k_q8_1"),
+            GgmlDType::Q4K => Some("indexed_moe_forward_q4k_q8_1"),
+            GgmlDType::Q5K => Some("indexed_moe_forward_q5k_q8_1"),
+            GgmlDType::Q6K => Some("indexed_moe_forward_q6k_q8_1"),
+            GgmlDType::Q8_0 => Some("indexed_moe_forward_q8_0_q8_1"),
+            _ => None,
+        }
+    }
+
+    impl candle_core::CustomOp2 for CandleIndexedKQuant<'_> {
+        fn name(&self) -> &'static str {
+            "cuda-indexed-moe-candle-k-quant"
+        }
+
+        fn cpu_fwd(
+            &self,
+            _input: &CpuStorage,
+            _input_layout: &Layout,
+            _ids: &CpuStorage,
+            _ids_layout: &Layout,
+        ) -> candle_core::Result<(CpuStorage, Shape)> {
+            candle_core::bail!("cuda-indexed-moe-candle-k-quant is only dispatched on CUDA")
+        }
+
+        fn cuda_fwd(
+            &self,
+            input: &CudaStorage,
+            input_layout: &Layout,
+            ids: &CudaStorage,
+            ids_layout: &Layout,
+        ) -> candle_core::Result<(CudaStorage, Shape)> {
+            use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+            use candle_core::cuda_backend::kernels::QUANTIZED;
+
+            let (_, out_dim, in_dim) = self.weights.shape().dims3()?;
+            let (batch, input_rows, input_dim) = input_layout.shape().dims3()?;
+            let (id_batch, top_k) = ids_layout.shape().dims2()?;
+            let Some(kernel) = candle_indexed_kernel(self.weights.dtype()) else {
+                candle_core::bail!("CUDA indexed MoE does not support this expert format")
+            };
+            if input_dim != in_dim
+                || id_batch != batch
+                || (input_rows != 1 && input_rows != top_k)
+                || batch == 0
+                || top_k == 0
+            {
+                candle_core::bail!("CUDA indexed MoE input, ID and weight shapes differ")
+            }
+            let overflow = || candle_core::Error::Msg("CUDA indexed MoE size overflow".into());
+            let total_rows = batch.checked_mul(input_rows).ok_or_else(overflow)?;
+            let input_elements = total_rows.checked_mul(in_dim).ok_or_else(overflow)?;
+            let routes = batch.checked_mul(top_k).ok_or_else(overflow)?;
+            let output_elements = routes.checked_mul(out_dim).ok_or_else(overflow)?;
+            let padded = in_dim
+                .div_ceil(Q8_1_ROW_PADDING)
+                .checked_mul(Q8_1_ROW_PADDING)
+                .ok_or_else(overflow)?;
+            // 36-byte blocks of 32 values.
+            let row_bytes = padded / 32 * 36;
+            let quantized_bytes = total_rows.checked_mul(row_bytes).ok_or_else(overflow)?;
+            if [out_dim, in_dim, batch, top_k, padded, input_rows]
+                .iter()
+                .any(|value| *value > i32::MAX as usize)
+            {
+                return Err(overflow());
+            }
+            validate_storage("input", input, input_layout, DType::F32, input_elements)?;
+            validate_storage("expert IDs", ids, ids_layout, DType::U32, routes)?;
+            let device = input.device();
+            if device.id() != ids.device().id()
+                || !self
+                    .weights
+                    .device()
+                    .same_device(&Device::Cuda(device.clone()))
+            {
+                candle_core::bail!("CUDA indexed MoE inputs and weights use different devices")
+            }
+            let input_view = checked_view_f32(
+                input.as_cuda_slice::<f32>()?,
+                input_layout,
+                input_elements,
+                "input",
+            )?;
+            let ids_view = checked_view_u32(
+                ids.as_cuda_slice::<u32>()?,
+                ids_layout,
+                routes,
+                "expert IDs",
+            )?;
+            let stream = device.cuda_stream();
+
+            let published = if total_rows == 1 {
+                let (address, _sync) = input_view.device_ptr(&stream);
+                crate::architectures::q8_1_memo_cuda::lookup(address, in_dim)
+            } else {
+                None
+            };
+            let quantized = match published {
+                Some(_) => None,
+                None => {
+                    // SAFETY: The quantization kernel writes every block of
+                    // every row, padding included.
+                    let quantized = unsafe { device.alloc::<u8>(quantized_bytes)? };
+                    let function = device.get_or_load_func("quantize_q8_1", &QUANTIZED)?;
+                    let blocks = padded.div_ceil(Q8_1_QUANTIZE_BLOCK) as u32;
+                    let width = in_dim as i32;
+                    let padded_width = padded as i32;
+                    let mut row = 0;
+                    while row < total_rows {
+                        let rows = (total_rows - row).min(CUDA_MAX_GRID_Y);
+                        let source = input_view.slice(row * in_dim..(row + rows) * in_dim);
+                        let destination =
+                            quantized.slice(row * row_bytes..(row + rows) * row_bytes);
+                        let config = LaunchConfig {
+                            grid_dim: (blocks, rows as u32, 1),
+                            block_dim: (Q8_1_QUANTIZE_BLOCK as u32, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let mut builder = function.builder();
+                        builder
+                            .arg(&source)
+                            .arg(&destination)
+                            .arg(&width)
+                            .arg(&padded_width);
+                        // SAFETY: Both chunks lie inside their buffers and
+                        // the grid covers exactly `rows` padded rows.
+                        unsafe { builder.launch(config) }.w()?;
+                        row += rows;
+                    }
+                    Some(quantized)
+                }
+            };
+
+            let (weight_ptr, _weight_guard) = self.weights.device_ptr_with_guard(&stream)?;
+            let weight_address = weight_ptr as u64;
+            // SAFETY: The grid has one block per output element and each
+            // block writes its element.
+            let output = unsafe { device.alloc::<f32>(output_elements)? };
+            let function = device.get_or_load_func(kernel, &QUANTIZED)?;
+            let config = LaunchConfig {
+                grid_dim: (out_dim as u32, batch as u32, top_k as u32),
+                block_dim: (CUDA_WARP_SIZE as u32, CUDA_WARPS_PER_BLOCK as u32, 1),
+                shared_mem_bytes: 0,
+            };
+            let n = out_dim as i32;
+            let k = in_dim as i32;
+            let batch_arg = batch as i32;
+            let top_k_arg = top_k as i32;
+            let padded_arg = padded as i32;
+            let input_rows_arg = input_rows as i32;
+            let mut builder = function.builder();
+            builder.arg(&weight_address);
+            match (&quantized, &published) {
+                (Some(quantized), _) => {
+                    builder.arg(quantized);
+                }
+                (None, Some(address)) => {
+                    builder.arg(address);
+                }
+                (None, None) => unreachable!("one of the two forms was prepared above"),
+            }
+            builder
+                .arg(&ids_view)
+                .arg(&output)
+                .arg(&n)
+                .arg(&k)
+                .arg(&batch_arg)
+                .arg(&top_k_arg)
+                .arg(&padded_arg)
+                .arg(&input_rows_arg);
+            // SAFETY: Shapes, storage bounds and device identity were
+            // checked above; the weight guard and the quantized buffer live
+            // until the launch is issued.
+            unsafe { builder.launch(config) }.w()?;
+
+            Ok((
+                CudaStorage::wrap_cuda_slice(output, device.clone()),
+                Shape::from((batch, top_k, out_dim)),
+            ))
+        }
+    }
+
+    /// Candle's indexed expert product for the K-quant formats the engine's
+    /// own kernels do not cover. See [`CandleIndexedKQuant`].
+    pub(crate) fn forward_candle_k_quant(
+        input: &Tensor,
+        expert_ids: &Tensor,
+        weights: &QTensor,
+    ) -> anyhow::Result<Tensor> {
+        anyhow::ensure!(
+            candle_indexed_kernel(weights.dtype()).is_some(),
+            "CUDA indexed MoE does not support {:?} experts",
+            weights.dtype()
+        );
+        input
+            .apply_op2_no_bwd(expert_ids, &CandleIndexedKQuant { weights })
+            .map_err(Into::into)
+    }
+
     fn validate_storage(
         name: &str,
         storage: &CudaStorage,
@@ -1696,8 +1916,8 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
 
 #[cfg(feature = "cuda")]
 pub(super) use cuda::{
-    forward, forward_grouped_wmma, forward_relu_squared, precompile, supports, supports_f32_decode,
-    supports_grouped_wmma,
+    forward, forward_candle_k_quant, forward_grouped_wmma, forward_relu_squared, precompile,
+    supports, supports_f32_decode, supports_grouped_wmma,
 };
 
 #[cfg(test)]

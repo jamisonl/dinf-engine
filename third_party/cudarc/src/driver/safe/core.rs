@@ -611,14 +611,30 @@ impl CudaEvent {
     }
 
     /// Returns `true` if all recorded work has been completed, `false` otherwise.
+    ///
+    /// This also returns `false` on CUDA errors. Use [Self::try_is_complete()] to handle errors.
     pub fn is_complete(&self) -> bool {
         unsafe { result::event::query(self.cu_event) }.is_ok()
+    }
+
+    /// Queries whether all recorded work has completed, without waiting.
+    ///
+    /// Returns `Ok(false)` only for [sys::CUresult::CUDA_ERROR_NOT_READY]. Other CUDA errors
+    /// are returned to the caller, including errors from earlier asynchronous launches.
+    /// An event that has not been recorded returns `Ok(true)`.
+    pub fn try_is_complete(&self) -> Result<bool, DriverError> {
+        match unsafe { result::event::query(self.cu_event) } {
+            Ok(()) => Ok(true),
+            Err(DriverError(sys::CUresult::CUDA_ERROR_NOT_READY)) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 }
 
 /// A wrapper around [sys::CUstream] that you can schedule work on.
 ///
 /// - Create with [CudaContext::new_stream()], [CudaContext::default_stream()], or [CudaStream::fork()].
+/// - Wrap a stream owned by another library with [CudaContext::wrap_borrowed_stream()].
 ///
 /// **Work done on this is asynchronous with respect to the host.**
 ///
@@ -627,17 +643,29 @@ impl CudaEvent {
 /// See [6.6. Event Management](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EVENT.html)
 /// See [Out-of-order execution](https://en.wikipedia.org/wiki/Out-of-order_execution)
 /// See [Dependence analysis](https://en.wikipedia.org/wiki/Dependence_analysis)
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct CudaStream {
     pub(crate) cu_stream: sys::CUstream,
     pub(crate) ctx: Arc<CudaContext>,
+    pub(crate) owned: bool,
 }
 
 unsafe impl Send for CudaStream {}
 unsafe impl Sync for CudaStream {}
 
+impl PartialEq for CudaStream {
+    fn eq(&self, other: &Self) -> bool {
+        self.cu_stream == other.cu_stream && self.ctx == other.ctx
+    }
+}
+
+impl Eq for CudaStream {}
+
 impl Drop for CudaStream {
     fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
         self.ctx.record_err(self.ctx.bind_to_thread());
         let cu_stream = std::mem::replace(&mut self.cu_stream, std::ptr::null_mut());
         if !cu_stream.is_null() && cu_stream != (0x2 as _) {
@@ -658,6 +686,7 @@ impl CudaContext {
         Arc::new(CudaStream {
             cu_stream: std::ptr::null_mut(),
             ctx: self.clone(),
+            owned: false,
         })
     }
 
@@ -667,6 +696,29 @@ impl CudaContext {
             // See https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html#group__CUDART__TYPES_1g7b7129befd6f52708309acafd1c46197
             cu_stream: 0x2 as _,
             ctx: self.clone(),
+            owned: false,
+        })
+    }
+
+    /// Wraps a CUDA stream owned by another library.
+    ///
+    /// Dropping the returned wrapper does not destroy the underlying stream.
+    ///
+    /// # Safety
+    ///
+    /// - `cu_stream` must be a valid CUDA stream belonging to this context.
+    /// - The stream's owner must keep it alive while the returned wrapper, or
+    ///   anything retaining it, may be used.
+    /// - The caller is responsible for ordering work submitted through cudarc
+    ///   with work submitted through the stream's owner.
+    pub unsafe fn wrap_borrowed_stream(
+        self: &Arc<Self>,
+        cu_stream: sys::CUstream,
+    ) -> Arc<CudaStream> {
+        Arc::new(CudaStream {
+            cu_stream,
+            ctx: self.clone(),
+            owned: false,
         })
     }
 
@@ -684,6 +736,7 @@ impl CudaContext {
         Ok(Arc::new(CudaStream {
             cu_stream,
             ctx: self.clone(),
+            owned: true,
         }))
     }
 
@@ -711,6 +764,7 @@ impl CudaContext {
         Ok(Arc::new(CudaStream {
             cu_stream,
             ctx: self.clone(),
+            owned: true,
         }))
     }
 }
@@ -724,6 +778,7 @@ impl CudaStream {
         let stream = Arc::new(CudaStream {
             cu_stream,
             ctx: self.ctx.clone(),
+            owned: true,
         });
         stream.join(self)?;
         Ok(stream)
@@ -803,11 +858,13 @@ unsafe impl<T> Sync for CudaSlice<T> {}
 impl<T> Drop for CudaSlice<T> {
     fn drop(&mut self) {
         let ctx = &self.stream.ctx;
-        if let Some(read) = self.read.as_ref() {
-            ctx.record_err(self.stream.wait(read));
-        }
-        if let Some(write) = self.write.as_ref() {
-            ctx.record_err(self.stream.wait(write));
+        if ctx.is_managing_stream_synchronization() {
+            if let Some(read) = self.read.as_ref() {
+                ctx.record_err(self.stream.wait(read));
+            }
+            if let Some(write) = self.write.as_ref() {
+                ctx.record_err(self.stream.wait(write));
+            }
         }
         // Local patch: a capture window holds the memory until it ends, and
         // pool blocks return to the pool. See `capture_window`.
@@ -948,7 +1005,7 @@ impl<T> CudaSlice<T> {
     }
 }
 
-impl<T> CudaViewMut<'_, T> {
+impl<'a, T> CudaViewMut<'a, T> {
     /// Number of elements `T` that are in this view.
     pub fn len(&self) -> usize {
         self.len
@@ -959,6 +1016,18 @@ impl<T> CudaViewMut<'_, T> {
 
     /// Downgrade this to a `&[T]`
     pub fn as_view<'b>(&'b self) -> CudaView<'b, T> {
+        CudaView {
+            ptr: self.ptr,
+            len: self.len,
+            read: self.read,
+            write: self.write,
+            stream: self.stream,
+            marker: PhantomData,
+        }
+    }
+
+    /// Downgrate this into to a `&[T]`, consuming the current view and keeping the original lifetime 'a
+    pub fn into_view(self) -> CudaView<'a, T> {
         CudaView {
             ptr: self.ptr,
             len: self.len,
@@ -1140,7 +1209,9 @@ impl Drop for SyncOnDrop<'_> {
         match self {
             SyncOnDrop::Record(target) => {
                 if let Some((event, stream)) = std::mem::take(target) {
-                    stream.ctx.record_err(event.record(stream));
+                    if stream.ctx.is_managing_stream_synchronization() {
+                        stream.ctx.record_err(event.record(stream));
+                    }
                 }
             }
             SyncOnDrop::Sync(target) => {
@@ -1421,17 +1492,39 @@ impl CudaContext {
         self: &Arc<Self>,
         len: usize,
     ) -> Result<PinnedHostSlice<T>, DriverError> {
+        self.alloc_pinned_with_flags(len, sys::CU_MEMHOSTALLOC_WRITECOMBINED)
+    }
+
+    /// Allocates page-locked host memory with the specified `flags`.
+    ///
+    /// `flags` may contain any combination of the following options:
+    ///
+    /// - [sys::CU_MEMHOSTALLOC_PORTABLE]
+    /// - [sys::CU_MEMHOSTALLOC_DEVICEMAP]
+    /// - [sys::CU_MEMHOSTALLOC_WRITECOMBINED]
+    ///
+    /// These flags are orthogonal and may be combined without restriction.
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1g572ca4011bfcb25034888a14d4e035b9)
+    ///
+    /// # Safety
+    /// 1. This is unsafe because the memory is unset after this call.
+    pub unsafe fn alloc_pinned_with_flags<T: DeviceRepr>(
+        self: &Arc<Self>,
+        len: usize,
+        flags: u32,
+    ) -> Result<PinnedHostSlice<T>, DriverError> {
         self.bind_to_thread()?;
-        let ptr = result::malloc_host(
-            len * std::mem::size_of::<T>(),
-            sys::CU_MEMHOSTALLOC_WRITECOMBINED,
-        )?;
-        let ptr = ptr as *mut T;
-        assert!(!ptr.is_null());
-        assert!(len * std::mem::size_of::<T>() < isize::MAX as usize);
-        assert!(ptr.is_aligned());
+        let num_bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .expect("Pinned host allocation size overflow");
+        assert!(num_bytes < isize::MAX as usize);
         let event = self.new_event(Some(sys::CUevent_flags::CU_EVENT_BLOCKING_SYNC))?;
-        Ok(PinnedHostSlice { ptr, len, event })
+        let ptr = result::malloc_host(num_bytes, flags)?;
+        let ptr = ptr as *mut T;
+        let allocation = PinnedHostSlice { ptr, len, event };
+        assert!(!ptr.is_null());
+        assert!(ptr.is_aligned());
+        Ok(allocation)
     }
 }
 
@@ -2329,6 +2422,14 @@ impl CudaModule {
 }
 
 impl CudaFunction {
+    /// Returns the raw CUDA Driver function handle.
+    ///
+    /// The returned handle remains valid only while this function and its
+    /// owning module remain alive.
+    pub fn cu_function(&self) -> sys::CUfunction {
+        self.cu_function
+    }
+
     pub fn occupancy_available_dynamic_smem_per_block(
         &self,
         num_blocks: u32,
@@ -2540,11 +2641,13 @@ impl<T> CudaSlice<T> {
         let ptr = s.cu_device_ptr;
 
         // Ensure pending operations are complete before resources are released.
-        if let Some(read) = s.read.as_ref() {
-            s.stream.ctx.record_err(s.stream.wait(read));
-        }
-        if let Some(write) = s.write.as_ref() {
-            s.stream.ctx.record_err(s.stream.wait(write));
+        if s.stream.ctx.is_managing_stream_synchronization() {
+            if let Some(read) = s.read.as_ref() {
+                s.stream.ctx.record_err(s.stream.wait(read));
+            }
+            if let Some(write) = s.write.as_ref() {
+                s.stream.ctx.record_err(s.stream.wait(write));
+            }
         }
 
         // Manually drop fields that own resources.
@@ -2593,9 +2696,73 @@ impl CudaStream {
 
 #[cfg(test)]
 mod tests {
+    use std::hint::black_box;
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn test_event_try_is_complete() {
+        use std::boxed::Box;
+        use std::sync::mpsc::{channel, Receiver};
+        use std::time::Duration;
+
+        unsafe extern "C" fn wait_for_release(data: *mut std::ffi::c_void) {
+            // The callback owns the receiver and makes no CUDA calls.
+            let receiver = unsafe { Box::from_raw(data.cast::<Receiver<()>>()) };
+            let _ = receiver.recv_timeout(Duration::from_secs(30));
+        }
+
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        let event = ctx.new_event(None).unwrap();
+        assert_eq!(event.try_is_complete(), Ok(true));
+
+        let (release, receiver) = channel();
+        let receiver = Box::into_raw(Box::new(receiver));
+        let launch = unsafe {
+            sys::cuLaunchHostFunc(stream.cu_stream(), Some(wait_for_release), receiver.cast())
+                .result()
+        };
+        if let Err(error) = launch {
+            // A failed launch did not transfer ownership to the callback.
+            unsafe { drop(Box::from_raw(receiver)) };
+            panic!("cuLaunchHostFunc failed: {error:?}");
+        }
+        event.record(&stream).unwrap();
+        let pending = event.try_is_complete();
+        let legacy_complete = event.is_complete();
+        release.send(()).unwrap();
+        event.synchronize().unwrap();
+
+        assert_eq!(pending, Ok(false));
+        assert!(!legacy_complete);
+        assert_eq!(event.try_is_complete(), Ok(true));
+        assert!(event.is_complete());
+    }
+
+    #[test]
+    fn test_event_try_is_complete_preserves_capture_error() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        let event = ctx.new_event(None).unwrap();
+        stream
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .unwrap();
+        event.record(&stream).unwrap();
+        let status = event.try_is_complete();
+        let legacy_complete = event.is_complete();
+        // Querying a captured event invalidates capture. End it before asserting.
+        let _ = stream.end_capture(
+            sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        );
+
+        assert_eq!(
+            status,
+            Err(DriverError(sys::CUresult::CUDA_ERROR_CAPTURED_EVENT))
+        );
+        assert!(!legacy_complete);
+    }
 
     #[test]
     fn test_transmutes() {
@@ -2644,6 +2811,28 @@ mod tests {
     fn test_post_build_arc_count() {
         let ctx = CudaContext::new(0).unwrap();
         assert_eq!(Arc::strong_count(&ctx), 1);
+    }
+
+    #[test]
+    fn test_borrowed_stream_is_not_destroyed_on_drop() {
+        let ctx = CudaContext::new(0).unwrap();
+        ctx.bind_to_thread().unwrap();
+        let raw = result::stream::create(result::stream::StreamKind::NonBlocking).unwrap();
+
+        {
+            let stream = unsafe { ctx.wrap_borrowed_stream(raw) };
+            assert_eq!(stream.cu_stream(), raw);
+            assert_eq!(stream.context(), &ctx);
+
+            let data = stream.clone_htod(&[1_u32, 2, 3]).unwrap();
+            stream.synchronize().unwrap();
+            drop(data);
+        }
+
+        unsafe {
+            result::stream::synchronize(raw).unwrap();
+            result::stream::destroy(raw).unwrap();
+        }
     }
 
     #[test]
@@ -2759,6 +2948,64 @@ mod tests {
         let dst = stream.clone_htod(&pinned).unwrap();
         let host = stream.clone_dtoh(&dst).unwrap();
         assert_eq!(&host, &truth);
+    }
+
+    #[test]
+    fn test_htod_copy_pinned_with_default_flags() {
+        let truth = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
+        let mut pinned = unsafe { ctx.alloc_pinned_with_flags::<f32>(10, 0) }.unwrap();
+        pinned.as_mut_slice().unwrap().clone_from_slice(&truth);
+        assert_eq!(pinned.as_slice().unwrap(), &truth);
+        let dst = stream.clone_htod(&pinned).unwrap();
+        let host = stream.clone_dtoh(&dst).unwrap();
+        assert_eq!(&host, &truth);
+    }
+
+    #[test]
+    #[should_panic(expected = "Pinned host allocation size overflow")]
+    fn test_alloc_pinned_panics_on_size_overflow() {
+        let ctx = CudaContext::new(0).unwrap();
+        let _ = unsafe { ctx.alloc_pinned_with_flags::<u32>(usize::MAX, 0) };
+    }
+
+    #[test]
+    fn test_default_pinned_host_reads_are_faster_than_write_combined() {
+        fn timed_host_reads(values: &[u32], n_samples: usize) -> (std::time::Duration, u64) {
+            let start = Instant::now();
+            let mut sum = 0_u64;
+            for _ in 0..n_samples {
+                for value in black_box(values) {
+                    sum = sum.wrapping_add(u64::from(*value));
+                }
+            }
+            (start.elapsed(), black_box(sum))
+        }
+
+        let ctx = CudaContext::new(0).unwrap();
+        let n = 1 << 20;
+        let n_samples = 5;
+        let mut write_combined =
+            unsafe { ctx.alloc_pinned_with_flags::<u32>(n, sys::CU_MEMHOSTALLOC_WRITECOMBINED) }
+                .unwrap();
+        let mut default = unsafe { ctx.alloc_pinned_with_flags::<u32>(n, 0) }.unwrap();
+        write_combined.as_mut_slice().unwrap().fill(1);
+        default.as_mut_slice().unwrap().fill(1);
+
+        let (write_combined_elapsed, write_combined_sum) =
+            timed_host_reads(write_combined.as_slice().unwrap(), n_samples);
+        let (default_elapsed, default_sum) =
+            timed_host_reads(default.as_slice().unwrap(), n_samples);
+        assert_eq!(write_combined_sum, default_sum);
+        std::println!(
+            "default pinned host reads: {default_elapsed:?}; write-combined host reads: {write_combined_elapsed:?}"
+        );
+        // The performance gap should be large, but leave margin for device and host variance.
+        assert!(
+            default_elapsed.as_secs_f32() * 2.0 < write_combined_elapsed.as_secs_f32(),
+            "{default_elapsed:?} vs {write_combined_elapsed:?}"
+        );
     }
 
     #[test]

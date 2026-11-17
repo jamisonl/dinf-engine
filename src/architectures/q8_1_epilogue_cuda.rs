@@ -5,7 +5,7 @@
 //! A kernel that produces an activation for one decode token can write the
 //! blocks itself with [`SOURCE`] and publish them with [`publish`]; products
 //! of that activation then skip their quantization launch (see
-//! `candle_core::quantized::q8_1_memo`).
+//! `q8_1_memo_cuda`).
 //!
 //! The device function performs the stock quantizer's operations in its
 //! order, so the blocks are the bytes that kernel would write.
@@ -61,7 +61,7 @@ static __device__ __forceinline__ int dinf_q8_1_padded(int values) {
 
 /// F32 elements that hold the Q8_1 form of one row of `len` values.
 pub(super) fn tail_elements(len: usize) -> usize {
-    candle_core::quantized::q8_1_memo::quantized_bytes(len) / std::mem::size_of::<f32>()
+    super::q8_1_memo_cuda::quantized_bytes(len) / std::mem::size_of::<f32>()
 }
 
 /// Publish the `len` values at element `activation_offset` of `packed`'s
@@ -72,7 +72,7 @@ pub(super) fn publish(
     len: usize,
     quantized_offset: usize,
 ) -> anyhow::Result<()> {
-    candle_core::quantized::q8_1_memo::publish(packed, activation_offset, len, quantized_offset)
+    super::q8_1_memo_cuda::publish(packed, activation_offset, len, quantized_offset)
         .map_err(Into::into)
 }
 
@@ -80,13 +80,14 @@ pub(super) fn publish(
 mod tests {
     use std::sync::Arc;
 
-    use candle_core::quantized::{GgmlDType, QTensor, q8_1_memo};
+    use candle_core::quantized::{GgmlDType, QTensor};
     use candle_core::{DType, Device, Tensor};
 
     use crate::architectures::dense_qmatmul_cuda::forward_one_to_f32;
     use crate::architectures::gemma4_norm_fusion_cuda::{
         MoePlanes, MoeTail, try_attention_planes, try_post_ffn,
     };
+    use crate::architectures::q8_1_memo_cuda as q8_1_memo;
     use crate::qmatmul::QMatMul;
 
     fn values(elements: usize, multiplier: usize) -> Vec<f32> {

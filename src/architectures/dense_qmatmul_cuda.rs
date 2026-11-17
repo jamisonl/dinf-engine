@@ -1039,7 +1039,7 @@ fn published_q8_1(input: cuda_sys::CUdeviceptr, input_dim: usize, rows: usize) -
     if rows != 1 {
         return None;
     }
-    candle_core::quantized::q8_1_memo::lookup(input, input_dim)
+    super::q8_1_memo_cuda::lookup(input, input_dim)
 }
 
 fn checked_f32_view<'a>(

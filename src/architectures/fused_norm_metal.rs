@@ -1577,11 +1577,7 @@ impl CustomOp2 for PostNormResidual {
             .as_ref()
             .map(|(weight, _)| weight.storage_and_layout());
         let scale_guard = self.scale.as_ref().map(Tensor::storage_and_layout);
-        let metal = |guard: &Option<(
-            std::sync::RwLockReadGuard<'_, candle_core::Storage>,
-            &Layout,
-        )>|
-         -> Result<Option<(MetalStorage, usize)>> {
+        let metal = |guard: &Option<(candle_core::StorageRef<'_>, &Layout)>| -> Result<Option<(MetalStorage, usize)>> {
             match guard {
                 None => Ok(None),
                 Some((storage, layout)) => match &**storage {

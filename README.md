@@ -119,13 +119,12 @@ Stage and architecture APIs may change before a stable release.
 | Metal | `cargo build --release` on macOS | Enabled automatically on macOS. |
 | CUDA | `cargo build --release --features cuda` | Requires a CUDA toolchain. |
 
-The repository vendors patched copies of `candle-core`,
-`candle-metal-kernels`, `cudaforge`, `cudarc` and `gemm-common` under
-`third_party/`, wired in through `[patch.crates-io]`
-in `Cargo.toml`. Builds must use these patches. Cargo applies `[patch]`
-sections only from the top-level workspace, so a project that depends on
-dinf-engine must copy the same `[patch.crates-io]` entries into its own
-`Cargo.toml`.
+The repository vendors patched copies of `candle-metal-kernels`, `cudaforge`,
+`cudarc` and `gemm-common` under `third_party/`, wired in through
+`[patch.crates-io]` in `Cargo.toml`. Builds must use these patches. Cargo
+applies `[patch]` sections only from the top-level workspace, so a project
+that depends on dinf-engine must copy the same `[patch.crates-io]` entries
+into its own `Cargo.toml`.
 
 ## Testing
 

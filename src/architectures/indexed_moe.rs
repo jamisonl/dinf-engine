@@ -465,7 +465,7 @@ impl IndexedMoeMatMul {
                         self.in_dim,
                     )?
                 } else {
-                    weights.indexed_moe_forward(&input, &expert_ids)?
+                    super::indexed_moe_cuda::forward_candle_k_quant(&input, &expert_ids, weights)?
                 }
             }
         };
