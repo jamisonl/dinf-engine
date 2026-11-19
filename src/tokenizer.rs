@@ -440,7 +440,11 @@ impl ChatTemplateToolCall {
 
 const MAX_CHAT_TEMPLATE_MESSAGES: usize = 4_096;
 const MAX_CHAT_TEMPLATE_TOOLS: usize = 128;
+/// Calls in one assistant message. The API allows the same number per message.
 const MAX_CHAT_TEMPLATE_TOOL_CALLS: usize = 128;
+/// Calls across the whole chat. A long agent session replays hundreds of
+/// earlier calls; the prompt size limit, not this count, is what bounds it.
+const MAX_CHAT_TEMPLATE_TOTAL_TOOL_CALLS: usize = 4_096;
 const MAX_CHAT_TEMPLATE_TOOL_NAME_BYTES: usize = 64;
 const MAX_CHAT_TEMPLATE_TOOL_ID_BYTES: usize = 256;
 const MAX_CHAT_TEMPLATE_DESCRIPTION_BYTES: usize = 16 * 1024;
@@ -2131,8 +2135,14 @@ impl GgufTokenizer {
             .map(|message| message.tool_calls.len())
             .sum::<usize>();
         anyhow::ensure!(
-            call_count <= MAX_CHAT_TEMPLATE_TOOL_CALLS,
-            "tool-capable chat exceeds {MAX_CHAT_TEMPLATE_TOOL_CALLS} tool calls"
+            messages
+                .iter()
+                .all(|message| message.tool_calls.len() <= MAX_CHAT_TEMPLATE_TOOL_CALLS),
+            "tool-capable chat exceeds {MAX_CHAT_TEMPLATE_TOOL_CALLS} tool calls in one message"
+        );
+        anyhow::ensure!(
+            call_count <= MAX_CHAT_TEMPLATE_TOTAL_TOOL_CALLS,
+            "tool-capable chat exceeds {MAX_CHAT_TEMPLATE_TOTAL_TOOL_CALLS} tool calls"
         );
         if self.chat_style == ChatStyle::MuseSpark {
             return format_muse_chat(messages, options, self.add_bos);
@@ -4634,6 +4644,50 @@ mod tests {
                 assert!(formatted.ends_with(suffix));
             }
         }
+    }
+
+    #[test]
+    fn long_tool_histories_are_bounded_per_message_not_per_chat() {
+        let mut tok = test_tokenizer_sp();
+        tok.chat_style = ChatStyle::Qwen3;
+        let options = ChatTemplateOptions::new([]);
+        // A long agent session: far more calls in total than one message may hold.
+        let mut history = vec![ChatTemplateMessage::new("user", "Build it.")];
+        for step in 0..300 {
+            let id = format!("call-{step}");
+            history.push(
+                ChatTemplateMessage::new("assistant", "").with_tool_calls([
+                    ChatTemplateToolCall::new("lookup", "{}").with_id(id.clone()),
+                ]),
+            );
+            history.push(ChatTemplateMessage::new("tool", "ok").with_tool_call_id(id));
+        }
+        let formatted = tok
+            .format_chat_with_tool_options(&history, &options)
+            .unwrap();
+        assert_eq!(formatted.matches("<tool_response>").count(), 300);
+
+        let crowded =
+            |calls: usize| {
+                vec![
+                    ChatTemplateMessage::new("user", "Go."),
+                    ChatTemplateMessage::new("assistant", "").with_tool_calls((0..calls).map(
+                        |n| ChatTemplateToolCall::new("lookup", "{}").with_id(format!("c{n}")),
+                    )),
+                ]
+            };
+        assert!(
+            tok.format_chat_with_tool_options(&crowded(MAX_CHAT_TEMPLATE_TOOL_CALLS), &options)
+                .is_ok()
+        );
+        let error = tok
+            .format_chat_with_tool_options(&crowded(MAX_CHAT_TEMPLATE_TOOL_CALLS + 1), &options)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "tool-capable chat exceeds 128 tool calls in one message"
+        );
     }
 
     #[test]
