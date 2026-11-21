@@ -160,6 +160,9 @@ impl ToolConstraint {
         if format == ToolFormat::Atem {
             return atem_grammar(&tools, options);
         }
+        if format == ToolFormat::Inkling {
+            return inkling_grammar(&tools, options);
+        }
         let mut grammar = String::from("%llguidance {\"no_forcing\":true}\nWS: /[ \\t\\r\\n]*/\n");
         grammar.push_str(&excluding_terminal(
             "TEXT",
@@ -271,7 +274,9 @@ impl ToolConstraint {
                     options.parallel_tool_calls,
                 )?);
             }
-            ToolFormat::Atem => unreachable!("recipient grammar handled above"),
+            ToolFormat::Atem | ToolFormat::Inkling => {
+                unreachable!("message grammars handled above")
+            }
         }
         Ok(grammar)
     }
@@ -414,7 +419,7 @@ fn native_grammar(
                         ToolFormat::DeepSeek => "</｜DSML｜parameter>",
                         ToolFormat::DeepSeekV41 => "</｜DSML｜ parameter>",
                         ToolFormat::Atem => "</atem:parameter>",
-                        ToolFormat::Json => unreachable!(),
+                        ToolFormat::Json | ToolFormat::Inkling => unreachable!(),
                     };
                     let tail = format!("{id}_tail");
                     let ws = if format == ToolFormat::Qwen { "WS" } else { "" };
@@ -440,7 +445,7 @@ fn native_grammar(
                             "{id}: {} {tail} WS\n",
                             literal(&format!("<atem:parameter name=\"{key}\">"))?
                         )),
-                        ToolFormat::Json => unreachable!(),
+                        ToolFormat::Json | ToolFormat::Inkling => unreachable!(),
                     }
                     continue;
                 }
@@ -449,7 +454,7 @@ fn native_grammar(
                     ToolFormat::Glm => grammar.push_str(&format!("{id}: \"<arg_key>\" {} \"</arg_key>\" \"<arg_value>\" {body} \"</arg_value>\"\n", literal(key)?)),
                     ToolFormat::DeepSeek | ToolFormat::DeepSeekV41 => grammar.push_str(&format!("{id}: {} {body} {} WS\n", literal(&format!("<｜DSML｜{dsml_space}parameter name=\"{key}\" string=\"{string}\">"))?, literal(&dsml_parameter_end)?)),
                     ToolFormat::Atem => grammar.push_str(&format!("{id}: {} WS {body} WS \"</atem:parameter>\" WS\n", literal(&format!("<atem:parameter name=\"{key}\">"))?)),
-                    ToolFormat::Json => unreachable!(),
+                    ToolFormat::Json | ToolFormat::Inkling => unreachable!(),
                 }
             }
         }
@@ -477,7 +482,7 @@ fn native_grammar(
                 "{id}: {} WS {parameters} \"</atem:invoke>\" WS\n",
                 literal(&format!("<atem:invoke name=\"{}\">", tool.name))?
             )),
-            ToolFormat::Json => unreachable!(),
+            ToolFormat::Json | ToolFormat::Inkling => unreachable!(),
         }
     }
     if format == ToolFormat::Atem {
@@ -539,6 +544,64 @@ fn atem_grammar(tools: &[&ChatTemplateTool], options: &ChatTemplateOptions) -> R
         "(muse_user | muse_calls)"
     };
     grammar.push_str(&format!("start: (muse_self | muse_commentary)* {end}\n"));
+    Ok(grammar)
+}
+
+/// Inkling 2 frames every model message. Reasoning and text messages may
+/// quote tool calls; only a model message whose header names a declared tool
+/// enters the call grammar, and its body is `{"name":NAME,"args":{...}}`.
+fn inkling_grammar(tools: &[&ChatTemplateTool], options: &ChatTemplateOptions) -> Result<String> {
+    use crate::tokenizer::{
+        INKLING_CONTENT_INVOKE_TOOL_JSON, INKLING_CONTENT_TEXT, INKLING_CONTENT_THINKING,
+        INKLING_END_MESSAGE, INKLING_MESSAGE_MODEL,
+    };
+    let mut grammar = String::from("%llguidance {\"no_forcing\":true}\nWS: /[ \\t\\r\\n]*/\n");
+    grammar.push_str(&excluding_terminal("INK_BODY", &[INKLING_END_MESSAGE]));
+    grammar.push_str(&format!(
+        "ink_thought: {} ink_tail\nink_text: {} ink_tail\nink_tail[lazy]: INK_BODY {}\n",
+        literal(&format!(
+            "{INKLING_MESSAGE_MODEL}{INKLING_CONTENT_THINKING}"
+        ))?,
+        literal(&format!("{INKLING_MESSAGE_MODEL}{INKLING_CONTENT_TEXT}"))?,
+        literal(INKLING_END_MESSAGE)?
+    ));
+    let mut calls = Vec::new();
+    for (index, tool) in tools.iter().enumerate() {
+        let id = format!("ink_call_{index}");
+        let body = json!({
+            "type": "object",
+            "properties": {
+                "name": {"const": tool.name},
+                "args": {"allOf": [{"type": "object"}, parameter_schema(tool)?]},
+            },
+            "required": ["name", "args"],
+            "additionalProperties": false,
+        });
+        grammar.push_str(&format!(
+            "{id}: {} %json {} {}\n",
+            literal(&format!(
+                "{INKLING_MESSAGE_MODEL}{}{INKLING_CONTENT_INVOKE_TOOL_JSON}",
+                tool.name
+            ))?,
+            serde_json::to_string(&body)?,
+            literal(INKLING_END_MESSAGE)?
+        ));
+        calls.push(id);
+    }
+    grammar.push_str(&format!("ink_call: {}\n", calls.join(" | ")));
+    // Calls end in WS, as the other formats' do: without a trailing lexeme
+    // that can be empty, the grammar refuses EOS once no further call fits.
+    grammar.push_str(if options.parallel_tool_calls {
+        "ink_calls: ink_call{1,16} WS\n"
+    } else {
+        "ink_calls: ink_call WS\n"
+    });
+    let calls = if options.tool_choice.requires_tool() {
+        "ink_calls"
+    } else {
+        "ink_calls?"
+    };
+    grammar.push_str(&format!("start: (ink_thought | ink_text)* {calls}\n"));
     Ok(grammar)
 }
 
@@ -717,7 +780,7 @@ mod sampling_tests {
 mod deepseek41_tests {
     use super::*;
 
-    fn accepts(grammar: &str, text: &str) -> bool {
+    pub(super) fn accepts(grammar: &str, text: &str) -> bool {
         let mut words = (0u8..=255).map(|byte| vec![byte]).collect::<Vec<_>>();
         words.push(vec![TokTrie::SPECIAL_TOKEN_MARKER, b'E']);
         let trie = TokTrie::from(&TokRxInfo::new(257, 256), &words);
@@ -858,5 +921,54 @@ mod deepseek41_tests {
             .with_parameters_json(r#"{"type":"object","minProperties":1}"#)])
         .with_tool_choice(ChatTemplateToolChoice::Required);
         assert!(ToolConstraint::grammar(ToolFormat::DeepSeekV41, &options, None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod inkling_tests {
+    use super::deepseek41_tests::accepts;
+    use super::*;
+
+    #[test]
+    fn inkling_grammar_frames_messages_and_constrains_calls() {
+        let weather = ChatTemplateTool::new("get_weather").with_parameters_json(
+            r#"{"type":"object","properties":{"city":{"type":"string"},"unit":{"type":"string","enum":["celsius","fahrenheit"]}},"required":["city"],"additionalProperties":false}"#,
+        );
+        let options = ChatTemplateOptions::new([weather]);
+        let grammar = ToolConstraint::grammar(ToolFormat::Inkling, &options, None).unwrap();
+        // The Q8_0 model's own output for a two-city request.
+        let thought = "<|message_model|><|content_thinking|>Need get_weather for both. Example: <|message_model|>get_weather<|content_invoke_tool_json|>{}<|end_message|>";
+        let call = |city: &str| {
+            format!(
+                r#"<|message_model|>get_weather<|content_invoke_tool_json|>{{"name":"get_weather","args":{{"city":"{city}","unit":"celsius"}}}}<|end_message|>"#
+            )
+        };
+        let calls = format!("{thought}{}{}", call("Paris"), call("Tokyo"));
+        assert!(accepts(&grammar, &calls));
+        let answer = "<|message_model|><|content_thinking|>Easy.<|end_message|><|message_model|><|content_text|>Paris: 14°C.<|end_message|>";
+        assert!(accepts(&grammar, answer));
+        for invalid in [
+            calls.replace("get_weather<|content_invoke", "get_time<|content_invoke"),
+            calls.replace("\"celsius\"", "\"kelvin\""),
+            calls.replace(r#""name":"get_weather","#, r#""name":"get_time","#),
+            calls.replace("\"args\"", "\"arguments\""),
+            calls.trim_end_matches("<|end_message|>").to_owned(),
+            format!("{}{answer}", call("Paris")),
+            "Paris".to_owned(),
+        ] {
+            assert!(!accepts(&grammar, &invalid), "{invalid}");
+        }
+        // A required call refuses a text-only turn; a serial request one call.
+        let required = options
+            .clone()
+            .with_tool_choice(ChatTemplateToolChoice::Required);
+        let grammar = ToolConstraint::grammar(ToolFormat::Inkling, &required, None).unwrap();
+        assert!(!accepts(&grammar, answer));
+        assert!(accepts(&grammar, &calls));
+        let serial = options.with_parallel_tool_calls(false);
+        let grammar = ToolConstraint::grammar(ToolFormat::Inkling, &serial, None).unwrap();
+
+        assert!(!accepts(&grammar, &calls));
+        assert!(accepts(&grammar, &format!("{thought}{}", call("Paris"))));
     }
 }

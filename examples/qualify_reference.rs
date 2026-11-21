@@ -406,8 +406,13 @@ fn run(
     )?;
     let metadata = read_gguf_metadata(model)?;
     let teacher = teacher_history(&reference)?;
+    // Inkling 2 pads its output head; logits cover the unpadded vocabulary.
+    let logits_vocab = metadata
+        .inkling2_loop
+        .as_ref()
+        .map_or(metadata.vocab_size, |inkling| inkling.vocab_size_unpadded);
     ensure!(
-        reference.vocab_size == metadata.vocab_size,
+        reference.vocab_size == logits_vocab,
         "reference vocabulary differs from model"
     );
     validate_reference_context(&reference, metadata.context_length)?;

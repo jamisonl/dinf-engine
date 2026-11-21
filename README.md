@@ -34,6 +34,7 @@ high-level `Engine` API or the lower-level stage and session APIs.
 - DeepSeek V4.1 Flash (Metal only; pinned checkpoints)
 - MiniMax M2.5
 - GLM-5.3 Flash
+- Inkling 2 Mini
 
 Vision input is supported for Qwen3.5, Gemma 4 and Llama 4. Speculative
 decoding uses DFlash2 draft models, and image generation uses Qwen Image.
@@ -43,7 +44,7 @@ request-state checks (chunked prefill, cancellation, cache cleanup) on Apple
 Silicon. That is a smoke test, not proof of numeric correctness. Logits have
 been compared against llama.cpp for a smaller set: Qwen2.5, Mistral 7B, Phi-3,
 Qwen3 MoE, Qwen3.5 and DeepSeek V2 Lite in full, plus targeted comparisons for
-MiniMax M2.5, Nemotron 3 Nano and Qwen3.6/3.8. See
+MiniMax M2.5, Nemotron 3 Nano, Qwen3.6/3.8 and Inkling 2 Mini (CUDA). See
 [docs/VALIDATION.md](docs/VALIDATION.md) for what was measured and its limits.
 
 The Llama-family loader has been checked with Mistral and Qwen2 checkpoints;

@@ -1616,6 +1616,13 @@ impl PipelineStage {
                     .any(|c| matches!(c, Some(LayerCache::DeepSeek41(_)))),
             "Maya history cannot be replaced by outer eviction"
         );
+        anyhow::ensure!(
+            !self
+                .cache
+                .iter()
+                .any(|c| matches!(c, Some(LayerCache::Inkling2(_)))),
+            "Inkling 2 visit state cannot be replaced by outer eviction"
+        );
         // Evict attention history, not the fixed recurrence which summarizes
         // the whole preceding sequence. Recurrent forwards create new state
         // tensors, so these immutable clones also keep failure rollback safe.
@@ -3242,6 +3249,13 @@ impl PipelineStage {
                 .iter()
                 .any(|entry| matches!(entry, Some(LayerCache::DeepSeek4(_)))),
             "V4 compressed history cannot be partially evicted; start a new request within the cache budget"
+        );
+        anyhow::ensure!(
+            !self
+                .cache
+                .iter()
+                .any(|entry| matches!(entry, Some(LayerCache::Inkling2(_)))),
+            "Inkling 2 visit state cannot be partially evicted; start a new request within the cache budget"
         );
         let mut eviction_error = None;
         for entry in self.cache.iter_mut() {

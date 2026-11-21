@@ -1309,6 +1309,7 @@ mod tests {
             indexer_kpool_select_tail: false,
             swiglu_clamp_exp: Vec::new(),
             swiglu_clamp_shexp: Vec::new(),
+            inkling2_loop: None,
         }
     }
 

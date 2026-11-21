@@ -54,6 +54,19 @@ impl Module for QMatMul {
                 if weight.device().is_metal() && weight.dtype() == GgmlDType::Q2K {
                     candle_core::bail!("packed Metal Q2_K must use QMatMul::from_arc/from_qtensor")
                 }
+                // Candle's Metal matrix-matrix path (more than one row) reads the
+                // input from the start of its buffer, ignoring a view's offset.
+                let copied;
+                let input = if input.device().is_metal()
+                    && input.layout().start_offset() != 0
+                    && input.rank() >= 2
+                    && input.dim(candle_core::D::Minus2)? != 1
+                {
+                    copied = input.force_contiguous()?;
+                    &copied
+                } else {
+                    input
+                };
                 CandleQMatMul::QTensor(Arc::clone(weight)).forward(input)
             }
             Self::Tensor(weight) => CandleQMatMul::Tensor(weight.clone()).forward(input),

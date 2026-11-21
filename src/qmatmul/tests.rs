@@ -1,6 +1,6 @@
 use super::QMatMul;
 use candle_core::quantized::{GgmlDType, QMatMul as CandleQMatMul, QTensor};
-use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
 use std::sync::Arc;
 
 fn exact(a: &Tensor, b: &Tensor) -> Result<()> {
@@ -149,6 +149,43 @@ fn metal_q2_covers_tails_views_batches_and_dropped_neighbors() -> anyhow::Result
         assert!(QMatMul::QTensor(qt).forward(&input).is_err());
         assert!(projection.forward(&input.to_dtype(DType::F16)?).is_err());
         assert!(projection.forward(&input.flatten_all()?).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn metal_quantized_projection_respects_offset_prompt_views() -> anyhow::Result<()> {
+    let Some(device) = crate::test_metal_device() else {
+        return Ok(());
+    };
+    let weights = Tensor::from_vec(
+        (0..64 * 256)
+            .map(|i| (i % 29) as f32 / 32. - 0.4)
+            .collect::<Vec<_>>(),
+        (64, 256),
+        &device,
+    )?;
+    // Three blocks of five rows; the projection sees the middle and last.
+    let groups = Tensor::from_vec(
+        (0..3 * 5 * 256)
+            .map(|i| (i % 41) as f32 / 32. - 0.6)
+            .collect::<Vec<_>>(),
+        (3, 5, 256),
+        &device,
+    )?;
+    for kind in [GgmlDType::Q8_0, GgmlDType::Q4K] {
+        let projection = QMatMul::from_arc(Arc::new(QTensor::quantize(&weights, kind)?))?;
+        for group in 1..3 {
+            let view = groups.i(group)?;
+            assert_ne!(view.layout().start_offset(), 0);
+            let fresh = view.force_contiguous()?;
+            exact(&projection.forward(&view)?, &projection.forward(&fresh)?)?;
+            let row = view.narrow(0, 2, 1)?;
+            exact(
+                &projection.forward(&row)?,
+                &projection.forward(&row.force_contiguous()?)?,
+            )?;
+        }
     }
     Ok(())
 }

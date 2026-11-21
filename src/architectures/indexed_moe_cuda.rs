@@ -160,6 +160,72 @@ fn checked_mul(lhs: usize, rhs: usize, label: &str) -> Result<usize> {
         .with_context(|| format!("CUDA Q4_0 indexed MoE {label} overflows usize"))
 }
 
+/// Decoding of the expert formats Candle lacks, shared by the F32 and
+/// tensor-core kernel sources: NVFP4 (GGML type 40, 64 elements in 36 bytes)
+/// and IQ4_NL (type 20, Q4_0's block with a nonlinear value table).
+#[cfg(feature = "cuda")]
+macro_rules! raw_formats_source {
+    () => {
+        r#"
+#define DINF_NVFP4 36
+#define DINF_IQ4_NL 19
+// In-memory MXFP8: 32 E4M3 weights in a 36-byte block after their UE8M0
+// scale byte and three zero bytes.
+#define DINF_MXFP8 37
+
+// An E4M3 (FN) byte; the loader rejects the NaN codes.
+__device__ __forceinline__ float dinf_e4m3(unsigned int x) {
+    const unsigned int exponent = (x >> 3) & 15u;
+    const unsigned int mantissa = x & 7u;
+    const float magnitude = exponent == 0
+        ? (float) mantissa * 0.001953125f
+        : __uint_as_float(((exponent + 120u) << 23) | (mantissa << 20));
+    return __uint_as_float(__float_as_uint(magnitude) | ((x & 0x80u) << 24));
+}
+
+// A UE8M0 scale byte, 2^(x - 127); 0 is the subnormal 2^-127.
+__device__ __forceinline__ float dinf_e8m0(unsigned int x) {
+    return x == 0 ? __uint_as_float(0x00400000u) : __uint_as_float(x << 23);
+}
+
+// ggml's kvalues_iq4nl.
+__device__ __constant__ signed char dinf_iq4nl_values[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+// E2M1 values, doubled as in ggml's kvalues_fp4; dinf_ue4m3 halves the scale.
+__device__ __constant__ signed char dinf_fp4_values[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+// ggml_ue4m3_to_fp32: an unsigned E4M3 scale, halved. 0 and 0x7f read as
+// zero and the sign bit is ignored.
+// The float is built from bits: (1 + m/8) 2^(e - 7) / 2 has the biased
+// exponent e + 119, and the subnormal m 2^-9 / 2 is m 2^-10, both exact.
+__device__ __forceinline__ float dinf_ue4m3(unsigned char x) {
+    if (x == 0 || x == 0x7f) {
+        return 0.0f;
+    }
+    const unsigned int exponent = (x >> 3) & 15;
+    const unsigned int mantissa = x & 7;
+    if (exponent == 0) {
+        return (float) mantissa * 0.0009765625f;
+    }
+    return __uint_as_float(((exponent + 119u) << 23) | (mantissa << 20));
+}
+
+// Element `inner` (0..63) of the 36-byte NVFP4 block at `packed`: four UE4M3
+// scales, one per 16 elements, then 32 bytes of E2M1 pairs. Byte j of a
+// 16-element group holds element j in its low nibble and j + 8 in its high one.
+__device__ __forceinline__ float dinf_nvfp4_weight(const unsigned char *packed, int inner) {
+    const int sub = inner >> 4;
+    const int j = inner & 15;
+    const unsigned char quant = packed[4 + sub * 8 + (j & 7)];
+    const int value = (j & 8) ? (quant >> 4) : (quant & 15);
+    return dinf_ue4m3(packed[sub]) * (float) dinf_fp4_values[value];
+}
+"#
+    };
+}
+
 #[cfg(feature = "cuda")]
 mod cuda {
     use std::{path::PathBuf, sync::OnceLock};
@@ -167,10 +233,12 @@ mod cuda {
     use anyhow::Context as _;
     use candle_core::backend::BackendStorage;
     use candle_core::cuda_backend::WrapErr;
-    use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+    use candle_core::cuda_backend::cudarc::driver::{
+        CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
+    };
     use candle_core::cuda_backend::cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
     use candle_core::quantized::{GgmlDType, QTensor};
-    use candle_core::{CpuStorage, CudaStorage, D, DType, Device, Layout, Shape, Tensor};
+    use candle_core::{CpuStorage, CudaStorage, D, DType, Device, Layout, Shape, Storage, Tensor};
 
     use super::{
         CUDA_MAX_GRID_Y, CUDA_PROMPT_OUTPUT_TILE, CUDA_PROMPT_ROUTE_TILE, CUDA_WARP_SIZE,
@@ -195,6 +263,11 @@ mod cuda {
     /// Output rows one block computes.
     const WMMA_OUTPUT_TILE: usize = 64;
 
+    const MMA_MODULE_NAME: &str = "dinf_raw_moe_mma_v1";
+    /// Output rows and threads of one `mma.sync` grouped block.
+    const MMA_OUTPUT_TILE: usize = 128;
+    const MMA_THREADS: usize = 256;
+
     /// Exact F32 decode and grouped prompt entry points.
     #[derive(Clone, Copy)]
     struct F32Kernels {
@@ -208,6 +281,9 @@ mod cuda {
         f32: Option<F32Kernels>,
         /// Half-precision tensor-core grouped prompt kernel.
         wmma: Option<&'static str>,
+        /// The `mma.sync` grouped prompt kernel (Ampere or newer), used in
+        /// place of `wmma` where it loads.
+        mma: Option<&'static str>,
         type_size: usize,
         block_elements: usize,
     }
@@ -218,6 +294,7 @@ mod cuda {
             prompt: "dinf_indexed_moe_q4_0_grouped_f32",
         }),
         wmma: None,
+        mma: None,
         type_size: super::Q4_0_TYPE_SIZE,
         block_elements: super::Q4_0_BLOCK_SIZE,
     };
@@ -227,13 +304,23 @@ mod cuda {
             prompt: "dinf_indexed_moe_q5_0_grouped_f32",
         }),
         wmma: Some("dinf_indexed_moe_q5_0_grouped_wmma"),
+        mma: None,
         type_size: super::Q5_0_TYPE_SIZE,
         block_elements: super::Q4_0_BLOCK_SIZE,
     };
     const Q4_K_KERNELS: QuantKernels = QuantKernels {
         f32: None,
         wmma: Some("dinf_indexed_moe_q4_k_grouped_wmma"),
+        mma: None,
         type_size: super::Q4_K_TYPE_SIZE,
+        block_elements: super::Q4_K_BLOCK_SIZE,
+    };
+    /// Q5_K stores 256 elements in a 176-byte super-block.
+    const Q5_K_KERNELS: QuantKernels = QuantKernels {
+        f32: None,
+        wmma: Some("dinf_indexed_moe_q5_k_grouped_wmma"),
+        mma: None,
+        type_size: 176,
         block_elements: super::Q4_K_BLOCK_SIZE,
     };
 
@@ -243,9 +330,177 @@ mod cuda {
             prompt: "dinf_indexed_moe_q8_0_grouped_f32",
         }),
         wmma: Some("dinf_indexed_moe_q8_0_grouped_wmma"),
+        mma: None,
         type_size: super::Q8_0_TYPE_SIZE,
         block_elements: super::Q4_0_BLOCK_SIZE,
     };
+
+    /// NVFP4 stores 64 elements in 36 bytes; the geometry counts 18 bytes
+    /// per 32-element block, as for Q4_0.
+    const NVFP4_KERNELS: QuantKernels = QuantKernels {
+        f32: Some(F32Kernels {
+            decode: "dinf_indexed_moe_nvfp4_f32",
+            prompt: "dinf_indexed_moe_nvfp4_grouped_f32",
+        }),
+        wmma: Some("dinf_indexed_moe_nvfp4_grouped_wmma"),
+        mma: Some("dinf_raw_moe_nvfp4_grouped_mma"),
+        type_size: super::Q4_0_TYPE_SIZE,
+        block_elements: super::Q4_0_BLOCK_SIZE,
+    };
+    /// IQ4_NL has Q4_0's block layout.
+    const IQ4_NL_KERNELS: QuantKernels = QuantKernels {
+        f32: Some(F32Kernels {
+            decode: "dinf_indexed_moe_iq4_nl_f32",
+            prompt: "dinf_indexed_moe_iq4_nl_grouped_f32",
+        }),
+        wmma: Some("dinf_indexed_moe_iq4_nl_grouped_wmma"),
+        mma: Some("dinf_raw_moe_iq4_nl_grouped_mma"),
+        type_size: super::Q4_0_TYPE_SIZE,
+        block_elements: super::Q4_0_BLOCK_SIZE,
+    };
+
+    /// In-memory MXFP8 (see `raw_experts.rs`): 36 bytes per 32 weights.
+    const MXFP8_KERNELS: QuantKernels = QuantKernels {
+        f32: Some(F32Kernels {
+            decode: "dinf_indexed_moe_mxfp8_f32",
+            prompt: "dinf_indexed_moe_mxfp8_grouped_f32",
+        }),
+        wmma: Some("dinf_indexed_moe_mxfp8_grouped_wmma"),
+        mma: Some("dinf_raw_moe_mxfp8_grouped_mma"),
+        type_size: 36,
+        block_elements: super::Q4_0_BLOCK_SIZE,
+    };
+
+    /// Expert formats Candle lacks, kept in their GGUF bytes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum RawExpertFormat {
+        Nvfp4,
+        Iq4Nl,
+        Mxfp8,
+    }
+
+    impl RawExpertFormat {
+        fn kernels(self) -> QuantKernels {
+            match self {
+                Self::Nvfp4 => NVFP4_KERNELS,
+                Self::Iq4Nl => IQ4_NL_KERNELS,
+                Self::Mxfp8 => MXFP8_KERNELS,
+            }
+        }
+
+        /// Elements per GGUF block.
+        fn block(self) -> usize {
+            match self {
+                Self::Nvfp4 => 64,
+                Self::Iq4Nl | Self::Mxfp8 => 32,
+            }
+        }
+    }
+
+    /// The expert weights of one launch: a Candle quantized bank, or raw
+    /// GGUF bytes (`[experts, out_dim, in_dim]`) of a format Candle lacks,
+    /// with optional F32 per-expert scales that multiply each expert's output.
+    #[derive(Clone, Copy)]
+    pub(crate) enum ExpertBank<'a> {
+        Packed(&'a QTensor),
+        Raw {
+            format: RawExpertFormat,
+            bytes: &'a Tensor,
+            scales: Option<&'a Tensor>,
+            dims: [usize; 3],
+        },
+    }
+
+    impl ExpertBank<'_> {
+        fn kernels(&self) -> Option<QuantKernels> {
+            match self {
+                Self::Packed(weights) => quant_kernels(weights.dtype()),
+                Self::Raw { format, .. } => Some(format.kernels()),
+            }
+        }
+
+        fn dims(&self) -> Option<[usize; 3]> {
+            match self {
+                Self::Packed(weights) => match weights.shape().dims() {
+                    &[experts, out_dim, in_dim] => Some([experts, out_dim, in_dim]),
+                    _ => None,
+                },
+                Self::Raw { dims, .. } => Some(*dims),
+            }
+        }
+
+        fn byte_len(&self) -> usize {
+            match self {
+                Self::Packed(weights) => weights.storage_size_in_bytes(),
+                Self::Raw { bytes, .. } => bytes.elem_count(),
+            }
+        }
+
+        fn is_on(&self, device: &candle_core::CudaDevice) -> bool {
+            let device = Device::Cuda(device.clone());
+            match self {
+                Self::Packed(weights) => weights.device().same_device(&device),
+                Self::Raw { bytes, scales, .. } => {
+                    bytes.device().same_device(&device)
+                        && scales.is_none_or(|scales| scales.device().same_device(&device))
+                }
+            }
+        }
+
+        /// Run `launch` with the device addresses of the weights and of the
+        /// per-expert scales (zero without scales), both held for the launch.
+        fn with_addresses<R>(
+            &self,
+            stream: &CudaStream,
+            launch: impl FnOnce(u64, u64) -> candle_core::Result<R>,
+        ) -> candle_core::Result<R> {
+            match self {
+                Self::Packed(weights) => {
+                    let (pointer, _guard) = weights.device_ptr_with_guard(stream)?;
+                    launch(pointer as u64, 0)
+                }
+                Self::Raw {
+                    bytes,
+                    scales,
+                    dims,
+                    ..
+                } => {
+                    let (storage, layout) = bytes.storage_and_layout();
+                    let Storage::Cuda(storage) = &*storage else {
+                        candle_core::bail!("raw expert bytes are not on CUDA")
+                    };
+                    if bytes.dtype() != DType::U8
+                        || !layout.is_contiguous()
+                        || layout.start_offset() != 0
+                    {
+                        candle_core::bail!("raw expert bytes must be a whole contiguous u8 tensor")
+                    }
+                    let (pointer, _guard) = storage.as_cuda_slice::<u8>()?.device_ptr(stream);
+                    let Some(scales) = scales else {
+                        return launch(pointer, 0);
+                    };
+                    let (scale_storage, scale_layout) = scales.storage_and_layout();
+                    let Storage::Cuda(scale_storage) = &*scale_storage else {
+                        candle_core::bail!("expert scales are not on CUDA")
+                    };
+                    if scales.dtype() != DType::F32
+                        || !scale_layout.is_contiguous()
+                        || scale_layout.shape().elem_count() != dims[0]
+                    {
+                        candle_core::bail!("expert scales must be contiguous f32, one per expert")
+                    }
+                    let scale_view = checked_view(
+                        scale_storage.as_cuda_slice::<f32>()?,
+                        scale_layout,
+                        dims[0],
+                        "expert scales",
+                    )?;
+                    let (scale_pointer, _scale_guard) = scale_view.device_ptr(stream);
+                    launch(pointer, scale_pointer)
+                }
+            }
+        }
+    }
 
     fn quant_kernels(dtype: GgmlDType) -> Option<QuantKernels> {
         match dtype {
@@ -253,6 +508,7 @@ mod cuda {
             GgmlDType::Q5_0 => Some(Q5_0_KERNELS),
             GgmlDType::Q8_0 => Some(Q8_0_KERNELS),
             GgmlDType::Q4K => Some(Q4_K_KERNELS),
+            GgmlDType::Q5K => Some(Q5_K_KERNELS),
             _ => None,
         }
     }
@@ -287,7 +543,8 @@ mod cuda {
     // routes), so the tile table spreads a busy expert over several blocks
     // and the shared weight tile saves it most of the dequantization. Inputs
     // and dequantized weights are rounded to F16; sums accumulate in F32.
-    const WMMA_SOURCE: &str = r#"
+    const WMMA_SOURCE: &str = concat!(
+        r#"
 #include <cuda_fp16.h>
 #include <mma.h>
 using namespace nvcuda;
@@ -299,6 +556,9 @@ using namespace nvcuda;
 #define DINF_ROUTE_TILE 128
 #define DINF_TABLE_EXPERTS 1024
 #define DINF_NO_ROUTE 0xffffffffu
+"#,
+        raw_formats_source!(),
+        r#"
 
 __device__ __forceinline__ int dinf_wmma_lower_bound(
     const unsigned int *sorted_experts, int routes, unsigned int expert) {
@@ -332,8 +592,10 @@ __device__ __forceinline__ int dinf_wmma_upper_bound(
 
 // Eight dequantized weights starting at `inner0` (a multiple of eight) of
 // 32-element step `step` in one expert row, rounded to F16. FORMAT is the
-// GGUF block byte size: 22 is Q5_0, 34 is Q8_0, 144 is Q4_K. One header decode
-// serves the whole run.
+// GGUF block byte size: 22 is Q5_0, 34 is Q8_0, 144 is Q4_K, 176 is Q5_K;
+// DINF_NVFP4 is
+// NVFP4, whose values F16 holds exactly, and DINF_IQ4_NL is IQ4_NL. One
+// header decode serves the run.
 template <int FORMAT>
 __device__ __forceinline__ void dinf_tile_weights8(
     const unsigned char *weights,
@@ -342,6 +604,75 @@ __device__ __forceinline__ void dinf_tile_weights8(
     int in_dim,
     int inner0,
     __half *out) {
+    if (FORMAT == DINF_NVFP4) {
+        const unsigned char *packed = weights
+            + (expert_row * (unsigned long long) (in_dim / 64)
+                + (unsigned long long) (step >> 1)) * 36ull;
+        const int sub = ((step & 1) << 1) | (inner0 >> 4);
+        const float d = dinf_ue4m3(packed[sub]);
+        const unsigned char *quants = packed + 4 + sub * 8;
+        const int shift = (inner0 & 8) ? 4 : 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            out[i] = __float2half(d * (float) dinf_fp4_values[(quants[i] >> shift) & 15]);
+        }
+        return;
+    }
+    if (FORMAT == DINF_MXFP8) {
+        const unsigned char *packed = weights
+            + (expert_row * (unsigned long long) (in_dim / 32)
+                + (unsigned long long) step) * 36ull;
+        const float d = dinf_e8m0(packed[0]);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            out[i] = __float2half(dinf_e4m3(packed[4 + inner0 + i]) * d);
+        }
+        return;
+    }
+    if (FORMAT == DINF_IQ4_NL) {
+        const unsigned char *packed = weights
+            + (expert_row * (unsigned long long) (in_dim / 32)
+                + (unsigned long long) step) * 18ull;
+        const float d = __half2float(*reinterpret_cast<const __half *>(packed));
+        const unsigned char *quants = packed + 2 + (inner0 & 15);
+        const int shift = inner0 < 16 ? 0 : 4;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            out[i] = __float2half(d * (float) dinf_iq4nl_values[(quants[i] >> shift) & 15]);
+        }
+        return;
+    }
+    if (FORMAT == 176) {
+        // Q5_K: Q4_K's scales and nibbles (after 32 bytes of fifth bits), with
+        // bit `sub` of qh[l] as the fifth bit of weight l in sub-block `sub`.
+        const unsigned char *packed = weights
+            + (expert_row * (unsigned long long) (in_dim / 256)
+                + (unsigned long long) (step >> 3)) * 176ull;
+        const int sub = step & 7;
+        const float d = __half2float(*reinterpret_cast<const __half *>(packed));
+        const float dmin = __half2float(*reinterpret_cast<const __half *>(packed + 2));
+        const unsigned char *scales = packed + 4;
+        int scale;
+        int minimum;
+        if (sub < 4) {
+            scale = scales[sub] & 63;
+            minimum = scales[sub + 4] & 63;
+        } else {
+            scale = (scales[sub + 4] & 0xF) | ((scales[sub - 4] >> 6) << 4);
+            minimum = (scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4);
+        }
+        const float step_scale = d * (float) scale;
+        const float step_min = dmin * (float) minimum;
+        const unsigned char *high = packed + 16 + inner0;
+        const unsigned char *quants = packed + 48 + (sub >> 1) * 32 + inner0;
+        const int shift = (sub & 1) * 4;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int value = ((quants[i] >> shift) & 15) | (((high[i] >> sub) & 1) << 4);
+            out[i] = __float2half(step_scale * (float) value - step_min);
+        }
+        return;
+    }
     if (FORMAT == 144) {
         const unsigned char *packed = weights
             + (expert_row * (unsigned long long) (in_dim / 256)
@@ -486,7 +817,8 @@ __device__ __forceinline__ void dinf_indexed_moe_grouped_wmma(
     int routes,
     int in_dim,
     int out_dim,
-    int num_experts) {
+    int num_experts,
+    const float *expert_scales) {
     const int warp = threadIdx.y;
     const int thread = warp * 32 + threadIdx.x;
     const int first_row = blockIdx.x * DINF_OUT;
@@ -575,6 +907,7 @@ __device__ __forceinline__ void dinf_indexed_moe_grouped_wmma(
 
         if (active) {
             const int lane = threadIdx.x;
+            const float expert_scale = expert_scales != nullptr ? expert_scales[expert] : 1.0f;
 #pragma unroll
             for (int chunk = 0; chunk < DINF_OUT_CHUNKS; ++chunk) {
                 wmma::store_matrix_sync(
@@ -587,7 +920,7 @@ __device__ __forceinline__ void dinf_indexed_moe_grouped_wmma(
                     const int output_row = first_row + chunk * 16 + column;
                     if (route != DINF_NO_ROUTE && output_row < out_dim) {
                         output[(unsigned long long) route * out_dim + output_row] =
-                            output_tile[warp][row][column];
+                            output_tile[warp][row][column] * expert_scale;
                     }
                 }
                 __syncwarp();
@@ -600,29 +933,77 @@ __device__ __forceinline__ void dinf_indexed_moe_grouped_wmma(
 extern "C" __global__ void NAME( \
     const __half *gathered, const unsigned int *sorted_route_ids, \
     const unsigned int *tiles, const unsigned char *weights, float *output, \
-    int routes, int in_dim, int out_dim, int num_experts) { \
+    int routes, int in_dim, int out_dim, int num_experts, const float *expert_scales) { \
     dinf_indexed_moe_grouped_wmma<FORMAT>(gathered, sorted_route_ids, tiles, \
-        weights, output, routes, in_dim, out_dim, num_experts); \
+        weights, output, routes, in_dim, out_dim, num_experts, expert_scales); \
 }
 
 DINF_WMMA_ENTRY(dinf_indexed_moe_q5_0_grouped_wmma, 22)
 DINF_WMMA_ENTRY(dinf_indexed_moe_q8_0_grouped_wmma, 34)
 DINF_WMMA_ENTRY(dinf_indexed_moe_q4_k_grouped_wmma, 144)
-"#;
+DINF_WMMA_ENTRY(dinf_indexed_moe_q5_k_grouped_wmma, 176)
+DINF_WMMA_ENTRY(dinf_indexed_moe_nvfp4_grouped_wmma, DINF_NVFP4)
+DINF_WMMA_ENTRY(dinf_indexed_moe_iq4_nl_grouped_wmma, DINF_IQ4_NL)
+DINF_WMMA_ENTRY(dinf_indexed_moe_mxfp8_grouped_wmma, DINF_MXFP8)
+"#
+    );
 
     // Each warp computes one output row. Four warps share each input tile,
     // while Q4_0 weights stay in their canonical 18-byte GGUF blocks.
-    const CUDA_SOURCE: &str = r#"
+    const CUDA_SOURCE: &str = concat!(
+        r#"
 #include <cuda_fp16.h>
 
 #define DINF_Q4_BLOCK_SIZE 32
 #define DINF_WARP_SIZE 32
+"#,
+        raw_formats_source!(),
+        r#"
 
-// One dequantized weight from a 32-element GGUF block. TYPE_SIZE 18 is Q4_0
-// (scale, 16 nibble bytes); 22 is Q5_0 (scale, 32 fifth bits, 16 nibble bytes);
-// 34 is Q8_0 (scale, 32 signed bytes).
+// Bytes of one 32-element block, and of an expert row of `blocks` of them.
 template <int TYPE_SIZE>
-__device__ __forceinline__ float dinf_block_weight(const unsigned char *packed, int inner) {
+__device__ __forceinline__ unsigned long long dinf_block_bytes() {
+    return TYPE_SIZE == DINF_NVFP4 || TYPE_SIZE == DINF_IQ4_NL ? 18ull
+        : TYPE_SIZE == DINF_MXFP8 ? 36ull
+        : TYPE_SIZE;
+}
+
+template <int TYPE_SIZE>
+__device__ __forceinline__ unsigned long long dinf_row_bytes(int blocks) {
+    return (unsigned long long) blocks * dinf_block_bytes<TYPE_SIZE>();
+}
+
+// Start of the GGUF block holding 32-element block `block` of `row`. An NVFP4
+// block holds two of them.
+template <int TYPE_SIZE>
+__device__ __forceinline__ const unsigned char *dinf_block_ptr(
+    const unsigned char *row, int block) {
+    if (TYPE_SIZE == DINF_NVFP4) {
+        return row + (unsigned long long) (block >> 1) * 36ull;
+    }
+    return row + (unsigned long long) block * dinf_block_bytes<TYPE_SIZE>();
+}
+
+// One dequantized weight of 32-element block `block`, whose GGUF block starts
+// at `packed`. TYPE_SIZE 18 is Q4_0 (scale, 16 nibble bytes); 22 is Q5_0
+// (scale, 32 fifth bits, 16 nibble bytes); 34 is Q8_0 (scale, 32 signed
+// bytes); DINF_NVFP4 is NVFP4 (see dinf_nvfp4_weight); DINF_IQ4_NL is
+// IQ4_NL (Q4_0's layout through dinf_iq4nl_values).
+template <int TYPE_SIZE>
+__device__ __forceinline__ float dinf_block_weight(
+    const unsigned char *packed, int block, int inner) {
+    if (TYPE_SIZE == DINF_NVFP4) {
+        return dinf_nvfp4_weight(packed, ((block & 1) << 5) | inner);
+    }
+    if (TYPE_SIZE == DINF_MXFP8) {
+        return dinf_e4m3(packed[4 + inner]) * dinf_e8m0(packed[0]);
+    }
+    if (TYPE_SIZE == DINF_IQ4_NL) {
+        const unsigned char quant = packed[2 + (inner & 15)];
+        const int value = inner < 16 ? (quant & 15) : (quant >> 4);
+        return __half2float(*reinterpret_cast<const __half *>(packed))
+            * (float) dinf_iq4nl_values[value];
+    }
     const float scale = __half2float(*reinterpret_cast<const __half *>(packed));
     if (TYPE_SIZE == 34) {
         return scale * (float) reinterpret_cast<const signed char *>(packed)[2 + inner];
@@ -654,7 +1035,8 @@ __device__ __forceinline__ void dinf_indexed_moe_decode(
     int in_dim,
     int out_dim,
     int num_experts,
-    int activation_kind) {
+    int activation_kind,
+    const float *expert_scales) {
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
     const int route = blockIdx.y;
@@ -679,7 +1061,7 @@ __device__ __forceinline__ void dinf_indexed_moe_decode(
     const unsigned long long expert_row =
         (unsigned long long) expert * out_dim + safe_output_row;
     const unsigned char *weight_row = weights
-        + expert_row * blocks_per_row * TYPE_SIZE;
+        + expert_row * dinf_row_bytes<TYPE_SIZE>(blocks_per_row);
 
     // Each lane reads its own input column of every block; the row is one
     // token's activation and stays in cache across the block's warps. A
@@ -692,9 +1074,8 @@ __device__ __forceinline__ void dinf_indexed_moe_decode(
                 value = fmaxf(value, 0.0f);
                 value *= value;
             }
-            const unsigned char *packed =
-                weight_row + (unsigned long long) block * TYPE_SIZE;
-            sum = fmaf(value, dinf_block_weight<TYPE_SIZE>(packed, lane), sum);
+            const unsigned char *packed = dinf_block_ptr<TYPE_SIZE>(weight_row, block);
+            sum = fmaf(value, dinf_block_weight<TYPE_SIZE>(packed, block, lane), sum);
         }
     }
 
@@ -703,6 +1084,9 @@ __device__ __forceinline__ void dinf_indexed_moe_decode(
         sum += __shfl_down_sync(0xffffffffu, sum, offset);
     }
     if (lane == 0 && valid_output) {
+        if (expert_scales != nullptr) {
+            sum *= expert_scales[expert];
+        }
         output[(unsigned long long) route * out_dim + output_row] = sum;
     }
 }
@@ -760,7 +1144,8 @@ __device__ __forceinline__ void dinf_indexed_moe_grouped(
     int in_dim,
     int out_dim,
     int num_experts,
-    int activation_kind) {
+    int activation_kind,
+    const float *expert_scales) {
     const int lane = threadIdx.x;
     const int route_lane = threadIdx.y;
     const int expert = blockIdx.y;
@@ -823,10 +1208,10 @@ __device__ __forceinline__ void dinf_indexed_moe_grouped(
                 const int safe_output_row = valid_weight ? candidate_output_row : 0;
                 const unsigned long long expert_row =
                     (unsigned long long) expert * out_dim + safe_output_row;
-                const unsigned char *packed = weights
-                    + (expert_row * blocks_per_row + block) * TYPE_SIZE;
+                const unsigned char *packed = dinf_block_ptr<TYPE_SIZE>(
+                    weights + expert_row * dinf_row_bytes<TYPE_SIZE>(blocks_per_row), block);
                 weight_tile[tile_row][inner] = valid_weight
-                    ? dinf_block_weight<TYPE_SIZE>(packed, inner)
+                    ? dinf_block_weight<TYPE_SIZE>(packed, block, inner)
                     : 0.0f;
             }
             __syncthreads();
@@ -844,6 +1229,9 @@ __device__ __forceinline__ void dinf_indexed_moe_grouped(
         }
 
         if (valid_route && valid_output) {
+            if (expert_scales != nullptr) {
+                sum *= expert_scales[expert];
+            }
             output[(unsigned long long) route * out_dim + output_row] = sum;
         }
     }
@@ -875,9 +1263,9 @@ extern "C" __global__ void dinf_indexed_moe_rank_sort(
 extern "C" __global__ void NAME( \
     const float *input, const unsigned int *expert_ids, const unsigned char *weights, \
     float *output, int routes, int top_k, int input_rows, int in_dim, int out_dim, \
-    int num_experts, int activation_kind) { \
+    int num_experts, int activation_kind, const float *expert_scales) { \
     dinf_indexed_moe_decode<TYPE_SIZE>(input, expert_ids, weights, output, routes, top_k, \
-        input_rows, in_dim, out_dim, num_experts, activation_kind); \
+        input_rows, in_dim, out_dim, num_experts, activation_kind, expert_scales); \
 }
 
 #define DINF_GROUPED_ENTRY(NAME, TYPE_SIZE) \
@@ -885,9 +1273,10 @@ extern "C" __global__ void NAME( \
     const float *input, const unsigned int *sorted_route_ids, \
     const unsigned int *sorted_experts, const unsigned char *weights, float *output, \
     int routes, int top_k, int input_rows, int in_dim, int out_dim, int num_experts, \
-    int activation_kind) { \
+    int activation_kind, const float *expert_scales) { \
     dinf_indexed_moe_grouped<TYPE_SIZE>(input, sorted_route_ids, sorted_experts, weights, \
-        output, routes, top_k, input_rows, in_dim, out_dim, num_experts, activation_kind); \
+        output, routes, top_k, input_rows, in_dim, out_dim, num_experts, activation_kind, \
+        expert_scales); \
 }
 
 DINF_DECODE_ENTRY(dinf_indexed_moe_q4_0_f32, 18)
@@ -896,7 +1285,172 @@ DINF_DECODE_ENTRY(dinf_indexed_moe_q8_0_f32, 34)
 DINF_GROUPED_ENTRY(dinf_indexed_moe_q4_0_grouped_f32, 18)
 DINF_GROUPED_ENTRY(dinf_indexed_moe_q5_0_grouped_f32, 22)
 DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
-"#;
+// Single-token product for the raw formats: one warp per (route, output
+// row), each lane taking 16 weights of the row at a time (an NVFP4 scale
+// group or half an IQ4_NL block). A lane decodes a group's scale once,
+// reads its nibbles as words and its inputs as float4, and looks the values
+// up in a shared table, which distinct nibbles read from distinct banks.
+template <int FORMAT>
+__device__ __forceinline__ void dinf_raw_moe_decode(
+    const float *input,
+    const unsigned int *expert_ids,
+    const unsigned char *weights,
+    float *output,
+    int routes,
+    int top_k,
+    int input_rows,
+    int in_dim,
+    int out_dim,
+    int num_experts,
+    const float *expert_scales) {
+    __shared__ float values[16];
+    if (threadIdx.y == 0 && threadIdx.x < 16) {
+        values[threadIdx.x] = FORMAT == DINF_NVFP4
+            ? (float) dinf_fp4_values[threadIdx.x]
+            : (float) dinf_iq4nl_values[threadIdx.x];
+    }
+    __syncthreads();
+    const int lane = threadIdx.x;
+    const int route = blockIdx.y;
+    const int output_row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (route >= routes || output_row >= out_dim) {
+        return;
+    }
+    const unsigned int expert = expert_ids[route];
+    if (expert >= (unsigned int) num_experts) {
+        if (lane == 0) {
+            output[(unsigned long long) route * out_dim + output_row] = 0.0f;
+        }
+        return;
+    }
+    const int input_row = input_rows == 1 ? route / top_k : route;
+    const float *x = input + (unsigned long long) input_row * in_dim;
+    const unsigned long long row = (unsigned long long) expert * out_dim + output_row;
+    float sum = 0.0f;
+    if (FORMAT == DINF_NVFP4) {
+        // Byte j of a group holds weight j (low nibble) and j + 8 (high).
+        const unsigned char *w = weights + row * (unsigned long long) (in_dim / 64) * 36ull;
+        const int groups = in_dim / 16;
+        for (int g = lane; g < groups; g += 32) {
+            const unsigned char *block = w + (g >> 2) * 36;
+            const int sub = g & 3;
+            const float d = dinf_ue4m3(block[sub]);
+            const unsigned int lo = *reinterpret_cast<const unsigned int *>(block + 4 + sub * 8);
+            const unsigned int hi = *reinterpret_cast<const unsigned int *>(block + 8 + sub * 8);
+            const float4 *xv = reinterpret_cast<const float4 *>(x + g * 16);
+            const float4 x0 = xv[0];
+            const float4 x1 = xv[1];
+            const float4 x2 = xv[2];
+            const float4 x3 = xv[3];
+            float acc = values[lo & 15] * x0.x;
+            acc = fmaf(values[(lo >> 8) & 15], x0.y, acc);
+            acc = fmaf(values[(lo >> 16) & 15], x0.z, acc);
+            acc = fmaf(values[(lo >> 24) & 15], x0.w, acc);
+            acc = fmaf(values[hi & 15], x1.x, acc);
+            acc = fmaf(values[(hi >> 8) & 15], x1.y, acc);
+            acc = fmaf(values[(hi >> 16) & 15], x1.z, acc);
+            acc = fmaf(values[(hi >> 24) & 15], x1.w, acc);
+            acc = fmaf(values[(lo >> 4) & 15], x2.x, acc);
+            acc = fmaf(values[(lo >> 12) & 15], x2.y, acc);
+            acc = fmaf(values[(lo >> 20) & 15], x2.z, acc);
+            acc = fmaf(values[(lo >> 28) & 15], x2.w, acc);
+            acc = fmaf(values[(hi >> 4) & 15], x3.x, acc);
+            acc = fmaf(values[(hi >> 12) & 15], x3.y, acc);
+            acc = fmaf(values[(hi >> 20) & 15], x3.z, acc);
+            acc = fmaf(values[(hi >> 28) & 15], x3.w, acc);
+            sum = fmaf(d, acc, sum);
+        }
+    } else if (FORMAT == DINF_MXFP8) {
+        // A lane takes half a block: sixteen E4M3 bytes under one scale.
+        const unsigned char *w = weights + row * (unsigned long long) (in_dim / 32) * 36ull;
+        const int units = in_dim / 16;
+        for (int u = lane; u < units; u += 32) {
+            const unsigned char *block = w + (u >> 1) * 36;
+            const unsigned int *bytes =
+                reinterpret_cast<const unsigned int *>(block + 4 + (u & 1) * 16);
+            const float4 *xv = reinterpret_cast<const float4 *>(x + u * 16);
+            float acc = 0.0f;
+#pragma unroll
+            for (int word = 0; word < 4; ++word) {
+                const unsigned int packed = bytes[word];
+                const float4 xw = xv[word];
+                acc = fmaf(dinf_e4m3(packed & 255u), xw.x, acc);
+                acc = fmaf(dinf_e4m3((packed >> 8) & 255u), xw.y, acc);
+                acc = fmaf(dinf_e4m3((packed >> 16) & 255u), xw.z, acc);
+                acc = fmaf(dinf_e4m3(packed >> 24), xw.w, acc);
+            }
+            sum = fmaf(dinf_e8m0(block[0]), acc, sum);
+        }
+    } else {
+        // Byte j of a block holds weight j (low nibble) and j + 16 (high).
+        // A lane takes half a block: eight bytes, weights h..h+7 and
+        // h+16..h+23 for h = 0 or 8, so units match NVFP4's 16 weights.
+        const unsigned char *w = weights + row * (unsigned long long) (in_dim / 32) * 18ull;
+        const int units = in_dim / 16;
+        for (int u = lane; u < units; u += 32) {
+            const unsigned char *block = w + (u >> 1) * 18;
+            const int half = (u & 1) * 8;
+            const float d = __half2float(*reinterpret_cast<const __half *>(block));
+            const unsigned short *pairs = reinterpret_cast<const unsigned short *>(block + 2 + half);
+            const float4 *low = reinterpret_cast<const float4 *>(x + (u >> 1) * 32 + half);
+            const float4 *high = reinterpret_cast<const float4 *>(x + (u >> 1) * 32 + 16 + half);
+            const float4 l0 = low[0];
+            const float4 l1 = low[1];
+            const float4 h0 = high[0];
+            const float4 h1 = high[1];
+            const unsigned int p0 = pairs[0];
+            const unsigned int p1 = pairs[1];
+            const unsigned int p2 = pairs[2];
+            const unsigned int p3 = pairs[3];
+            float acc = values[p0 & 15] * l0.x;
+            acc = fmaf(values[(p0 >> 8) & 15], l0.y, acc);
+            acc = fmaf(values[p1 & 15], l0.z, acc);
+            acc = fmaf(values[(p1 >> 8) & 15], l0.w, acc);
+            acc = fmaf(values[p2 & 15], l1.x, acc);
+            acc = fmaf(values[(p2 >> 8) & 15], l1.y, acc);
+            acc = fmaf(values[p3 & 15], l1.z, acc);
+            acc = fmaf(values[(p3 >> 8) & 15], l1.w, acc);
+            acc = fmaf(values[(p0 >> 4) & 15], h0.x, acc);
+            acc = fmaf(values[(p0 >> 12) & 15], h0.y, acc);
+            acc = fmaf(values[(p1 >> 4) & 15], h0.z, acc);
+            acc = fmaf(values[(p1 >> 12) & 15], h0.w, acc);
+            acc = fmaf(values[(p2 >> 4) & 15], h1.x, acc);
+            acc = fmaf(values[(p2 >> 12) & 15], h1.y, acc);
+            acc = fmaf(values[(p3 >> 4) & 15], h1.z, acc);
+            acc = fmaf(values[(p3 >> 12) & 15], h1.w, acc);
+            sum = fmaf(d, acc, sum);
+        }
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0) {
+        if (expert_scales != nullptr) {
+            sum *= expert_scales[expert];
+        }
+        output[(unsigned long long) route * out_dim + output_row] = sum;
+    }
+}
+
+#define DINF_RAW_DECODE_ENTRY(NAME, FORMAT) \
+extern "C" __global__ void NAME( \
+    const float *input, const unsigned int *expert_ids, const unsigned char *weights, \
+    float *output, int routes, int top_k, int input_rows, int in_dim, int out_dim, \
+    int num_experts, int activation_kind, const float *expert_scales) { \
+    (void) activation_kind; \
+    dinf_raw_moe_decode<FORMAT>(input, expert_ids, weights, output, routes, top_k, \
+        input_rows, in_dim, out_dim, num_experts, expert_scales); \
+}
+
+DINF_RAW_DECODE_ENTRY(dinf_indexed_moe_nvfp4_f32, DINF_NVFP4)
+DINF_GROUPED_ENTRY(dinf_indexed_moe_nvfp4_grouped_f32, DINF_NVFP4)
+DINF_RAW_DECODE_ENTRY(dinf_indexed_moe_iq4_nl_f32, DINF_IQ4_NL)
+DINF_RAW_DECODE_ENTRY(dinf_indexed_moe_mxfp8_f32, DINF_MXFP8)
+DINF_GROUPED_ENTRY(dinf_indexed_moe_mxfp8_grouped_f32, DINF_MXFP8)
+DINF_GROUPED_ENTRY(dinf_indexed_moe_iq4_nl_grouped_f32, DINF_IQ4_NL)
+"#
+    );
 
     static PTX: OnceLock<std::result::Result<String, String>> = OnceLock::new();
     static CUDA_LOGGED: OnceLock<()> = OnceLock::new();
@@ -984,6 +1538,362 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
             Ok(ptx) => Ok(ptx.as_str()),
             Err(error) => candle_core::bail!("failed to compile CUDA WMMA indexed MoE: {error}"),
         }
+    }
+
+    const MMA_SOURCE: &str = concat!(
+        r#"
+#include <cuda_fp16.h>
+"#,
+        raw_formats_source!(),
+        r#"
+// Output rows per block (16 per warp), routes per tile (the tile table's
+// DINF_ROUTE_TILE), inner elements per step, and the padded shared row
+// width in halves: 40 halves = 20 words, so the eight rows an ldmatrix
+// reads land in distinct banks.
+#define DINF_MMA_N 128
+#define DINF_MMA_M 128
+#define DINF_MMA_K 32
+#define DINF_MMA_STRIDE 40
+#define DINF_MMA_THREADS 256
+#define DINF_NO_ROUTE 0xffffffffu
+
+static __device__ __forceinline__ void dinf_mma_16816(float *d, const unsigned int *a, const unsigned int *b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+static __device__ __forceinline__ void dinf_ldmatrix_x4(unsigned int *r, const __half *p) {
+    const unsigned int address = (unsigned int) __cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(address));
+}
+
+static __device__ __forceinline__ void dinf_cp_async_16(__half *dst, const __half *src) {
+    const unsigned int address = (unsigned int) __cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(address), "l"(src));
+}
+
+// The raw bytes of one thread's 16 weights for one 32-element step:
+// output row `expert_row`, weights [16 * half, 16 * half + 16) of the step.
+struct DinfRawWeights {
+    unsigned int words[4];
+    unsigned int scale;
+};
+
+template <int FORMAT>
+static __device__ __forceinline__ DinfRawWeights dinf_raw_fetch(
+    const unsigned char *weights, unsigned long long expert_row, int step, int in_dim, int half) {
+    DinfRawWeights raw;
+    if (FORMAT == DINF_NVFP4) {
+        // 64 weights per 36-byte block: four scales, then 8 bytes per
+        // 16-weight group (byte j: weight j low, j + 8 high).
+        const unsigned char *block = weights
+            + (expert_row * (unsigned long long) (in_dim / 64) + (unsigned long long) (step >> 1)) * 36ull;
+        const int group = ((step & 1) << 1) | half;
+        const unsigned int *words = reinterpret_cast<const unsigned int *>(block);
+        raw.scale = (words[0] >> (8 * group)) & 0xffu;
+        raw.words[0] = words[1 + 2 * group];
+        raw.words[1] = words[2 + 2 * group];
+        raw.words[2] = 0;
+        raw.words[3] = 0;
+    } else if (FORMAT == DINF_MXFP8) {
+        // 32 weights per 36-byte block: the UE8M0 scale, three zero bytes,
+        // then the E4M3 bytes.
+        const unsigned int *words = reinterpret_cast<const unsigned int *>(
+            weights + (expert_row * (unsigned long long) (in_dim / 32) + (unsigned long long) step) * 36ull);
+        raw.scale = words[0] & 0xffu;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            raw.words[i] = words[1 + 4 * half + i];
+        }
+    } else {
+        // IQ4_NL: 32 weights per 18-byte block, an f16 scale then 16 bytes
+        // (byte j: weight j low, j + 16 high); 2-byte aligned.
+        const unsigned short *shorts = reinterpret_cast<const unsigned short *>(
+            weights + (expert_row * (unsigned long long) (in_dim / 32) + (unsigned long long) step) * 18ull);
+        raw.scale = shorts[0];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            raw.words[i] = (unsigned int) shorts[1 + 2 * i] | ((unsigned int) shorts[2 + 2 * i] << 16);
+        }
+    }
+    return raw;
+}
+
+static __device__ __forceinline__ unsigned int dinf_half_pair(__half lo, __half hi) {
+    return (unsigned int) __half_as_ushort(lo) | ((unsigned int) __half_as_ushort(hi) << 16);
+}
+
+// The 16 weights of `raw` as f16 pairs in order, exactly as
+// dinf_tile_weights8 rounds them.
+template <int FORMAT>
+static __device__ __forceinline__ void dinf_raw_decode(
+    const DinfRawWeights &raw, int half, const __half *lut, unsigned int *packed) {
+    if (FORMAT == DINF_NVFP4) {
+        // fp4 * scale is exact in f16 (at most 6 significant bits). Weights
+        // 0..7 are the low nibbles of bytes 0..7, weights 8..15 the high ones.
+        const __half scale = __float2half(dinf_ue4m3((unsigned char) raw.scale));
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const unsigned int word = raw.words[i >> 1];
+            const unsigned int lo = (word >> (16 * (i & 1))) & 0xffu;
+            const unsigned int hi = (word >> (16 * (i & 1) + 8)) & 0xffu;
+            packed[i] = dinf_half_pair(__hmul(lut[lo & 15u], scale), __hmul(lut[hi & 15u], scale));
+            packed[4 + i] = dinf_half_pair(__hmul(lut[lo >> 4], scale), __hmul(lut[hi >> 4], scale));
+        }
+    } else if (FORMAT == DINF_MXFP8) {
+        // An E4M3 byte's low seven bits, shifted up seven, are an f16 of its
+        // magnitude times 2^-8 (exponent bias 15 against 7, subnormals
+        // included), so one f16 multiply by 2^(e - 127 + 8) is the single
+        // rounding of the product. Scales outside f16's normal powers of two
+        // take the float path.
+        const int exponent = (int) raw.scale - 127 + 8;
+        if (raw.scale != 0 && exponent >= -14 && exponent <= 15) {
+            const __half2 scale = __half2half2(__ushort_as_half((unsigned short) ((exponent + 15) << 10)));
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const unsigned int word = raw.words[i >> 1] >> (16 * (i & 1));
+                const unsigned int bits = ((word & 0x7fu) << 7) | ((word & 0x80u) << 8)
+                    | ((word & 0x7f00u) << 15) | ((word & 0x8000u) << 16);
+                const __half2 product = __hmul2(*reinterpret_cast<const __half2 *>(&bits), scale);
+                packed[i] = *reinterpret_cast<const unsigned int *>(&product);
+            }
+        } else {
+            const float scale = dinf_e8m0(raw.scale);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const unsigned int word = raw.words[i >> 1] >> (16 * (i & 1));
+                packed[i] = dinf_half_pair(__float2half(dinf_e4m3(word & 0xffu) * scale),
+                                           __float2half(dinf_e4m3((word >> 8) & 0xffu) * scale));
+            }
+        }
+    } else {
+        // One f16 rounding of value * scale, as the float product rounds.
+        const __half scale = __ushort_as_half((unsigned short) raw.scale);
+        const int shift = half ? 4 : 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const unsigned int word = raw.words[i >> 1] >> (16 * (i & 1));
+            packed[i] = dinf_half_pair(__hmul(lut[(word >> shift) & 15u], scale),
+                                       __hmul(lut[(word >> (8 + shift)) & 15u], scale));
+        }
+    }
+}
+
+// Grouped prompt expert products on mma.sync tensor cores for the raw
+// formats: block (output tile, route tile) computes DINF_MMA_N output rows
+// for one tile of one expert's sorted routes (see dinf_indexed_moe_wmma_tiles).
+// Each warp owns 16 output rows for every route of the tile, so all warps
+// work however few routes the tile has. Per 32-element step the block
+// dequantizes its 128 x 32 weights into shared memory (each thread 16) and
+// copies the routes' f16 inputs in with cp.async, both one step ahead of
+// the products. Outputs are scattered to route order, times the expert's
+// scale when `expert_scales` is set.
+template <int FORMAT>
+static __device__ __forceinline__ void dinf_raw_moe_grouped_mma(
+    const __half *gathered, const unsigned int *sorted_route_ids, const unsigned int *tiles,
+    const unsigned char *weights, float *output, int routes, int in_dim, int out_dim,
+    int num_experts, const float *expert_scales) {
+    __shared__ __align__(16) __half a_tile[2][DINF_MMA_M * DINF_MMA_STRIDE];
+    __shared__ __align__(16) __half b_tile[2][DINF_MMA_N * DINF_MMA_STRIDE];
+    __shared__ unsigned int tile_route[DINF_MMA_M];
+    __shared__ __half lut[16];
+    const int thread = threadIdx.x;
+    const int warp = thread >> 5;
+    const int lane = thread & 31;
+    const unsigned int *tile = tiles + 3ull * blockIdx.y;
+    const int expert = (int) tile[0];
+    const int segment_start = (int) tile[1];
+    const int tile_routes = (int) tile[2];
+    if (tile_routes <= 0 || tile_routes > DINF_MMA_M || expert >= num_experts
+        || segment_start < 0 || segment_start > routes - tile_routes) {
+        return;
+    }
+    if (thread < 16) {
+        lut[thread] = __float2half(FORMAT == DINF_NVFP4 ? (float) dinf_fp4_values[thread]
+                                                        : (float) dinf_iq4nl_values[thread]);
+    }
+    if (thread < DINF_MMA_M) {
+        unsigned int route = DINF_NO_ROUTE;
+        if (thread < tile_routes) {
+            const unsigned int candidate = sorted_route_ids[segment_start + thread];
+            if (candidate < (unsigned int) routes) {
+                route = candidate;
+            }
+        }
+        tile_route[thread] = route;
+    }
+    // Rows past the tile, up to its last 16, belong to the next expert or
+    // the padding; their products are discarded.
+    const int m_tiles = (tile_routes + 15) / 16;
+    const int a_rows = m_tiles * 16;
+    const int first_row = blockIdx.x * DINF_MMA_N;
+    const int steps = in_dim / DINF_MMA_K;
+    const int w_row = thread >> 1;
+    const int w_half = thread & 1;
+    const unsigned long long expert_row =
+        (unsigned long long) expert * out_dim + min(first_row + w_row, out_dim - 1);
+    const __half *a_source = gathered + (unsigned long long) segment_start * in_dim;
+
+    // Two 16-byte chunks per thread cover 128 rows of 32 halves.
+    auto copy_inputs = [&](int step, int buffer) {
+#pragma unroll
+        for (int pass = 0; pass < 2; ++pass) {
+            const int index = pass * DINF_MMA_THREADS + thread;
+            const int row = index >> 2;
+            const int chunk = index & 3;
+            if (row < a_rows) {
+                dinf_cp_async_16(a_tile[buffer] + row * DINF_MMA_STRIDE + chunk * 8,
+                                 a_source + (unsigned long long) row * in_dim + step * DINF_MMA_K + chunk * 8);
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    auto store_weights = [&](const DinfRawWeights &raw, int buffer) {
+        unsigned int packed[8];
+        dinf_raw_decode<FORMAT>(raw, w_half, lut, packed);
+        uint4 *dst = reinterpret_cast<uint4 *>(b_tile[buffer] + w_row * DINF_MMA_STRIDE + w_half * 16);
+        dst[0] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+        dst[1] = make_uint4(packed[4], packed[5], packed[6], packed[7]);
+    };
+
+    float acc[DINF_MMA_M / 16][2][4];
+#pragma unroll
+    for (int m = 0; m < DINF_MMA_M / 16; ++m) {
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[m][n][i] = 0.0f;
+            }
+        }
+    }
+
+    copy_inputs(0, 0);
+    __syncthreads();  // the value table
+    store_weights(dinf_raw_fetch<FORMAT>(weights, expert_row, 0, in_dim, w_half), 0);
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    __syncthreads();
+
+    for (int step = 0; step < steps; ++step) {
+        const int buffer = step & 1;
+        const bool more = step + 1 < steps;
+        DinfRawWeights next = {};
+        if (more) {
+            copy_inputs(step + 1, buffer ^ 1);
+            next = dinf_raw_fetch<FORMAT>(weights, expert_row, step + 1, in_dim, w_half);
+        }
+        const __half *a = a_tile[buffer];
+        const __half *b = b_tile[buffer] + warp * 16 * DINF_MMA_STRIDE;
+#pragma unroll
+        for (int k = 0; k < DINF_MMA_K; k += 16) {
+            // Rows +0..7 / +8..15 of the warp's outputs by inner +0..7 / +8..15.
+            const int matrix = lane >> 3;
+            unsigned int bf[4];
+            dinf_ldmatrix_x4(bf, b + ((matrix >> 1) * 8 + (lane & 7)) * DINF_MMA_STRIDE + k + (matrix & 1) * 8);
+#pragma unroll
+            for (int m = 0; m < DINF_MMA_M / 16; ++m) {
+                if (m < m_tiles) {
+                    // Routes +0..7 / +8..15 by inner +0..7 / +8..15: a0..a3.
+                    unsigned int af[4];
+                    dinf_ldmatrix_x4(af, a + (m * 16 + (matrix & 1) * 8 + (lane & 7)) * DINF_MMA_STRIDE + k + (matrix >> 1) * 8);
+                    dinf_mma_16816(acc[m][0], af, bf);
+                    dinf_mma_16816(acc[m][1], af, bf + 2);
+                }
+            }
+        }
+        if (more) {
+            store_weights(next, buffer ^ 1);
+        }
+        asm volatile("cp.async.wait_group 0;\n" ::);
+        __syncthreads();
+    }
+
+    const float scale = expert_scales != nullptr ? expert_scales[expert] : 1.0f;
+    const int group = lane >> 2;
+    const int quad = lane & 3;
+#pragma unroll
+    for (int m = 0; m < DINF_MMA_M / 16; ++m) {
+        if (m >= m_tiles) {
+            continue;
+        }
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const int slot = m * 16 + group + 8 * r;
+            const unsigned int route = slot < tile_routes ? tile_route[slot] : DINF_NO_ROUTE;
+            if (route == DINF_NO_ROUTE) {
+                continue;
+            }
+#pragma unroll
+            for (int n = 0; n < 2; ++n) {
+                const int column = first_row + warp * 16 + n * 8 + 2 * quad;
+                float *o = output + (unsigned long long) route * out_dim + column;
+                // Pairs are 8-byte aligned only when every row is.
+                if ((out_dim & 1) == 0 && column + 1 < out_dim) {
+                    *reinterpret_cast<float2 *>(o) =
+                        make_float2(acc[m][n][2 * r] * scale, acc[m][n][2 * r + 1] * scale);
+                } else {
+                    if (column < out_dim) {
+                        o[0] = acc[m][n][2 * r] * scale;
+                    }
+                    if (column + 1 < out_dim) {
+                        o[1] = acc[m][n][2 * r + 1] * scale;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#define DINF_MMA_ENTRY(NAME, FORMAT)                                                          \
+    extern "C" __global__ void __launch_bounds__(DINF_MMA_THREADS) NAME(                     \
+        const __half *gathered, const unsigned int *sorted_route_ids,                       \
+        const unsigned int *tiles, const unsigned char *weights, float *output,             \
+        int routes, int in_dim, int out_dim, int num_experts, const float *expert_scales) { \
+        dinf_raw_moe_grouped_mma<FORMAT>(gathered, sorted_route_ids, tiles, weights, output,  \
+                                         routes, in_dim, out_dim, num_experts, expert_scales); \
+    }
+
+DINF_MMA_ENTRY(dinf_raw_moe_nvfp4_grouped_mma, DINF_NVFP4)
+DINF_MMA_ENTRY(dinf_raw_moe_iq4_nl_grouped_mma, DINF_IQ4_NL)
+DINF_MMA_ENTRY(dinf_raw_moe_mxfp8_grouped_mma, DINF_MXFP8)
+"#
+    );
+
+    static MMA_PTX: OnceLock<std::result::Result<String, String>> = OnceLock::new();
+
+    /// The raw formats' `mma.sync` grouped kernels need `mma.sync` m16n8k16
+    /// and `cp.async` (Ampere or newer); elsewhere the WMMA kernels stay.
+    fn mma_ptx() -> candle_core::Result<&'static str> {
+        match MMA_PTX.get_or_init(|| {
+            compile_ptx_with_opts(
+                MMA_SOURCE,
+                CompileOptions {
+                    include_paths: cuda_include_paths(),
+                    name: Some("raw_moe_mma.cu".to_string()),
+                    arch: Some("sm_80"),
+                    ..Default::default()
+                },
+            )
+            .map(|ptx| ptx.to_src())
+            .map_err(|error| error.to_string())
+        }) {
+            Ok(ptx) => Ok(ptx.as_str()),
+            Err(error) => candle_core::bail!("failed to compile CUDA mma raw MoE: {error}"),
+        }
+    }
+
+    /// Whether `name` of the `mma.sync` module loads on `device`.
+    fn mma_loads(device: &candle_core::CudaDevice, name: &str) -> bool {
+        mma_ptx().is_ok_and(|ptx| {
+            device
+                .get_or_load_custom_func(name, MMA_MODULE_NAME, ptx)
+                .is_ok()
+        })
     }
 
     pub(crate) fn precompile(device: &Device) -> anyhow::Result<()> {
@@ -1100,7 +2010,7 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
     }
 
     struct DecodeIndexedQ4<'a> {
-        weights: &'a QTensor,
+        bank: ExpertBank<'a>,
         geometry: Q4IndexedGeometry,
         activation_kind: i32,
     }
@@ -1139,17 +2049,14 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
             if input.device().id() != ids.device().id() {
                 candle_core::bail!("CUDA Q4_0 indexed MoE inputs use different devices")
             }
-            let Some(kernels) = quant_kernels(self.weights.dtype()) else {
+            let Some(kernels) = self.bank.kernels() else {
                 candle_core::bail!("CUDA indexed MoE does not support this expert format")
             };
             if kernels.type_size != geometry.type_size
-                || self.weights.shape().dims()
-                    != [geometry.num_experts, geometry.out_dim, geometry.in_dim]
-                || self.weights.storage_size_in_bytes() != geometry.weight_bytes
-                || !self
-                    .weights
-                    .device()
-                    .same_device(&Device::Cuda(input.device().clone()))
+                || self.bank.dims()
+                    != Some([geometry.num_experts, geometry.out_dim, geometry.in_dim])
+                || self.bank.byte_len() != geometry.weight_bytes
+                || !self.bank.is_on(input.device())
             {
                 candle_core::bail!("CUDA Q4_0 indexed MoE weight geometry differs")
             }
@@ -1168,8 +2075,6 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
             )?;
             let device = input.device();
             let stream = device.cuda_stream();
-            let (weight_ptr, _weight_guard) = self.weights.device_ptr_with_guard(&stream)?;
-            let weight_address = weight_ptr as u64;
             // SAFETY: The decode kernel writes every output element,
             // including zeros for an out-of-range expert.
             let mut output = unsafe { device.alloc::<f32>(geometry.output_elements)? };
@@ -1194,22 +2099,27 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
             let out_dim = geometry.out_dim as i32;
             let num_experts = geometry.num_experts as i32;
             let activation_kind = self.activation_kind;
-            let mut builder = function.builder();
-            builder
-                .arg(&input_view)
-                .arg(&ids_view)
-                .arg(&weight_address)
-                .arg(&mut output)
-                .arg(&routes)
-                .arg(&top_k)
-                .arg(&input_rows)
-                .arg(&in_dim)
-                .arg(&out_dim)
-                .arg(&num_experts)
-                .arg(&activation_kind);
-            // SAFETY: Geometry, storage bounds, device identity, and all kernel
-            // index limits were checked before this launch.
-            unsafe { builder.launch(config) }.w()?;
+            self.bank
+                .with_addresses(&stream, |weight_address, scale_address| {
+                    let mut builder = function.builder();
+                    builder
+                        .arg(&input_view)
+                        .arg(&ids_view)
+                        .arg(&weight_address)
+                        .arg(&mut output)
+                        .arg(&routes)
+                        .arg(&top_k)
+                        .arg(&input_rows)
+                        .arg(&in_dim)
+                        .arg(&out_dim)
+                        .arg(&num_experts)
+                        .arg(&activation_kind)
+                        .arg(&scale_address);
+                    // SAFETY: Geometry, storage bounds, device identity, and
+                    // all kernel index limits were checked before this launch.
+                    unsafe { builder.launch(config) }.w()?;
+                    Ok(())
+                })?;
 
             Ok((
                 CudaStorage::wrap_cuda_slice(output, device.clone()),
@@ -1219,7 +2129,7 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
     }
 
     struct GroupedPromptIndexedQ4<'a> {
-        weights: &'a QTensor,
+        bank: ExpertBank<'a>,
         geometry: Q4IndexedGeometry,
         activation_kind: i32,
         /// Use the half-precision tensor-core kernel.
@@ -1279,17 +2189,14 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
             {
                 candle_core::bail!("CUDA Q4_0 grouped prompt inputs use different devices")
             }
-            let Some(kernels) = quant_kernels(self.weights.dtype()) else {
+            let Some(kernels) = self.bank.kernels() else {
                 candle_core::bail!("CUDA indexed MoE does not support this expert format")
             };
             if kernels.type_size != geometry.type_size
-                || self.weights.shape().dims()
-                    != [geometry.num_experts, geometry.out_dim, geometry.in_dim]
-                || self.weights.storage_size_in_bytes() != geometry.weight_bytes
-                || !self
-                    .weights
-                    .device()
-                    .same_device(&Device::Cuda(input.device().clone()))
+                || self.bank.dims()
+                    != Some([geometry.num_experts, geometry.out_dim, geometry.in_dim])
+                || self.bank.byte_len() != geometry.weight_bytes
+                || !self.bank.is_on(input.device())
             {
                 candle_core::bail!("CUDA Q4_0 grouped prompt weight geometry differs")
             }
@@ -1314,8 +2221,6 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
             )?;
             let device = input.device();
             let stream = device.cuda_stream();
-            let (weight_ptr, _weight_guard) = self.weights.device_ptr_with_guard(&stream)?;
-            let weight_address = weight_ptr as u64;
             let mut output = device.alloc_zeros::<f32>(geometry.output_elements)?;
             // Both grouped kernels give one block 32 output rows.
             const _: () = assert!(WMMA_TILE == CUDA_PROMPT_OUTPUT_TILE);
@@ -1407,37 +2312,57 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
                 }
                 .w()?;
 
-                let function =
-                    device.get_or_load_custom_func(name, WMMA_MODULE_NAME, wmma_ptx()?)?;
-                let grid_dim = (
-                    geometry.out_dim.div_ceil(WMMA_OUTPUT_TILE) as u32,
-                    max_tiles as u32,
-                    1,
-                );
-                let mut builder = function.builder();
-                builder
-                    .arg(&gathered)
-                    .arg(&sorted_route_ids_view)
-                    .arg(&tiles)
-                    .arg(&weight_address)
-                    .arg(&mut output)
-                    .arg(&routes)
-                    .arg(&in_dim)
-                    .arg(&out_dim)
-                    .arg(&num_experts);
-                // SAFETY: The sort outputs, the tile table, the gathered rows
-                // and the weights stay on this stream; geometry, storage
-                // bounds and launch limits were checked. The kernel rejects
-                // a tile outside the routes and reads at most one 32-route
-                // step past a tile, which the padding covers.
-                unsafe {
-                    builder.launch(LaunchConfig {
-                        grid_dim,
-                        block_dim: (CUDA_WARP_SIZE as u32, WMMA_WARPS as u32, 1),
-                        shared_mem_bytes: 0,
-                    })
-                }
-                .w()?;
+                let mma = kernels.mma.filter(|name| mma_loads(device, name));
+                let (function, grid_dim, block_dim) = match mma {
+                    Some(name) => (
+                        device.get_or_load_custom_func(name, MMA_MODULE_NAME, mma_ptx()?)?,
+                        (
+                            geometry.out_dim.div_ceil(MMA_OUTPUT_TILE) as u32,
+                            max_tiles as u32,
+                            1,
+                        ),
+                        (MMA_THREADS as u32, 1, 1),
+                    ),
+                    None => (
+                        device.get_or_load_custom_func(name, WMMA_MODULE_NAME, wmma_ptx()?)?,
+                        (
+                            geometry.out_dim.div_ceil(WMMA_OUTPUT_TILE) as u32,
+                            max_tiles as u32,
+                            1,
+                        ),
+                        (CUDA_WARP_SIZE as u32, WMMA_WARPS as u32, 1),
+                    ),
+                };
+                self.bank
+                    .with_addresses(&stream, |weight_address, scale_address| {
+                        let mut builder = function.builder();
+                        builder
+                            .arg(&gathered)
+                            .arg(&sorted_route_ids_view)
+                            .arg(&tiles)
+                            .arg(&weight_address)
+                            .arg(&mut output)
+                            .arg(&routes)
+                            .arg(&in_dim)
+                            .arg(&out_dim)
+                            .arg(&num_experts)
+                            .arg(&scale_address);
+                        // SAFETY: The sort outputs, the tile table, the
+                        // gathered rows and the weights stay on this stream;
+                        // geometry, storage bounds and launch limits were
+                        // checked. The kernels reject a tile outside the
+                        // routes and read at most 32 routes past a tile,
+                        // which the padding covers.
+                        unsafe {
+                            builder.launch(LaunchConfig {
+                                grid_dim,
+                                block_dim,
+                                shared_mem_bytes: 0,
+                            })
+                        }
+                        .w()?;
+                        Ok(())
+                    })?;
                 return Ok((
                     CudaStorage::wrap_cuda_slice(output, device.clone()),
                     Shape::from((geometry.tokens, geometry.top_k, geometry.out_dim)),
@@ -1464,23 +2389,29 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
             let out_dim = geometry.out_dim as i32;
             let num_experts = geometry.num_experts as i32;
             let activation_kind = self.activation_kind;
-            let mut builder = function.builder();
-            builder
-                .arg(&input_view)
-                .arg(&sorted_route_ids_view)
-                .arg(&sorted_experts_view)
-                .arg(&weight_address)
-                .arg(&mut output)
-                .arg(&routes)
-                .arg(&top_k)
-                .arg(&input_rows)
-                .arg(&in_dim)
-                .arg(&out_dim)
-                .arg(&num_experts)
-                .arg(&activation_kind);
-            // SAFETY: The sort outputs and all storage views stay on this
-            // stream. Geometry, storage bounds, and launch limits were checked.
-            unsafe { builder.launch(config) }.w()?;
+            self.bank
+                .with_addresses(&stream, |weight_address, scale_address| {
+                    let mut builder = function.builder();
+                    builder
+                        .arg(&input_view)
+                        .arg(&sorted_route_ids_view)
+                        .arg(&sorted_experts_view)
+                        .arg(&weight_address)
+                        .arg(&mut output)
+                        .arg(&routes)
+                        .arg(&top_k)
+                        .arg(&input_rows)
+                        .arg(&in_dim)
+                        .arg(&out_dim)
+                        .arg(&num_experts)
+                        .arg(&activation_kind)
+                        .arg(&scale_address);
+                    // SAFETY: The sort outputs and all storage views stay on
+                    // this stream. Geometry, storage bounds, and launch limits
+                    // were checked.
+                    unsafe { builder.launch(config) }.w()?;
+                    Ok(())
+                })?;
 
             Ok((
                 CudaStorage::wrap_cuda_slice(output, device.clone()),
@@ -1772,7 +2703,7 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
         forward_impl(
             input,
             expert_ids,
-            weights,
+            ExpertBank::Packed(weights),
             num_experts,
             out_dim,
             in_dim,
@@ -1796,7 +2727,7 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
         forward_impl(
             input,
             expert_ids,
-            weights,
+            ExpertBank::Packed(weights),
             num_experts,
             out_dim,
             in_dim,
@@ -1816,7 +2747,7 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
         forward_impl(
             input,
             expert_ids,
-            weights,
+            ExpertBank::Packed(weights),
             num_experts,
             out_dim,
             in_dim,
@@ -1825,11 +2756,74 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
         )
     }
 
+    /// Expert product over raw GGUF bytes: `bytes` holds `[num_experts,
+    /// out_dim, in_dim]` in `format` and `scales`, if any, one output scale
+    /// per expert. Single tokens use the exact F32 decode kernel; prompts use
+    /// the tensor-core grouped kernel where it compiled (inputs and weights
+    /// are rounded to F16; NVFP4 weights are exact in it), else the grouped
+    /// F32 kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_raw(
+        format: RawExpertFormat,
+        input: &Tensor,
+        expert_ids: &Tensor,
+        bytes: &Tensor,
+        scales: Option<&Tensor>,
+        num_experts: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> anyhow::Result<Tensor> {
+        anyhow::ensure!(
+            in_dim.is_multiple_of(format.block()),
+            "{format:?} expert rows must hold whole blocks"
+        );
+        let tokens = input.dim(0)?;
+        forward_impl(
+            input,
+            expert_ids,
+            ExpertBank::Raw {
+                format,
+                bytes,
+                scales,
+                dims: [num_experts, out_dim, in_dim],
+            },
+            num_experts,
+            out_dim,
+            in_dim,
+            0,
+            tokens > 1 && wmma_ptx().is_ok(),
+        )
+    }
+
+    /// Compile and load the kernels of one raw expert format ahead of use.
+    pub(crate) fn precompile_raw(format: RawExpertFormat, device: &Device) -> anyhow::Result<()> {
+        if !device.is_cuda() {
+            return Ok(());
+        }
+        let device = device.as_cuda_device()?;
+        let kernels = format.kernels();
+        if let Some(kernels) = kernels.f32 {
+            device.get_or_load_custom_func(kernels.decode, CUDA_MODULE_NAME, ptx()?)?;
+            device.get_or_load_custom_func(kernels.prompt, CUDA_MODULE_NAME, ptx()?)?;
+        }
+        if let Some(name) = kernels.mma {
+            // Optional: without it the WMMA kernel serves prompts.
+            let _ = mma_loads(device, name);
+        }
+        if let (Some(name), Ok(wmma)) = (kernels.wmma, wmma_ptx()) {
+            device.get_or_load_custom_func(name, WMMA_MODULE_NAME, wmma)?;
+            device.get_or_load_custom_func(WMMA_GATHER_KERNEL_NAME, WMMA_MODULE_NAME, wmma)?;
+            device.get_or_load_custom_func(WMMA_TILES_KERNEL_NAME, WMMA_MODULE_NAME, wmma)?;
+        }
+        device.get_or_load_custom_func(RANK_SORT_KERNEL_NAME, CUDA_MODULE_NAME, ptx()?)?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward_impl(
         input: &Tensor,
         expert_ids: &Tensor,
-        weights: &QTensor,
+        bank: ExpertBank<'_>,
         num_experts: usize,
         out_dim: usize,
         in_dim: usize,
@@ -1842,7 +2836,8 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
             actual_in_dim == in_dim,
             "CUDA Q4_0 indexed MoE input width differs"
         );
-        let kernels = quant_kernels(weights.dtype())
+        let kernels = bank
+            .kernels()
             .context("CUDA indexed MoE does not support this expert format")?;
         anyhow::ensure!(
             if wmma {
@@ -1874,12 +2869,12 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
         anyhow::ensure!(
             input.device().is_cuda()
                 && input.device().same_device(expert_ids.device())
-                && input.device().same_device(&weights.device()),
+                && bank.is_on(input.device().as_cuda_device()?),
             "CUDA Q4_0 indexed MoE inputs and weights must share one CUDA device"
         );
         anyhow::ensure!(
-            weights.shape().dims() == [num_experts, out_dim, in_dim]
-                && weights.storage_size_in_bytes() == geometry.weight_bytes,
+            bank.dims() == Some([num_experts, out_dim, in_dim])
+                && bank.byte_len() == geometry.weight_bytes,
             "CUDA Q4_0 indexed MoE weight geometry differs"
         );
         if tokens == 1 {
@@ -1887,7 +2882,7 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
                 .apply_op2_no_bwd(
                     expert_ids,
                     &DecodeIndexedQ4 {
-                        weights,
+                        bank,
                         geometry,
                         activation_kind,
                     },
@@ -1904,7 +2899,7 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
                 &sorted_route_ids,
                 &sorted_experts,
                 &GroupedPromptIndexedQ4 {
-                    weights,
+                    bank,
                     geometry,
                     activation_kind,
                     wmma,
@@ -1916,8 +2911,9 @@ DINF_GROUPED_ENTRY(dinf_indexed_moe_q8_0_grouped_f32, 34)
 
 #[cfg(feature = "cuda")]
 pub(super) use cuda::{
-    forward, forward_candle_k_quant, forward_grouped_wmma, forward_relu_squared, precompile,
-    supports, supports_f32_decode, supports_grouped_wmma,
+    RawExpertFormat, forward, forward_candle_k_quant, forward_grouped_wmma, forward_raw,
+    forward_relu_squared, precompile, precompile_raw, supports, supports_f32_decode,
+    supports_grouped_wmma,
 };
 
 #[cfg(test)]
@@ -2258,7 +3254,12 @@ mod tests {
 
         #[test]
         fn cuda_wmma_grouped_prompt_matches_reference() -> anyhow::Result<()> {
-            for dtype in [GgmlDType::Q5_0, GgmlDType::Q8_0, GgmlDType::Q4K] {
+            for dtype in [
+                GgmlDType::Q5_0,
+                GgmlDType::Q8_0,
+                GgmlDType::Q4K,
+                GgmlDType::Q5K,
+            ] {
                 // 70 tokens give one expert more than two 32-route tiles.
                 test_case_with(dtype, false, false, 70, false, true)?;
                 // 300 tokens give each expert more than one 128-route tile, the

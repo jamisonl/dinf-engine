@@ -535,6 +535,62 @@ pub struct GgufMetadata {
     pub swiglu_clamp_exp: Vec<f64>,
     /// Per-layer upper bound used by shared-expert SwiGLU.
     pub swiglu_clamp_shexp: Vec<f64>,
+    /// Looped Inkling 2 parameters; `None` for every other architecture.
+    pub inkling2_loop: Option<Inkling2LoopMetadata>,
+}
+
+/// Header parameters of the looped Inkling 2 architecture (`inkling2_loop`).
+///
+/// Physical layers `loop_start..loop_end` run `loop_count` times per token;
+/// every visit keeps its own KV and convolution state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Inkling2LoopMetadata {
+    /// Rows of the output head that are real tokens; the rest are padding.
+    pub vocab_size_unpadded: usize,
+    /// First looped physical layer.
+    pub loop_start: usize,
+    /// One past the last looped physical layer.
+    pub loop_end: usize,
+    /// Passes over the looped layers.
+    pub loop_count: usize,
+    /// Rank of the loop message-gate projections.
+    pub loop_gate_rank: usize,
+    /// Per-head width of the relative-position states.
+    pub relative_length: usize,
+    /// Backward distance covered by the relative-position bias.
+    pub relative_extent: usize,
+    /// Largest L2 norm of each query and key head.
+    pub qk_clip: f64,
+    /// Largest L2 norm of each relative-state head.
+    pub relative_clip: f64,
+    /// Position from which full-attention layers scale queries logarithmically.
+    pub log_scale_floor: usize,
+    /// Strength of that logarithmic scale.
+    pub log_scale_alpha: f64,
+    /// Short causal convolution width, including the current token.
+    pub shortconv_l_cache: usize,
+    /// Softcap of the expert gate's linear factor.
+    pub situ_beta: f64,
+    /// Softcap of the expert up projection.
+    pub situ_linear_beta: f64,
+    /// Layers per attention-residual block.
+    pub attn_res_block_size: usize,
+}
+
+impl Inkling2LoopMetadata {
+    /// Layer visits per token, counting each pass over the looped core.
+    pub fn visit_count(&self, num_layers: usize) -> usize {
+        num_layers + (self.loop_count - 1) * (self.loop_end - self.loop_start)
+    }
+
+    /// How many times one token visits physical layer `layer`.
+    pub fn visits_of_layer(&self, layer: usize) -> usize {
+        if (self.loop_start..self.loop_end).contains(&layer) {
+            self.loop_count
+        } else {
+            1
+        }
+    }
 }
 
 impl GgufMetadata {
@@ -551,6 +607,23 @@ impl GgufMetadata {
         let layer_end = layer_end.min(self.num_layers);
         if layer_start >= layer_end {
             return 0;
+        }
+        if let Some(inkling) = &self.inkling2_loop {
+            // Only full-attention visits grow with the context. Sliding
+            // visits keep one window and are charged as fixed state.
+            let per_visit = usize_to_u64(self.num_kv_heads)
+                .saturating_mul(usize_to_u64(self.head_dim))
+                .saturating_mul(4);
+            return (layer_start..layer_end)
+                .filter(|&layer| {
+                    !self
+                        .sliding_window_pattern
+                        .get(layer)
+                        .copied()
+                        .unwrap_or(false)
+                })
+                .map(|layer| usize_to_u64(inkling.visits_of_layer(layer)).saturating_mul(per_visit))
+                .fold(0u64, u64::saturating_add);
         }
         if self.architecture == "deepseek41" {
             // Model-wide F32 QDQ carriers: three ratio-two owners and one
@@ -778,6 +851,22 @@ fn md_get_usize_or(
 /// Read a scalar integer with compatibility for metadata that stores the
 /// same architecture setting as a per-layer integer array. The array itself
 /// is validated by the corresponding `md_get_usize_array` call.
+/// Read a scalar, or a non-empty per-layer array whose values all agree.
+fn md_get_uniform_usize_array(md: &HashMap<String, gguf_file::Value>, key: &str) -> Result<usize> {
+    if !matches!(md.get(key), Some(gguf_file::Value::Array(_))) {
+        return md_get_usize(md, key);
+    }
+    let values = md_get_usize_array(md, key)?;
+    let first = *values
+        .first()
+        .with_context(|| format!("GGUF metadata key {key} is an empty array"))?;
+    anyhow::ensure!(
+        values.iter().all(|&value| value == first),
+        "GGUF metadata key {key} must have the same value on every layer"
+    );
+    Ok(first)
+}
+
 fn md_get_usize_or_scalar(
     md: &HashMap<String, gguf_file::Value>,
     key: &str,
@@ -1107,18 +1196,30 @@ fn parse_canonical_metadata(md: &HashMap<String, gguf_file::Value>) -> Result<Gg
     };
     validate_layer_count(num_layers, "GGUF executable layer count")?;
     let hidden_dim = md_get_usize(md, &format!("{prefix}.embedding_length"))?;
-    let num_attention_heads = md_get_usize(md, &format!("{prefix}.attention.head_count"))?;
+    let head_count_key = format!("{prefix}.attention.head_count");
+    // A per-layer array is accepted only when every layer agrees.
+    let num_attention_heads = if matches!(md.get(&head_count_key), Some(gguf_file::Value::Array(_)))
+    {
+        md_get_uniform_usize_array(md, &head_count_key)?
+    } else {
+        md_get_usize(md, &head_count_key)?
+    };
     anyhow::ensure!(num_layers > 0, "GGUF model must contain at least one layer");
     anyhow::ensure!(hidden_dim > 0, "GGUF embedding length must be positive");
     anyhow::ensure!(
         num_attention_heads > 0,
         "GGUF attention head count must be positive"
     );
-    let num_kv_heads = md_get_usize_or_scalar(
-        md,
-        &format!("{prefix}.attention.head_count_kv"),
-        num_attention_heads,
-    )?;
+    let num_kv_heads = if architecture == "inkling2_loop" {
+        // Every Inkling 2 layer has attention, with one shared KV width.
+        md_get_uniform_usize_array(md, &format!("{prefix}.attention.head_count_kv"))?
+    } else {
+        md_get_usize_or_scalar(
+            md,
+            &format!("{prefix}.attention.head_count_kv"),
+            num_attention_heads,
+        )?
+    };
     let head_dim = md_get_usize_or(
         md,
         &format!("{prefix}.attention.key_length"),
@@ -1481,6 +1582,17 @@ fn parse_canonical_metadata(md: &HashMap<String, gguf_file::Value>) -> Result<Gg
             0
         };
     let expert_group_count = md_get_usize_or(md, &format!("{prefix}.expert_group_count"), 1)?;
+    let inkling2_loop = if architecture == "inkling2_loop" {
+        Some(parse_inkling2_loop_metadata(
+            md,
+            num_layers,
+            vocab_size,
+            sliding_window,
+            &sliding_window_pattern,
+        )?)
+    } else {
+        None
+    };
 
     Ok(GgufMetadata {
         architecture,
@@ -1551,7 +1663,102 @@ fn parse_canonical_metadata(md: &HashMap<String, gguf_file::Value>) -> Result<Gg
         indexer_kpool_select_tail,
         swiglu_clamp_exp,
         swiglu_clamp_shexp,
+        inkling2_loop,
     })
+}
+
+/// Read and check the `inkling2_loop.*` keys. The variable-loop research
+/// layout (`loop.varying = true`) is not supported.
+fn parse_inkling2_loop_metadata(
+    md: &HashMap<String, gguf_file::Value>,
+    num_layers: usize,
+    vocab_size: usize,
+    sliding_window: usize,
+    sliding_window_pattern: &[bool],
+) -> Result<Inkling2LoopMetadata> {
+    let prefix = "inkling2_loop";
+    let key = |name: &str| format!("{prefix}.{name}");
+    let usize_key = |name: &str| md_get_usize(md, &key(name));
+    let f64_key = |name: &str| -> Result<f64> {
+        let name = key(name);
+        anyhow::ensure!(
+            md.contains_key(&name),
+            "Inkling 2 metadata is missing {name}"
+        );
+        md_get_f64(md, &name, 0.0)
+    };
+    anyhow::ensure!(
+        !md_get_bool(md, &key("loop.varying"), false)?,
+        "Inkling 2 variable-loop checkpoints are not supported"
+    );
+    let parsed = Inkling2LoopMetadata {
+        vocab_size_unpadded: usize_key("vocab_size_unpadded")?,
+        loop_start: usize_key("loop.start")?,
+        loop_end: usize_key("loop.end")?,
+        loop_count: usize_key("loop.count")?,
+        loop_gate_rank: usize_key("loop.gate_rank")?,
+        relative_length: usize_key("attention.relative_length")?,
+        relative_extent: usize_key("attention.relative_extent")?,
+        qk_clip: f64_key("attention.qk_clip")?,
+        relative_clip: f64_key("attention.relative_clip")?,
+        log_scale_floor: usize_key("attention.log_scale_floor")?,
+        log_scale_alpha: f64_key("attention.log_scale_alpha")?,
+        shortconv_l_cache: usize_key("shortconv.l_cache")?,
+        situ_beta: f64_key("activation.situ_beta")?,
+        situ_linear_beta: f64_key("activation.situ_linear_beta")?,
+        attn_res_block_size: usize_key("attn_res.block_size")?,
+    };
+    let block = parsed.attn_res_block_size;
+    anyhow::ensure!(
+        block > 0
+            && parsed.loop_start > 0
+            && parsed.loop_start < parsed.loop_end
+            && parsed.loop_end <= num_layers
+            && parsed.loop_start.is_multiple_of(block)
+            && parsed.loop_end.is_multiple_of(block)
+            && (1..=8).contains(&parsed.loop_count),
+        "Inkling 2 loop [{}, {}) x {} must span whole attention-residual blocks of {block} inside {num_layers} layers",
+        parsed.loop_start,
+        parsed.loop_end,
+        parsed.loop_count
+    );
+    anyhow::ensure!(
+        parsed.vocab_size_unpadded > 0 && parsed.vocab_size_unpadded <= vocab_size,
+        "Inkling 2 unpadded vocabulary {} must fit the padded vocabulary {vocab_size}",
+        parsed.vocab_size_unpadded
+    );
+    anyhow::ensure!(
+        (2..=64).contains(&parsed.shortconv_l_cache)
+            && parsed.relative_length > 0
+            && parsed.relative_extent > 0
+            && parsed.log_scale_floor > 0
+            && parsed.loop_gate_rank > 0,
+        "Inkling 2 convolution, relative-position or loop-gate sizes are invalid"
+    );
+    for (name, value) in [
+        ("qk_clip", parsed.qk_clip),
+        ("relative_clip", parsed.relative_clip),
+        ("situ_beta", parsed.situ_beta),
+        ("situ_linear_beta", parsed.situ_linear_beta),
+    ] {
+        anyhow::ensure!(
+            value.is_finite() && value > 0.0 && (value as f32).is_finite(),
+            "Inkling 2 {name} must be finite and positive"
+        );
+    }
+    anyhow::ensure!(
+        parsed.log_scale_alpha.is_finite() && parsed.log_scale_alpha >= 0.0,
+        "Inkling 2 log_scale_alpha must be finite and non-negative"
+    );
+    anyhow::ensure!(
+        sliding_window > 0 && sliding_window_pattern.len() == num_layers,
+        "Inkling 2 needs a sliding window and one sliding-window flag per layer"
+    );
+    anyhow::ensure!(
+        md_get_usize_or(md, &key("rope.dimension_count"), 0)? == 0,
+        "Inkling 2 has no rotary embedding"
+    );
+    Ok(parsed)
 }
 
 // Maya's published flat typed keys, not the embedded JSON or stale quantization
@@ -1801,9 +2008,19 @@ pub fn read_gguf_metadata(path: &Path) -> Result<GgufMetadata> {
         return parse_gguf_metadata(&content.metadata);
     }
     let (mut file, _) = open_validated_gguf(path)?;
-    let content = gguf_file::Content::read(&mut file)
-        .with_context(|| format!("Failed to parse GGUF header: {}", path.display()))?;
-    parse_gguf_metadata(&content.metadata)
+    match gguf_file::Content::read(&mut file) {
+        Ok(content) => parse_gguf_metadata(&content.metadata),
+        // Inkling 2 NVFP4 files: Candle rejects the tensor type, not the metadata.
+        Err(candle_error) => {
+            let content = RawGgufContent::read(&mut file).with_context(|| {
+                format!(
+                    "Failed to parse GGUF header with Candle ({candle_error}) or the DINF reader: {}",
+                    path.display()
+                )
+            })?;
+            parse_gguf_metadata(&content.metadata)
+        }
+    }
 }
 
 /// Read the GGUF metadata map, including files whose tensor table uses a
@@ -1919,6 +2136,14 @@ fn tensor_belongs_to_stage(name: &str, range: &LayerRange) -> bool {
     // as a tied output head when output.weight is absent.
     if name == "token_embd.weight" || name.starts_with("token_embd.") {
         return range.is_head() || range.is_tail();
+    }
+    // Inkling 2 normalizes token embeddings before the first layer.
+    if name == "token_embd_norm.weight" {
+        return range.is_head();
+    }
+    // Inkling 2's final attention-residual query, read before output_norm.
+    if name == "output_res_query.weight" {
+        return range.is_tail();
     }
 
     // V4 hyper-connection output tensors belong to the tail stage.
@@ -2187,6 +2412,13 @@ pub fn load_stage_tensors(
     // header. Route this family through the byte-preserving reader first.
     if architecture == "deepseek4" {
         return load_stage_tensors_deepseek4(&shard_paths, range, device);
+    }
+
+    if architecture == "inkling2_loop"
+        && shard_paths.len() == 1
+        && has_tensor_types_candle_lacks(&shard_paths[0])?
+    {
+        return load_stage_tensors_mixed(&shard_paths[0], range, device);
     }
 
     if shard_paths.len() == 1 {
@@ -2861,6 +3093,134 @@ fn load_stage_tensors_deepseek4(
         raw_source: None,
         device: device.clone(),
     })
+}
+
+/// Whether a GGUF file holds a tensor type that Candle 0.11 cannot load.
+fn has_tensor_types_candle_lacks(path: &Path) -> Result<bool> {
+    let (mut file, _) = open_validated_gguf(path)?;
+    let content = RawGgufContent::read(&mut file)
+        .with_context(|| format!("Failed to parse GGUF header: {}", path.display()))?;
+    Ok(content
+        .tensor_infos
+        .values()
+        .any(|info| info.dtype.candle_dtype().is_none()))
+}
+
+/// Single-file loading for a GGUF whose tensor table mixes Candle types with
+/// types Candle lacks (Inkling 2's NVFP4 expert banks). Candle types become
+/// ordinary quantized tensors, placed as [`load_stage_tensors_single`] places
+/// them. The others keep their GGUF bytes in `raw_tensors`: NVFP4 and IQ4_NL
+/// banks on the device for CUDA, which reads them in place, and everything
+/// else in host memory (MXFP8 banks are rearranged there before upload).
+fn load_stage_tensors_mixed(
+    gguf_path: &Path,
+    range: LayerRange,
+    device: &Device,
+) -> Result<StageTensors> {
+    let (mut file, _) = open_validated_gguf(gguf_path)?;
+    let content = RawGgufContent::read(&mut file)
+        .with_context(|| format!("Failed to parse GGUF header: {}", gguf_path.display()))?;
+    let mut shard_metadata = ShardMetadata::new(1);
+    shard_metadata.record(0, &content.metadata, content.tensor_infos.len())?;
+    shard_metadata.finish()?;
+
+    let metadata = parse_gguf_metadata(&content.metadata)?;
+    if let Some(info) = content.tensor_infos.get("token_embd.weight") {
+        validate_embedding_vocabulary(&metadata, &info.shape)?;
+    }
+    anyhow::ensure!(
+        range.total_layers == metadata.num_layers,
+        "Layer range total_layers ({}) doesn't match model num_layers ({})",
+        range.total_layers,
+        metadata.num_layers
+    );
+
+    let has_output_weight = content.tensor_infos.contains_key("output.weight");
+    // Read in file order so the loader streams through the file once.
+    let mut names = content
+        .tensor_infos
+        .iter()
+        .map(|(name, info)| (info.offset, name.clone()))
+        .collect::<Vec<_>>();
+    names.sort();
+    let raw_device = if device.is_cuda() {
+        device
+    } else {
+        &Device::Cpu
+    };
+    let mut tensors = HashMap::new();
+    let mut raw_tensors = HashMap::new();
+    for (_, name) in names {
+        if !tensor_belongs_to_stage(&name, &range)
+            || (!range.is_head() && has_output_weight && is_token_embedding(&name))
+        {
+            continue;
+        }
+        let (info, bytes) = content
+            .read_tensor_bytes(&mut file, &name)
+            .with_context(|| format!("Failed to read tensor: {name}"))?;
+        match info.dtype.candle_dtype() {
+            Some(dtype) => {
+                let load_device =
+                    if tensor_loads_on_cpu(&metadata.architecture, &name, dtype, device.is_metal())
+                    {
+                        &Device::Cpu
+                    } else {
+                        device
+                    };
+                let tensor = gguf_file_qtensor(dtype, &bytes, info.shape.clone(), load_device)
+                    .with_context(|| format!("Failed to load tensor: {name}"))?;
+                tensors.insert(name, Arc::new(tensor));
+            }
+            None => {
+                let (shape, dtype, len) = (info.shape.clone(), info.dtype, bytes.len());
+                let in_place = matches!(
+                    dtype,
+                    deepseek4_gguf::DeepSeek4DType::NVFP4 | deepseek4_gguf::DeepSeek4DType::IQ4NL
+                );
+                let raw = RawTensor::new(
+                    shape,
+                    dtype,
+                    candle_core::Tensor::from_vec(
+                        bytes,
+                        len,
+                        if in_place { raw_device } else { &Device::Cpu },
+                    )?,
+                )?;
+                raw_tensors.insert(name, Arc::new(raw));
+            }
+        }
+    }
+
+    tracing::info!(
+        "Loaded {} tensors and {} raw tensors for layers [{}, {}) of {} (arch: {})",
+        tensors.len(),
+        raw_tensors.len(),
+        range.start,
+        range.end,
+        gguf_path.display(),
+        metadata.architecture,
+    );
+
+    Ok(StageTensors {
+        range,
+        metadata,
+        tensors,
+        raw_tensors,
+        raw_source: None,
+        device: device.clone(),
+    })
+}
+
+fn gguf_file_qtensor(
+    dtype: GgmlDType,
+    bytes: &[u8],
+    shape: Vec<usize>,
+    device: &Device,
+) -> Result<candle_core::quantized::QTensor> {
+    Ok(candle_core::quantized::ggml_file::qtensor_from_ggml(
+        dtype, bytes, shape, device,
+    )?)
 }
 
 /// Single-file GGUF loading (original path).
@@ -6949,6 +7309,107 @@ mod tests {
         assert!(parse_gguf_metadata(&metadata).is_err());
     }
 
+    fn inkling2_loop_metadata() -> HashMap<String, gguf_file::Value> {
+        use gguf_file::Value;
+        let p = |key: &str| format!("inkling2_loop.{key}");
+        let mut md = HashMap::from([
+            (
+                "general.architecture".to_string(),
+                Value::String("inkling2_loop".into()),
+            ),
+            (p("block_count"), Value::U32(24)),
+            (p("context_length"), Value::U32(1_048_576)),
+            (p("embedding_length"), Value::U32(2304)),
+            (
+                p("attention.head_count"),
+                Value::Array(vec![Value::U32(24); 24]),
+            ),
+            (
+                p("attention.head_count_kv"),
+                Value::Array(vec![Value::U32(8); 24]),
+            ),
+            (p("attention.key_length"), Value::U32(128)),
+            (p("attention.layer_norm_rms_epsilon"), Value::F32(1e-6)),
+            (p("vocab_size"), Value::U32(201_024)),
+            (p("vocab_size_unpadded"), Value::U32(200_058)),
+            (p("expert_count"), Value::U32(128)),
+            (p("expert_used_count"), Value::U32(8)),
+            (p("expert_feed_forward_length"), Value::U32(1152)),
+            (p("rope.dimension_count"), Value::U32(0)),
+            (p("attention.sliding_window"), Value::U32(1024)),
+            (
+                p("attention.sliding_window_pattern"),
+                Value::Array((0..24).map(|i| Value::Bool((i + 1) % 6 != 0)).collect()),
+            ),
+            (p("shortconv.l_cache"), Value::U32(4)),
+            (p("expert_weights_scale"), Value::F32(8.0)),
+            (p("activation.situ_beta"), Value::F32(4.0)),
+            (p("activation.situ_linear_beta"), Value::F32(25.0)),
+            (p("attn_res.block_size"), Value::U32(6)),
+            (p("final_logit_softcapping"), Value::F32(30.0)),
+            (p("attention.relative_length"), Value::U32(16)),
+            (p("attention.relative_extent"), Value::U32(1024)),
+            (p("attention.qk_clip"), Value::F32(22.627_417)),
+            (p("attention.relative_clip"), Value::F32(8.0)),
+            (p("attention.log_scale_floor"), Value::U32(8192)),
+            (p("attention.log_scale_alpha"), Value::F32(0.1)),
+            (p("loop.start"), Value::U32(6)),
+            (p("loop.end"), Value::U32(18)),
+            (p("loop.count"), Value::U32(3)),
+            (p("loop.gate_rank"), Value::U32(64)),
+            (p("loop.varying"), Value::Bool(false)),
+        ]);
+        md.shrink_to_fit();
+        md
+    }
+
+    #[test]
+    fn parses_inkling2_loop_metadata_and_per_visit_kv() {
+        let parsed = parse_gguf_metadata(&inkling2_loop_metadata()).unwrap();
+        let inkling = parsed.inkling2_loop.as_ref().expect("loop parameters");
+        assert_eq!(
+            (inkling.loop_start, inkling.loop_end, inkling.loop_count),
+            (6, 18, 3)
+        );
+        assert_eq!(inkling.visit_count(parsed.num_layers), 48);
+        assert_eq!(inkling.vocab_size_unpadded, 200_058);
+        assert_eq!(parsed.vocab_size, 201_024);
+        // Full layers 5 and 23 once, 11 and 17 three times: 8 visits of 4 KiB.
+        assert_eq!(parsed.kv_bytes_per_token(0, 24), 8 * 8 * 128 * 4);
+        assert_eq!(parsed.kv_bytes_per_token(6, 18), 6 * 8 * 128 * 4);
+        assert!(
+            parse_gguf_metadata(&minimal_llama_metadata())
+                .unwrap()
+                .inkling2_loop
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_inkling2_loop_layouts() {
+        use gguf_file::Value;
+        let error_with = |key: &str, value: Value| {
+            let mut md = inkling2_loop_metadata();
+            md.insert(format!("inkling2_loop.{key}"), value);
+            parse_gguf_metadata(&md).unwrap_err().to_string()
+        };
+        assert!(error_with("loop.varying", Value::Bool(true)).contains("variable-loop"));
+        assert!(
+            error_with("loop.start", Value::U32(4)).contains("whole attention-residual blocks")
+        );
+        assert!(error_with("loop.end", Value::U32(30)).contains("whole attention-residual blocks"));
+        assert!(error_with("vocab_size_unpadded", Value::U32(300_000)).contains("unpadded"));
+        assert!(error_with("rope.dimension_count", Value::U32(64)).contains("rotary"));
+        let mut md = inkling2_loop_metadata();
+        md.remove("inkling2_loop.attention.qk_clip");
+        assert!(
+            parse_gguf_metadata(&md)
+                .unwrap_err()
+                .to_string()
+                .contains("qk_clip")
+        );
+    }
+
     #[test]
     fn rejects_malformed_or_nonfinite_metadata_array_values() {
         let mut metadata = minimal_llama_metadata();
@@ -7679,6 +8140,7 @@ mod tests {
             indexer_kpool_select_tail: false,
             swiglu_clamp_exp: Vec::new(),
             swiglu_clamp_shexp: Vec::new(),
+            inkling2_loop: None,
         }
     }
 

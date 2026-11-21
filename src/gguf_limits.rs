@@ -186,6 +186,7 @@ pub(crate) fn validate_gguf_header_budget(file: &mut File) -> Result<GgufHeaderS
 
         let mut alignment = 32u64;
         let mut deepseek41 = false;
+        let mut inkling2 = false;
         let mut engram_encoding = false;
         let (mut split_no, mut split_count, mut split_tensors) = (None, None, None);
         let mut metadata_keys = DuplicateStringIndex::default();
@@ -228,6 +229,7 @@ pub(crate) fn validate_gguf_header_budget(file: &mut File) -> Result<GgufHeaderS
                 let value = read_string_scan(file, version, file_size)?;
                 if key.matches(b"general.architecture") {
                     deepseek41 = value.matches(b"deepseek41");
+                    inkling2 = value.matches(b"inkling2_loop");
                 } else {
                     engram_encoding = value.matches(b"e4m3_e8m0_32_row264");
                 }
@@ -289,6 +291,13 @@ pub(crate) fn validate_gguf_header_budget(file: &mut File) -> Result<GgufHeaderS
                 && dimensions == 2
                 && shape[..2] == [256, 768022850];
             let disk_engram = maya_engram || coder_engram;
+            // The official Inkling 2 MXFP8 expert banks keep each 32-weight
+            // block's UE8M0 exponent as one byte beside the F8_E4M3 weights:
+            // `[in / 32, out, experts]`, within the usual caps.
+            let inkling2_mx_scale = inkling2
+                && tensor_type == 24
+                && dimensions == 3
+                && name.ends_with(b"_exps.mx_scale");
             if deepseek41 && name.display_name().contains("engram_embd") {
                 anyhow::ensure!(
                     disk_engram,
@@ -300,8 +309,9 @@ pub(crate) fn validate_gguf_header_budget(file: &mut File) -> Result<GgufHeaderS
                 "GGUF tensor element count ({element_count}) exceeds application limit ({MAX_GGUF_TENSOR_ELEMENTS})"
             );
             anyhow::ensure!(
-                tensor_type != 24 || disk_engram,
-                "I8 is supported only for exact disk-only DeepSeek V4.1 Engram tables"
+                tensor_type != 24 || disk_engram || inkling2_mx_scale,
+                "I8 is supported only for exact disk-only DeepSeek V4.1 Engram tables \
+                 and Inkling 2 MXFP8 expert scales"
             );
             let (block_elements, block_bytes) = ggml_block_layout(tensor_type)?;
             anyhow::ensure!(
@@ -443,6 +453,17 @@ impl StringScan {
         self.len == expected.len() as u64
             && expected.len() <= self.small_len
             && self.small[..expected.len()] == *expected
+    }
+
+    /// Whether the whole (normalized) string fits the scanned prefix and
+    /// ends with `suffix`.
+    fn ends_with(self, suffix: &[u8]) -> bool {
+        let Ok(len) = usize::try_from(self.len) else {
+            return false;
+        };
+        len <= self.small_len
+            && len >= suffix.len()
+            && self.small[len - suffix.len()..len] == *suffix
     }
 
     fn is_general_alignment(self) -> bool {
@@ -760,11 +781,13 @@ fn ggml_block_layout(tensor_type: u32) -> Result<(u64, u64)> {
         21 => (256, 110), // IQ3_S
         22 => (256, 82),  // IQ2_S
         23 => (256, 136), // IQ4_XS
-        24 => (1, 1),     // I8 (disk-only Engram on V4.1)
+        24 => (1, 1),     // I8 (disk-only Engram on V4.1, Inkling 2 MXFP8 scales)
         26 => (1, 4),     // I32
         29 => (256, 56),  // IQ1_M
         30 => (1, 2),     // BF16
         39 => (32, 17),   // MXFP4
+        40 => (64, 36),   // NVFP4
+        43 => (1, 1),     // F8_E4M3
         value => anyhow::bail!("unsupported GGUF tensor type {value}"),
     })
 }
@@ -1206,5 +1229,51 @@ mod tests {
         );
         truncated.as_file().set_len(data - 64).unwrap();
         assert!(validate_gguf_header_budget(truncated.as_file_mut()).is_err());
+    }
+
+    #[test]
+    fn inkling2_mxfp8_scales_are_the_only_other_i8_tensors() {
+        use crate::deepseek4_gguf::fixtures::sparse;
+        use candle_core::quantized::gguf_file::Value;
+        use std::collections::HashMap;
+        let metadata = |architecture: &str| {
+            HashMap::from([(
+                "general.architecture".to_string(),
+                Value::String(architecture.into()),
+            )])
+        };
+        let check = |architecture: &str, name: &str, shape: &[usize]| {
+            let (mut file, _) = sparse(&metadata(architecture), &[(name, shape, 24, 0)]);
+            validate_gguf_header_budget(file.as_file_mut())
+        };
+        let name = "blk.20.ffn_gate_up_exps.mx_scale";
+        assert!(check("inkling2_loop", name, &[72, 2304, 8]).is_ok());
+        assert!(
+            check(
+                "inkling2_loop",
+                "blk.20.ffn_down_exps.mx_scale",
+                &[36, 2304, 8]
+            )
+            .is_ok()
+        );
+        for (architecture, name, shape) in [
+            ("llama", name, &[72, 2304, 8][..]),
+            ("inkling2_loop", name, &[72, 2304]),
+            (
+                "inkling2_loop",
+                "blk.20.ffn_gate_up_exps.weight",
+                &[72, 2304, 8],
+            ),
+            (
+                "inkling2_loop",
+                "blk.20.ffn_gate_up_exps.mx_scale.x",
+                &[72, 2304, 8],
+            ),
+        ] {
+            assert!(
+                check(architecture, name, shape).is_err(),
+                "{architecture} {name} {shape:?}"
+            );
+        }
     }
 }

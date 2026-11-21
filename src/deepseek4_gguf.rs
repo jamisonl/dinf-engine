@@ -93,6 +93,10 @@ pub enum DeepSeek4DType {
     IQ3S,
     BF16,
     MXFP4,
+    /// NVIDIA FP4: E2M1 values with one UE4M3 scale per 16.
+    NVFP4,
+    /// FP8 E4M3 values (no block scale).
+    F8E4M3,
     Unknown(u32),
 }
 
@@ -126,6 +130,8 @@ impl DeepSeek4DType {
             29 => Self::IQ1M,
             30 => Self::BF16,
             39 => Self::MXFP4,
+            40 => Self::NVFP4,
+            43 => Self::F8E4M3,
             value => Self::Unknown(value),
         }
     }
@@ -159,6 +165,8 @@ impl DeepSeek4DType {
             Self::IQ1M => 29,
             Self::BF16 => 30,
             Self::MXFP4 => 39,
+            Self::NVFP4 => 40,
+            Self::F8E4M3 => 43,
             Self::Unknown(value) => value,
         }
     }
@@ -194,6 +202,8 @@ impl DeepSeek4DType {
             Self::IQ2S => (256, 82),
             Self::IQ3S => (256, 110),
             Self::MXFP4 => (32, 17),
+            Self::NVFP4 => (64, 36),
+            Self::F8E4M3 => (1, 1),
             Self::Unknown(_) => return None,
         })
     }
@@ -215,6 +225,29 @@ impl DeepSeek4DType {
             .checked_div(block)
             .and_then(|blocks| blocks.checked_mul(size))
             .context("GGUF tensor byte length overflow")
+    }
+
+    /// The Candle quantization type with the same GGML ID, if Candle has one.
+    pub(crate) fn candle_dtype(self) -> Option<candle_core::quantized::GgmlDType> {
+        use candle_core::quantized::GgmlDType as G;
+        Some(match self {
+            Self::F32 => G::F32,
+            Self::F16 => G::F16,
+            Self::BF16 => G::BF16,
+            Self::Q4_0 => G::Q4_0,
+            Self::Q4_1 => G::Q4_1,
+            Self::Q5_0 => G::Q5_0,
+            Self::Q5_1 => G::Q5_1,
+            Self::Q8_0 => G::Q8_0,
+            Self::Q8_1 => G::Q8_1,
+            Self::Q2K => G::Q2K,
+            Self::Q3K => G::Q3K,
+            Self::Q4K => G::Q4K,
+            Self::Q5K => G::Q5K,
+            Self::Q6K => G::Q6K,
+            Self::Q8K => G::Q8K,
+            _ => return None,
+        })
     }
 }
 
@@ -1184,6 +1217,18 @@ impl RawGgufContent {
                 && name.ends_with("_exps.weight")),
             "V4.1 expert banks are disk-only; load a single expert slice"
         );
+        let (info, raw) = self.read_tensor_bytes(file, name)?;
+        let byte_len = raw.len();
+        let bytes = Tensor::from_vec(raw, byte_len, device)?;
+        RawTensor::new(info.shape.clone(), info.dtype, bytes)
+    }
+
+    /// Read one tensor's bytes, in their GGUF layout, into host memory.
+    pub(crate) fn read_tensor_bytes(
+        &self,
+        file: &mut File,
+        name: &str,
+    ) -> Result<(&RawTensorInfo, Vec<u8>)> {
         let info = self
             .tensor_infos
             .get(name)
@@ -1203,8 +1248,7 @@ impl RawGgufContent {
         let mut raw = vec![0u8; byte_len];
         file.seek(SeekFrom::Start(start))?;
         file.read_exact(&mut raw)?;
-        let bytes = Tensor::from_vec(raw, byte_len, device)?;
-        RawTensor::new(info.shape.clone(), info.dtype, bytes)
+        Ok((info, raw))
     }
 }
 

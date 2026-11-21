@@ -1,0 +1,766 @@
+//! Expert banks in GGUF formats Candle lacks, kept in their GGUF bytes.
+//!
+//! - NVFP4 (GGML type 40): 64 weights in 36 bytes, four UE4M3 scales, one per
+//!   16 weights, then 32 bytes of E2M1 pairs. Byte `j` of a 16-weight group
+//!   holds weight `j` in its low nibble and weight `j + 8` in its high one
+//!   (`dequantize_row_nvfp4` in ggml).
+//! - IQ4_NL (type 20): Q4_0's 18-byte block of 32 weights, an F16 scale and
+//!   16 bytes of nibbles (low nibbles first), through a nonlinear value table
+//!   (`dequantize_row_iq4_nl`).
+//!
+//! - MXFP8 (the official checkpoint's last four layers): E4M3 weights with an
+//!   E8M0 scale per 32, stored in the GGUF as an `F8_E4M3` tensor and an
+//!   `I8` `.mx_scale` tensor. In memory each 32 weights become a 36-byte
+//!   block: the scale byte, three zero bytes, then the 32 weight bytes.
+//!
+//! A bank may also carry one F32 scale per expert, which multiplies that
+//! expert's output (`ffn_*_exps.scale`, which comes with NVFP4 banks).
+//!
+//! CUDA runs banks through the indexed expert kernels in `indexed_moe_cuda`.
+//! Elsewhere each expert a call uses is dequantized on the host for that
+//! call: the reference for the kernels, and a slow path for devices without
+//! kernels for the format.
+
+use anyhow::{Context, Result};
+use candle_core::{CpuStorage, DType, Device, Storage, Tensor};
+
+use crate::deepseek4_gguf::{DeepSeek4DType, RawTensor};
+
+/// NVFP4 weights per block.
+const BLOCK: usize = 64;
+/// NVFP4 bytes per block.
+const BLOCK_BYTES: usize = 36;
+/// NVFP4 weights per scale.
+const GROUP: usize = 16;
+/// E2M1 values, doubled as in ggml's `kvalues_fp4`; [`ue4m3`] halves the scale.
+const FP4_VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+/// ggml's `kvalues_iq4nl`.
+const IQ4_NL_VALUES: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
+/// A raw expert format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RawFormat {
+    Nvfp4,
+    Iq4Nl,
+    Mxfp8,
+}
+
+impl RawFormat {
+    pub(crate) fn of(dtype: DeepSeek4DType) -> Option<Self> {
+        match dtype {
+            DeepSeek4DType::NVFP4 => Some(Self::Nvfp4),
+            DeepSeek4DType::IQ4NL => Some(Self::Iq4Nl),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn dtype(self) -> DeepSeek4DType {
+        match self {
+            Self::Nvfp4 => DeepSeek4DType::NVFP4,
+            Self::Iq4Nl => DeepSeek4DType::IQ4NL,
+            Self::Mxfp8 => DeepSeek4DType::F8E4M3,
+        }
+    }
+
+    /// `(weights, bytes)` per block, as held in memory.
+    fn block(self) -> (usize, usize) {
+        match self {
+            Self::Nvfp4 => (BLOCK, BLOCK_BYTES),
+            Self::Iq4Nl => (32, 18),
+            Self::Mxfp8 => (32, MXFP8_BLOCK_BYTES),
+        }
+    }
+
+    fn dequantize(self, bytes: &[u8], out: &mut [f32]) -> Result<()> {
+        match self {
+            Self::Nvfp4 => dequantize(bytes, out),
+            Self::Iq4Nl => dequantize_iq4_nl(bytes, out),
+            Self::Mxfp8 => dequantize_mxfp8(bytes, out),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn kernel_format(self) -> super::indexed_moe_cuda::RawExpertFormat {
+        match self {
+            Self::Nvfp4 => super::indexed_moe_cuda::RawExpertFormat::Nvfp4,
+            Self::Iq4Nl => super::indexed_moe_cuda::RawExpertFormat::Iq4Nl,
+            Self::Mxfp8 => super::indexed_moe_cuda::RawExpertFormat::Mxfp8,
+        }
+    }
+}
+
+/// Bytes of one in-memory MXFP8 block of 32 weights: scale, padding, weights.
+const MXFP8_BLOCK_BYTES: usize = 36;
+
+/// An E4M3 (FN) byte. 0x7f and 0xff are NaN, which the loader rejects.
+pub(crate) fn e4m3(x: u8) -> f32 {
+    let exponent = i32::from((x >> 3) & 15);
+    let mantissa = f32::from(x & 7);
+    let magnitude = if exponent == 0 {
+        mantissa * 2f32.powi(-9)
+    } else {
+        (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
+    };
+    if x & 0x80 != 0 { -magnitude } else { magnitude }
+}
+
+/// A UE8M0 scale byte: `2^(x - 127)`. 255 is NaN, which the loader rejects.
+pub(crate) fn e8m0(x: u8) -> f32 {
+    2f32.powi(i32::from(x) - 127)
+}
+
+/// Dequantize in-memory MXFP8 blocks into `out`.
+pub(crate) fn dequantize_mxfp8(bytes: &[u8], out: &mut [f32]) -> Result<()> {
+    anyhow::ensure!(
+        out.len().is_multiple_of(32) && bytes.len() == out.len() / 32 * MXFP8_BLOCK_BYTES,
+        "MXFP8 dequantization of {} bytes into {} values",
+        bytes.len(),
+        out.len()
+    );
+    for (block, values) in bytes
+        .chunks_exact(MXFP8_BLOCK_BYTES)
+        .zip(out.chunks_exact_mut(32))
+    {
+        let scale = e8m0(block[0]);
+        for (value, &byte) in values.iter_mut().zip(&block[4..]) {
+            *value = e4m3(byte) * scale;
+        }
+    }
+    Ok(())
+}
+
+/// The GGUF's MXFP8 weight bytes `[rows, cols]` and scale bytes `[rows, cols /
+/// 32]` as in-memory blocks, rejecting NaN codes.
+fn mxfp8_blocks(values: &[u8], scales: &[u8], cols: usize) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        cols.is_multiple_of(32)
+            && values.len() == scales.len() * 32
+            && values.len().is_multiple_of(cols),
+        "MXFP8 values and scales differ in shape"
+    );
+    anyhow::ensure!(
+        values.iter().all(|&x| x & 0x7f != 0x7f) && scales.iter().all(|&x| x != 0xff),
+        "MXFP8 weights hold NaN codes"
+    );
+    let mut blocks = vec![0u8; scales.len() * MXFP8_BLOCK_BYTES];
+    for ((block, &scale), weights) in blocks
+        .chunks_exact_mut(MXFP8_BLOCK_BYTES)
+        .zip(scales)
+        .zip(values.chunks_exact(32))
+    {
+        block[0] = scale;
+        block[4..].copy_from_slice(weights);
+    }
+    Ok(blocks)
+}
+
+fn host_bytes(tensor: &Tensor) -> Result<Vec<u8>> {
+    Ok(tensor
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1::<u8>()?)
+}
+
+/// ggml's `ggml_ue4m3_to_fp32`: an unsigned E4M3 scale, halved. 0 and 0x7f
+/// read as zero and the sign bit is ignored.
+pub(crate) fn ue4m3(x: u8) -> f32 {
+    if x == 0 || x == 0x7f {
+        return 0.0;
+    }
+    let exponent = i32::from((x >> 3) & 15);
+    let mantissa = f32::from(x & 7);
+    let raw = if exponent == 0 {
+        mantissa * 2f32.powi(-9)
+    } else {
+        (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
+    };
+    raw * 0.5
+}
+
+/// Dequantize whole IQ4_NL blocks into `out`, as `dequantize_row_iq4_nl` does.
+pub(crate) fn dequantize_iq4_nl(bytes: &[u8], out: &mut [f32]) -> Result<()> {
+    anyhow::ensure!(
+        out.len().is_multiple_of(32) && bytes.len() == out.len() / 32 * 18,
+        "IQ4_NL dequantization of {} bytes into {} values",
+        bytes.len(),
+        out.len()
+    );
+    for (block, values) in bytes.chunks_exact(18).zip(out.chunks_exact_mut(32)) {
+        let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+        for (j, &quant) in block[2..].iter().enumerate() {
+            values[j] = scale * f32::from(IQ4_NL_VALUES[usize::from(quant & 15)]);
+            values[j + 16] = scale * f32::from(IQ4_NL_VALUES[usize::from(quant >> 4)]);
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize whole NVFP4 blocks into `out`, as `dequantize_row_nvfp4` does.
+pub(crate) fn dequantize(bytes: &[u8], out: &mut [f32]) -> Result<()> {
+    anyhow::ensure!(
+        out.len().is_multiple_of(BLOCK) && bytes.len() == out.len() / BLOCK * BLOCK_BYTES,
+        "NVFP4 dequantization of {} bytes into {} values",
+        bytes.len(),
+        out.len()
+    );
+    for (block, values) in bytes
+        .chunks_exact(BLOCK_BYTES)
+        .zip(out.chunks_exact_mut(BLOCK))
+    {
+        for group in 0..BLOCK / GROUP {
+            let scale = ue4m3(block[group]);
+            let quants = &block[4 + group * GROUP / 2..4 + (group + 1) * GROUP / 2];
+            let values = &mut values[group * GROUP..(group + 1) * GROUP];
+            for (j, &quant) in quants.iter().enumerate() {
+                values[j] = f32::from(FP4_VALUES[usize::from(quant & 15)]) * scale;
+                values[j + GROUP / 2] = f32::from(FP4_VALUES[usize::from(quant >> 4)]) * scale;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `[experts, out_dim, in_dim]` raw weights with optional per-expert output
+/// scales.
+pub(crate) struct RawExperts {
+    format: RawFormat,
+    /// GGUF bytes: on the device for CUDA, in host memory otherwise.
+    bytes: Tensor,
+    /// `[experts]` F32 on the bytes' device.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    scales: Option<Tensor>,
+    host_scales: Option<Vec<f32>>,
+    experts: usize,
+    out_dim: usize,
+    in_dim: usize,
+}
+
+impl RawExperts {
+    pub(crate) fn new(
+        raw: &RawTensor,
+        scales: Option<Vec<f32>>,
+        experts: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<Self> {
+        let format = RawFormat::of(raw.dtype())
+            .with_context(|| format!("expert type {:?} is not supported", raw.dtype()))?;
+        let (block, block_bytes) = format.block();
+        anyhow::ensure!(
+            raw.shape() == [experts, out_dim, in_dim] && in_dim.is_multiple_of(block),
+            "{format:?} expert shape {:?} differs from [{experts}, {out_dim}, {in_dim}]",
+            raw.shape()
+        );
+        let bytes = raw.bytes().clone();
+        let expected = experts
+            .checked_mul(out_dim)
+            .and_then(|rows| rows.checked_mul(in_dim / block * block_bytes))
+            .context("expert bank size overflows")?;
+        anyhow::ensure!(
+            bytes.dtype() == DType::U8 && bytes.dims() == [expected],
+            "{format:?} expert storage holds {:?}, expected {expected} bytes",
+            bytes.dims()
+        );
+        Self::from_parts(format, bytes, scales, experts, out_dim, in_dim)
+    }
+
+    /// An MXFP8 bank from the GGUF's `F8_E4M3` weights `[experts, out_dim,
+    /// in_dim]` and UE8M0 scales `[experts, out_dim, in_dim / 32]`, held on
+    /// `device` for CUDA and in host memory otherwise.
+    pub(crate) fn mxfp8(
+        values: &RawTensor,
+        block_scales: &RawTensor,
+        experts: usize,
+        out_dim: usize,
+        in_dim: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            values.dtype() == DeepSeek4DType::F8E4M3
+                && values.shape() == [experts, out_dim, in_dim]
+                && block_scales.shape() == [experts, out_dim, in_dim / 32]
+                && in_dim.is_multiple_of(32),
+            "MXFP8 expert shapes {:?} / {:?} differ from [{experts}, {out_dim}, {in_dim}]",
+            values.shape(),
+            block_scales.shape()
+        );
+        let blocks = mxfp8_blocks(
+            &host_bytes(values.bytes())?,
+            &host_bytes(block_scales.bytes())?,
+            in_dim,
+        )?;
+        let len = blocks.len();
+        let place = if device.is_cuda() {
+            device
+        } else {
+            &Device::Cpu
+        };
+        let bytes = Tensor::from_vec(blocks, len, place)?;
+        Self::from_parts(RawFormat::Mxfp8, bytes, None, experts, out_dim, in_dim)
+    }
+
+    fn from_parts(
+        format: RawFormat,
+        bytes: Tensor,
+        scales: Option<Vec<f32>>,
+        experts: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<Self> {
+        if let Some(scales) = &scales {
+            anyhow::ensure!(
+                scales.len() == experts && scales.iter().all(|scale| scale.is_finite()),
+                "expert scales must be {experts} finite values"
+            );
+        }
+        let device_scales = scales
+            .as_ref()
+            .map(|scales| Tensor::from_slice(scales, experts, bytes.device()))
+            .transpose()?;
+        #[cfg(feature = "cuda")]
+        if bytes.device().is_cuda() {
+            super::indexed_moe_cuda::precompile_raw(format.kernel_format(), bytes.device())?;
+        }
+        Ok(Self {
+            format,
+            bytes,
+            scales: device_scales,
+            host_scales: scales,
+            experts,
+            out_dim,
+            in_dim,
+        })
+    }
+
+    /// Whether `device` runs this bank in kernels rather than on the host.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn runs_on(&self, device: &Device) -> bool {
+        self.bytes.device().is_cuda() && self.bytes.device().same_device(device)
+    }
+
+    /// `input` `[tokens, 1 | top_k, in_dim]` F32 through the experts named
+    /// by `ids` `[tokens, top_k]` U32, giving `[tokens, top_k, out_dim]`.
+    pub(crate) fn forward(&self, input: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if self.runs_on(input.device()) {
+            return super::indexed_moe_cuda::forward_raw(
+                self.format.kernel_format(),
+                &input.contiguous()?,
+                &ids.contiguous()?,
+                &self.bytes,
+                self.scales.as_ref(),
+                self.experts,
+                self.out_dim,
+                self.in_dim,
+            );
+        }
+        self.forward_host(input, ids)
+    }
+
+    /// Dequantize one expert's `[out_dim, in_dim]` weights.
+    pub(crate) fn dequantize_expert(&self, expert: usize) -> Result<Vec<f32>> {
+        anyhow::ensure!(expert < self.experts, "expert {expert} is out of range");
+        let (block, block_bytes) = self.format.block();
+        let row_bytes = self.in_dim / block * block_bytes;
+        let bytes = if self.bytes.device().is_cpu() {
+            self.bytes.clone()
+        } else {
+            let len = self.out_dim * row_bytes;
+            self.bytes
+                .narrow(0, expert * len, len)?
+                .to_device(&Device::Cpu)?
+        };
+        let (storage, layout) = bytes.storage_and_layout();
+        let Storage::Cpu(CpuStorage::U8(data)) = &*storage else {
+            anyhow::bail!("raw expert host bytes are not u8")
+        };
+        let start = layout.start_offset()
+            + if self.bytes.device().is_cpu() {
+                expert * self.out_dim * row_bytes
+            } else {
+                0
+            };
+        let mut values = vec![0f32; self.out_dim * self.in_dim];
+        self.format
+            .dequantize(&data[start..start + self.out_dim * row_bytes], &mut values)?;
+        Ok(values)
+    }
+
+    fn forward_host(&self, input: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        let (tokens, input_rows, in_dim) = input.dims3()?;
+        let (id_tokens, top_k) = ids.dims2()?;
+        anyhow::ensure!(
+            in_dim == self.in_dim
+                && id_tokens == tokens
+                && (input_rows == 1 || input_rows == top_k),
+            "expert input {:?} does not fit ids {:?}",
+            input.dims(),
+            ids.dims()
+        );
+        let ids = ids.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
+        let input = input
+            .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
+            .reshape((tokens * input_rows, in_dim))?;
+        let mut routes_of = vec![Vec::new(); self.experts];
+        for (token, experts) in ids.iter().enumerate() {
+            for (slot, &expert) in experts.iter().enumerate() {
+                let expert = expert as usize;
+                anyhow::ensure!(expert < self.experts, "expert {expert} is out of range");
+                routes_of[expert].push(token * top_k + slot);
+            }
+        }
+        let mut output = vec![0f32; tokens * top_k * self.out_dim];
+        for (expert, routes) in routes_of.iter().enumerate() {
+            if routes.is_empty() {
+                continue;
+            }
+            let weight = Tensor::from_vec(
+                self.dequantize_expert(expert)?,
+                (self.out_dim, self.in_dim),
+                &Device::Cpu,
+            )?;
+            let rows = routes
+                .iter()
+                .map(|&route| {
+                    if input_rows == 1 {
+                        (route / top_k) as u32
+                    } else {
+                        route as u32
+                    }
+                })
+                .collect::<Vec<_>>();
+            let rows = Tensor::from_vec(rows, routes.len(), &Device::Cpu)?;
+            let mut product = input.index_select(&rows, 0)?.matmul(&weight.t()?)?;
+            if let Some(scales) = &self.host_scales {
+                product = (product * f64::from(scales[expert]))?;
+            }
+            for (&route, values) in routes.iter().zip(product.to_vec2::<f32>()?) {
+                output[route * self.out_dim..(route + 1) * self.out_dim].copy_from_slice(&values);
+            }
+        }
+        Ok(Tensor::from_vec(
+            output,
+            (tokens, top_k, self.out_dim),
+            &Device::Cpu,
+        )?)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// A bank of `experts` x `out_dim` x `in_dim` pseudo-random NVFP4 blocks,
+    /// with every scale byte the format can hold appearing somewhere.
+    pub(crate) fn random_bank(experts: usize, out_dim: usize, in_dim: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(7);
+        let blocks = experts * out_dim * in_dim / BLOCK;
+        let mut bytes = Vec::with_capacity(blocks * BLOCK_BYTES);
+        for _ in 0..blocks {
+            for byte in 0..BLOCK_BYTES {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let value = (state >> 13) as u8;
+                // Keep the scales near 1 most of the time so products stay
+                // in a range that a relative tolerance can check.
+                bytes.push(if byte < 4 && !value.is_multiple_of(8) {
+                    0x30 + value % 24
+                } else {
+                    value
+                });
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn ue4m3_matches_ggml() {
+        assert_eq!(ue4m3(0), 0.0);
+        assert_eq!(ue4m3(0x7f), 0.0);
+        // 0x38: exponent 7, mantissa 0 -> 1.0, halved.
+        assert_eq!(ue4m3(0x38), 0.5);
+        // 0x39: (1 + 1/8) * 2^0 / 2.
+        assert_eq!(ue4m3(0x39), 0.5625);
+        // Subnormal: mantissa 1 * 2^-9 / 2.
+        assert_eq!(ue4m3(0x01), 2f32.powi(-10));
+        // Largest finite (0x7f is the NaN code): (1 + 6/8) * 2^8 / 2.
+        assert_eq!(ue4m3(0x7e), 224.0);
+        // The sign bit is ignored.
+        assert_eq!(ue4m3(0xb8), ue4m3(0x38));
+    }
+
+    #[test]
+    fn dequantize_places_low_and_high_nibbles_per_group() -> Result<()> {
+        let mut block = [0u8; BLOCK_BYTES];
+        // Group scales 0.5, 1, 2, 4 (unhalved 1, 2, 4, 8).
+        block[..4].copy_from_slice(&[0x38, 0x40, 0x48, 0x50]);
+        for group in 0..4 {
+            for j in 0..8 {
+                // Low nibble: value index j % 8; high nibble: 8 + j % 8 (negatives).
+                block[4 + group * 8 + j] = ((8 + j as u8) << 4) | j as u8;
+            }
+        }
+        let mut values = [0f32; BLOCK];
+        dequantize(&block, &mut values)?;
+        for group in 0..4 {
+            let scale = [0.5f32, 1.0, 2.0, 4.0][group];
+            for j in 0..8 {
+                assert_eq!(values[group * 16 + j], f32::from(FP4_VALUES[j]) * scale);
+                assert_eq!(
+                    values[group * 16 + 8 + j],
+                    f32::from(FP4_VALUES[8 + j]) * scale
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A bank of pseudo-random IQ4_NL blocks with small scales.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn random_iq4_nl_bank(
+        experts: usize,
+        out_dim: usize,
+        in_dim: usize,
+        seed: u32,
+    ) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(3);
+        let blocks = experts * out_dim * in_dim / 32;
+        let mut bytes = Vec::with_capacity(blocks * 18);
+        for _ in 0..blocks {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let scale =
+                half::f16::from_f32(((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) / 32.0);
+            bytes.extend_from_slice(&scale.to_le_bytes());
+            for _ in 0..16 {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                bytes.push((state >> 13) as u8);
+            }
+        }
+        bytes
+    }
+
+    fn bank_on(
+        format: RawFormat,
+        bytes: &[u8],
+        scales: Option<Vec<f32>>,
+        dims: [usize; 3],
+        device: &Device,
+    ) -> Result<RawExperts> {
+        let raw = RawTensor::new(
+            dims.to_vec(),
+            format.dtype(),
+            Tensor::from_slice(bytes, bytes.len(), device)?,
+        )?;
+        RawExperts::new(&raw, scales, dims[0], dims[1], dims[2])
+    }
+
+    /// Pseudo-random MXFP8 weight bytes (no NaN codes) and scales near 2^-6.
+    pub(crate) fn random_mxfp8(
+        experts: usize,
+        out_dim: usize,
+        in_dim: usize,
+        seed: u32,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(5);
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 13) as u8
+        };
+        let values = (0..experts * out_dim * in_dim)
+            .map(|_| {
+                let byte = next();
+                if byte & 0x7f == 0x7f { byte ^ 1 } else { byte }
+            })
+            .collect();
+        let scales = (0..experts * out_dim * in_dim / 32)
+            .map(|_| 118 + next() % 6)
+            .collect();
+        (values, scales)
+    }
+
+    fn mxfp8_on(
+        values: &[u8],
+        scales: &[u8],
+        dims: [usize; 3],
+        device: &Device,
+    ) -> Result<RawExperts> {
+        let values = RawTensor::new(
+            dims.to_vec(),
+            DeepSeek4DType::F8E4M3,
+            Tensor::from_slice(values, values.len(), &Device::Cpu)?,
+        )?;
+        let scales = RawTensor::new(
+            vec![dims[0], dims[1], dims[2] / 32],
+            DeepSeek4DType::I8,
+            Tensor::from_slice(scales, scales.len(), &Device::Cpu)?,
+        )?;
+        RawExperts::mxfp8(&values, &scales, dims[0], dims[1], dims[2], device)
+    }
+
+    #[test]
+    fn mxfp8_matches_e4m3_and_e8m0() -> Result<()> {
+        assert_eq!(e4m3(0x38), 1.0);
+        assert_eq!(e4m3(0xb8), -1.0);
+        assert_eq!(e4m3(0x7e), 448.0);
+        assert_eq!(e4m3(0x01), 2f32.powi(-9));
+        assert_eq!(e8m0(127), 1.0);
+        assert_eq!(e8m0(0), 2f32.powi(-127));
+        let (values, scales) = random_mxfp8(2, 3, 64, 4);
+        let bank = mxfp8_on(&values, &scales, [2, 3, 64], &Device::Cpu)?;
+        let expert = bank.dequantize_expert(1)?;
+        for (i, value) in expert.iter().enumerate() {
+            let flat = 3 * 64 + i;
+            assert_eq!(*value, e4m3(values[flat]) * e8m0(scales[flat / 32]));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn iq4_nl_dequantize_matches_ggml_layout() -> Result<()> {
+        let mut block = [0u8; 18];
+        block[..2].copy_from_slice(&half::f16::from_f32(0.5).to_le_bytes());
+        for (j, byte) in block[2..].iter_mut().enumerate() {
+            *byte = ((15 - j as u8) << 4) | j as u8;
+        }
+        let mut values = [0f32; 32];
+        dequantize_iq4_nl(&block, &mut values)?;
+        for j in 0..16 {
+            assert_eq!(values[j], 0.5 * f32::from(IQ4_NL_VALUES[j]));
+            assert_eq!(values[j + 16], 0.5 * f32::from(IQ4_NL_VALUES[15 - j]));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn host_forward_matches_dense_products() -> Result<()> {
+        let (experts, out_dim, in_dim) = (3usize, 5usize, 128usize);
+        let bytes = random_bank(experts, out_dim, in_dim, 3);
+        let scales = vec![0.5f32, 2.0, -1.5];
+        let bank = bank_on(
+            RawFormat::Nvfp4,
+            &bytes,
+            Some(scales.clone()),
+            [experts, out_dim, in_dim],
+            &Device::Cpu,
+        )?;
+        let input = Tensor::from_vec(
+            (0..2 * in_dim).map(|i| (i as f32 * 0.37).sin()).collect(),
+            (2, 1, in_dim),
+            &Device::Cpu,
+        )?;
+        let ids = Tensor::from_vec(vec![2u32, 0, 1, 2], (2, 2), &Device::Cpu)?;
+        let out = bank.forward(&input, &ids)?.to_vec3::<f32>()?;
+        for (token, experts_of) in [[2usize, 0], [1, 2]].iter().enumerate() {
+            let x = input.get(token)?.squeeze(0)?.to_vec1::<f32>()?;
+            for (slot, &expert) in experts_of.iter().enumerate() {
+                let weight = bank.dequantize_expert(expert)?;
+                for row in 0..out_dim {
+                    let expected = scales[expert]
+                        * weight[row * in_dim..(row + 1) * in_dim]
+                            .iter()
+                            .zip(&x)
+                            .map(|(w, x)| w * x)
+                            .sum::<f32>();
+                    let got = out[token][slot][row];
+                    assert!(
+                        (got - expected).abs() <= 1e-4 * expected.abs().max(1.0),
+                        "token {token} expert {expert} row {row}: {got} vs {expected}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The CUDA decode, grouped and tensor-core kernels against the host path.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_kernels_match_host_reference() -> Result<()> {
+        let Some(cuda) = crate::test_cuda_device() else {
+            return Ok(());
+        };
+        let (experts, out_dim, in_dim, top_k) = (6usize, 70usize, 192usize, 3usize);
+        let scales = (0..experts)
+            .map(|e| 0.25 + e as f32 * 0.5)
+            .collect::<Vec<_>>();
+        let dims = [experts, out_dim, in_dim];
+        for (format, with_scales) in [
+            (RawFormat::Nvfp4, false),
+            (RawFormat::Nvfp4, true),
+            (RawFormat::Iq4Nl, false),
+            (RawFormat::Mxfp8, false),
+        ] {
+            let scales = with_scales.then(|| scales.clone());
+            let (host, gpu) = match format {
+                RawFormat::Mxfp8 => {
+                    let (values, block_scales) = random_mxfp8(experts, out_dim, in_dim, 13);
+                    (
+                        mxfp8_on(&values, &block_scales, dims, &Device::Cpu)?,
+                        mxfp8_on(&values, &block_scales, dims, &cuda)?,
+                    )
+                }
+                _ => {
+                    let bytes = match format {
+                        RawFormat::Nvfp4 => random_bank(experts, out_dim, in_dim, 11),
+                        _ => random_iq4_nl_bank(experts, out_dim, in_dim, 12),
+                    };
+                    (
+                        bank_on(format, &bytes, scales.clone(), dims, &Device::Cpu)?,
+                        bank_on(format, &bytes, scales, dims, &cuda)?,
+                    )
+                }
+            };
+            assert!(gpu.runs_on(&cuda));
+            // One decode token, a prompt sharing one input row per token, and
+            // a prompt with one input row per route (the down projection).
+            // 200 tokens fill route tiles with up to eight 16-route slabs.
+            for (tokens, input_rows) in [
+                (1usize, 1usize),
+                (1, top_k),
+                (37, 1),
+                (37, top_k),
+                (200, 1),
+                (200, top_k),
+            ] {
+                let input = Tensor::from_vec(
+                    (0..tokens * input_rows * in_dim)
+                        .map(|i| ((i * 7919 % 1013) as f32 / 1013.0 - 0.5) * 2.0)
+                        .collect(),
+                    (tokens, input_rows, in_dim),
+                    &Device::Cpu,
+                )?;
+                let ids = Tensor::from_vec(
+                    (0..tokens * top_k)
+                        .map(|i| ((i * 5 + i / top_k) % experts) as u32)
+                        .collect(),
+                    (tokens, top_k),
+                    &Device::Cpu,
+                )?;
+                let expected = host
+                    .forward(&input, &ids)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let got = gpu
+                    .forward(&input.to_device(&cuda)?, &ids.to_device(&cuda)?)?
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let scale = expected.iter().fold(1f32, |m, v| m.max(v.abs()));
+                let error = expected
+                    .iter()
+                    .zip(&got)
+                    .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                // Prompts round inputs to F16 on tensor cores.
+                let tolerance = if tokens > 1 { 2e-3 } else { 1e-5 } * scale;
+                assert!(
+                    error <= tolerance,
+                    "{format:?} tokens {tokens}, input rows {input_rows}, scales {with_scales}: error {error} (scale {scale})"
+                );
+            }
+        }
+        Ok(())
+    }
+}

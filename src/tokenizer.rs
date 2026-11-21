@@ -25,6 +25,13 @@ use crate::gguf_limits::validate_gguf_header_budget;
 
 #[path = "tokenizer_deepseek41.rs"]
 mod deepseek41;
+#[path = "tokenizer_inkling.rs"]
+mod inkling;
+pub(crate) use inkling::{
+    CONTENT_INVOKE_TOOL_JSON as INKLING_CONTENT_INVOKE_TOOL_JSON,
+    CONTENT_TEXT as INKLING_CONTENT_TEXT, CONTENT_THINKING as INKLING_CONTENT_THINKING,
+    END_MESSAGE as INKLING_END_MESSAGE, MESSAGE_MODEL as INKLING_MESSAGE_MODEL,
+};
 
 #[derive(Debug)]
 struct MergeNode {
@@ -194,6 +201,9 @@ pub enum ChatStyle {
     Llama4,
     /// Muse Spark recipient headers and separate message/turn endings.
     MuseSpark,
+    /// Inkling 2: role and content tokens, a thinking-effort system message,
+    /// and no generation prompt (the model opens its own turn).
+    Inkling2,
     /// Phi-3 style: <|user|>\n...\n<|end|>\n<|assistant|>\n
     Phi3,
     /// Classic instruct: `[INST] user [/INST] assistant`
@@ -357,7 +367,7 @@ pub enum ChatTemplateToolChoice {
 }
 
 impl ChatTemplateToolChoice {
-    fn requires_tool(&self) -> bool {
+    pub(crate) fn requires_tool(&self) -> bool {
         matches!(self, Self::Required | Self::Named(_))
     }
 }
@@ -508,6 +518,9 @@ pub struct GgufTokenizer {
     ignore_merges: bool,
     /// MiniMax's case-aware word splits and NFC normalization.
     minimax_pretokenizer: bool,
+    /// The same o200k split without normalization (llama.cpp's GPT-4o preset),
+    /// used by Inkling 2.
+    o200k_pretokenizer: bool,
     /// GLM's cl100k-style split; spaces never join number tokens.
     glm_pretokenizer: bool,
     /// JoyAI's three sequential isolated splits, before byte encoding.
@@ -988,6 +1001,7 @@ impl GgufTokenizer {
         };
         let ignore_merges = tokenizer_pre == "pixtral";
         let minimax_pretokenizer = tokenizer_pre == "minimax-m2";
+        let o200k_pretokenizer = tokenizer_pre == "inkling2";
 
         // Extract special token IDs
         let bos_id = metadata_token_id(md, "tokenizer.ggml.bos_token_id", vocab.len())?
@@ -1070,6 +1084,12 @@ impl GgufTokenizer {
         }
         let chat_style = if architecture == "muse-spark" {
             ChatStyle::MuseSpark
+        } else if architecture == "inkling2_loop"
+            && INKLING_CONTROL_TOKENS
+                .iter()
+                .all(|token| vocab_to_id.contains_key(*token))
+        {
+            ChatStyle::Inkling2
         } else if matches!(architecture.as_str(), "glm5next" | "glm5-next")
             && vocab_to_id.contains_key("[gMASK]")
             && vocab_to_id.contains_key("<sop>")
@@ -1150,6 +1170,7 @@ impl GgufTokenizer {
             ChatStyle::Llama3 => &["<|eot_id|>", "<|end_of_text|>"],
             ChatStyle::Llama4 => &["<|eot|>", "<|end_of_text|>"],
             ChatStyle::MuseSpark => &["<|eot|>", "<|end_of_text|>"],
+            ChatStyle::Inkling2 => &["<|content_model_end_sampling|>"],
             ChatStyle::Phi3 => &["<|end|>"],
             ChatStyle::ChatML => &["<|im_end|>", "<|endoftext|>"],
             ChatStyle::Qwen3 => &["<|im_end|>", "<|endoftext|>"],
@@ -1196,6 +1217,7 @@ impl GgufTokenizer {
             merge_ranks,
             ignore_merges,
             minimax_pretokenizer,
+            o200k_pretokenizer,
             glm_pretokenizer,
             joyai_pretokenizer: tokenizer_pre == "joyai-llm",
             deepseek_llm_pretokenizer: tokenizer_pre == "deepseek-llm",
@@ -1539,6 +1561,7 @@ impl GgufTokenizer {
                 )
                 .expect("plain DeepSeek V4.1 chat requires valid text messages")
             }
+            ChatStyle::Inkling2 => format_inkling_chat(messages, thinking_state, reasoning_effort),
             ChatStyle::MuseSpark => {
                 let messages = messages
                     .iter()
@@ -2095,6 +2118,7 @@ impl GgufTokenizer {
                 ChatStyle::Glm5 => matches!(effort, "low" | "high" | "max"),
                 ChatStyle::DeepSeekV41 => matches!(effort, "none" | "low" | "high" | "max"),
                 ChatStyle::MuseSpark => matches!(effort, "low" | "medium" | "high" | "xhigh"),
+                ChatStyle::Inkling2 => inkling_effort_level(effort).is_some(),
                 ChatStyle::Qwen3 if self.qwen_default_xhigh_reasoning => {
                     matches!(effort, "none" | "low" | "medium" | "xhigh")
                 }
@@ -2146,6 +2170,9 @@ impl GgufTokenizer {
         );
         if self.chat_style == ChatStyle::MuseSpark {
             return format_muse_chat(messages, options, self.add_bos);
+        }
+        if self.chat_style == ChatStyle::Inkling2 {
+            return inkling::format_chat(messages, options);
         }
         if self.chat_style == ChatStyle::DeepSeekV41 {
             return deepseek41::format_chat(messages, options);
@@ -2205,6 +2232,7 @@ impl GgufTokenizer {
             ChatStyle::DeepSeekV4 => ToolFormat::DeepSeek,
             ChatStyle::DeepSeekV41 => ToolFormat::DeepSeekV41,
             ChatStyle::MuseSpark => ToolFormat::Atem,
+            ChatStyle::Inkling2 => ToolFormat::Inkling,
             ChatStyle::Qwen3 if self.qwen_xml_tools => ToolFormat::Qwen,
             _ => ToolFormat::Json,
         }
@@ -2222,6 +2250,9 @@ impl GgufTokenizer {
     ) -> ToolFormat {
         if self.chat_style == ChatStyle::MuseSpark {
             return ToolFormat::Atem;
+        }
+        if self.chat_style == ChatStyle::Inkling2 {
+            return ToolFormat::Inkling;
         }
         if self.chat_style == ChatStyle::DeepSeekV41 {
             return ToolFormat::DeepSeekV41;
@@ -2247,6 +2278,75 @@ impl GgufTokenizer {
             format
         }
     }
+}
+
+/// Control tokens an Inkling 2 vocabulary must contain for its chat format.
+const INKLING_CONTROL_TOKENS: [&str; 10] = [
+    inkling::MESSAGE_USER,
+    inkling::MESSAGE_MODEL,
+    inkling::MESSAGE_SYSTEM,
+    inkling::MESSAGE_TOOL,
+    inkling::CONTENT_TEXT,
+    inkling::CONTENT_THINKING,
+    inkling::CONTENT_XML,
+    inkling::CONTENT_INVOKE_TOOL_JSON,
+    inkling::END_MESSAGE,
+    inkling::END_SAMPLING,
+];
+
+/// The template's named reasoning efforts, as the number it prints.
+fn inkling_effort_level(effort: &str) -> Option<&'static str> {
+    Some(match effort {
+        "none" => "0",
+        "minimal" => "0.1",
+        "low" => "0.2",
+        "medium" => "0.7",
+        "high" => "0.9",
+        "xhigh" | "max" => "0.99",
+        _ => return None,
+    })
+}
+
+/// The Inkling 2 chat template for plain `(role, text)` messages, through
+/// the structured formatter. Unknown roles read as user turns, and earlier
+/// reasoning arrives as a leading `<think>` block from the portable tool path;
+/// it becomes a native thinking message. Thinking turned off without an
+/// effort selects level 0.
+fn format_inkling_chat(
+    messages: &[(String, String)],
+    thinking_state: Option<bool>,
+    reasoning_effort: Option<&str>,
+) -> String {
+    let effort = reasoning_effort
+        .filter(|effort| inkling_effort_level(effort).is_some())
+        .or((thinking_state == Some(false)).then_some("none"));
+    let messages = messages
+        .iter()
+        .map(|(role, content)| {
+            let role = match role.as_str() {
+                "system" | "developer" => "system",
+                "assistant" | "model" => "assistant",
+                "tool" | "function" => "tool",
+                _ => "user",
+            };
+            let split = (role == "assistant")
+                .then(|| {
+                    content
+                        .strip_prefix("<think>\n")?
+                        .split_once("\n</think>\n\n")
+                })
+                .flatten();
+            match split {
+                Some((reasoning, text)) => {
+                    ChatTemplateMessage::new(role, text).with_reasoning_content(reasoning)
+                }
+                None => ChatTemplateMessage::new(role, content.as_str()),
+            }
+        })
+        .collect::<Vec<_>>();
+    let options = ChatTemplateOptions::new([]).with_reasoning_effort(effort.map(str::to_owned));
+    inkling::format_chat(&messages, &options)
+        .expect("plain Inkling 2 chat has valid roles and effort")
 }
 
 fn muse_escape(value: &str) -> String {
@@ -2750,6 +2850,9 @@ pub enum ToolFormat {
     DeepSeekV41,
     /// Muse Spark's ATEM calls, one recipient message per call.
     Atem,
+    /// Inkling 2's native messages: each call is a model message
+    /// `NAME<|content_invoke_tool_json|>{"name":NAME,"args":{...}}`.
+    Inkling,
 }
 
 fn contains_native_control(text: &str) -> bool {
@@ -2997,7 +3100,9 @@ fn native_tool_call(call: &ChatTemplateToolCall, format: ToolFormat) -> Result<S
         ToolFormat::Qwen => format!("<tool_call>\n<function={}>\n", call.name),
         ToolFormat::Glm => format!("<tool_call>{}", call.name),
         ToolFormat::DeepSeek => format!("<｜DSML｜invoke name=\"{}\">\n", call.name),
-        ToolFormat::Json | ToolFormat::Atem | ToolFormat::DeepSeekV41 => unreachable!(),
+        ToolFormat::Json | ToolFormat::Atem | ToolFormat::DeepSeekV41 | ToolFormat::Inkling => {
+            unreachable!()
+        }
     };
     for (key, value) in arguments {
         anyhow::ensure!(
@@ -3025,7 +3130,9 @@ fn native_tool_call(call: &ChatTemplateToolCall, format: ToolFormat) -> Result<S
             ToolFormat::Glm => out.push_str(&format!(
                 "<arg_key>{key}</arg_key><arg_value>{value}</arg_value>"
             )),
-            ToolFormat::Json | ToolFormat::Atem | ToolFormat::DeepSeekV41 => unreachable!(),
+            ToolFormat::Json | ToolFormat::Atem | ToolFormat::DeepSeekV41 | ToolFormat::Inkling => {
+                unreachable!()
+            }
         }
     }
     if format == ToolFormat::Qwen {
@@ -3114,7 +3221,9 @@ fn canonical_tool_instruction(options: &ChatTemplateOptions, format: ToolFormat)
             ToolFormat::Glm => {
                 "<tool_call>function_name<arg_key>argument_name</arg_key><arg_value>value</arg_value></tool_call>"
             }
-            ToolFormat::Json | ToolFormat::Atem | ToolFormat::DeepSeekV41 => unreachable!(),
+            ToolFormat::Json | ToolFormat::Atem | ToolFormat::DeepSeekV41 | ToolFormat::Inkling => {
+                unreachable!()
+            }
         };
         let closing = match format {
             ToolFormat::Qwen => {
@@ -3126,7 +3235,9 @@ fn canonical_tool_instruction(options: &ChatTemplateOptions, format: ToolFormat)
             ToolFormat::DeepSeek => {
                 "Every invoke must be inside <｜DSML｜tool_calls></｜DSML｜tool_calls>. Close every parameter, then the invoke, then the outer tool_calls block. Never emit an invoke without the outer block."
             }
-            ToolFormat::Json | ToolFormat::Atem | ToolFormat::DeepSeekV41 => unreachable!(),
+            ToolFormat::Json | ToolFormat::Atem | ToolFormat::DeepSeekV41 | ToolFormat::Inkling => {
+                unreachable!()
+            }
         };
         let types = if format == ToolFormat::DeepSeek {
             "Set string=\"true\" for strings and string=\"false\" for other values."
@@ -3397,7 +3508,10 @@ impl GgufTokenizer {
             pretokenize_deepseek_llm(text)
         } else if self.space_marker.is_some() {
             vec![text.to_string()]
-        } else if self.minimax_pretokenizer || self.chat_style == ChatStyle::MuseSpark {
+        } else if self.minimax_pretokenizer
+            || self.o200k_pretokenizer
+            || self.chat_style == ChatStyle::MuseSpark
+        {
             pretokenize_minimax(text)
         } else if self.glm_pretokenizer {
             pretokenize_glm(text)
@@ -4248,6 +4362,7 @@ mod tests {
             merge_ranks: HashMap::new(),
             ignore_merges: false,
             minimax_pretokenizer: false,
+            o200k_pretokenizer: false,
             glm_pretokenizer: false,
             joyai_pretokenizer: false,
             deepseek_llm_pretokenizer: false,
@@ -5738,6 +5853,135 @@ mod tests {
     }
 
     #[test]
+    fn inkling_chat_matches_the_published_template() {
+        let chat = |messages: &[(&str, &str)], thinking, effort| {
+            let messages = messages
+                .iter()
+                .map(|(role, content)| (role.to_string(), content.to_string()))
+                .collect::<Vec<_>>();
+            format_inkling_chat(&messages, thinking, effort)
+        };
+        // Default effort, inserted before the first non-system message.
+        assert_eq!(
+            chat(&[("user", "Hi")], None, None),
+            "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>\
+             <|message_user|><|content_text|>Hi<|end_message|>"
+        );
+        // System messages stay ahead of the effort message; reasoning history
+        // becomes a thinking message, and the assistant turn is closed.
+        assert_eq!(
+            chat(
+                &[
+                    ("system", "Be brief."),
+                    ("user", "2+2?"),
+                    ("assistant", "<think>\nadd\n</think>\n\n4"),
+                    ("user", "And 3+3?"),
+                ],
+                None,
+                Some("none"),
+            ),
+            "<|message_system|><|content_text|>Be brief.<|end_message|>\
+             <|message_system|><|content_text|>Thinking effort level: 0<|end_message|>\
+             <|message_user|><|content_text|>2+2?<|end_message|>\
+             <|message_model|><|content_thinking|>add<|end_message|>\
+             <|message_model|><|content_text|>4<|end_message|><|content_model_end_sampling|>\
+             <|message_user|><|content_text|>And 3+3?<|end_message|>"
+        );
+        // A system-only prompt ends with the effort message; disabled
+        // thinking without a named effort prints 0.
+        assert_eq!(
+            chat(&[("system", "S")], Some(false), None),
+            "<|message_system|><|content_text|>S<|end_message|>\
+             <|message_system|><|content_text|>Thinking effort level: 0<|end_message|>"
+        );
+        assert_eq!(inkling_effort_level("xhigh"), Some("0.99"));
+        assert_eq!(inkling_effort_level("minimal"), Some("0.1"));
+        assert_eq!(inkling_effort_level("default"), None);
+    }
+
+    #[test]
+    fn inkling_vocabulary_selects_its_chat_style_and_stop_token() {
+        let bytes = build_gpt2_byte_to_unicode();
+        let mut vocab: Vec<_> = (0..=255_u8).map(|b| bytes[&b].to_string()).collect();
+        vocab.extend(INKLING_CONTROL_TOKENS.iter().map(|token| token.to_string()));
+        let eos = vocab.len() - 1;
+        let token_types = (0..vocab.len())
+            .map(|id| gguf_file::Value::I32(if id >= 256 { 3 } else { 1 }))
+            .collect();
+        let metadata = HashMap::from([
+            (
+                "tokenizer.ggml.tokens".into(),
+                gguf_file::Value::Array(vocab.into_iter().map(gguf_file::Value::String).collect()),
+            ),
+            (
+                "tokenizer.ggml.token_type".into(),
+                gguf_file::Value::Array(token_types),
+            ),
+            (
+                "tokenizer.ggml.model".into(),
+                gguf_file::Value::String("gpt2".into()),
+            ),
+            (
+                "tokenizer.ggml.pre".into(),
+                gguf_file::Value::String("inkling2".into()),
+            ),
+            (
+                "general.architecture".into(),
+                gguf_file::Value::String("inkling2_loop".into()),
+            ),
+            (
+                "tokenizer.ggml.eos_token_id".into(),
+                gguf_file::Value::U32(eos as u32),
+            ),
+            (
+                "tokenizer.ggml.add_bos_token".into(),
+                gguf_file::Value::Bool(false),
+            ),
+        ]);
+        let tokenizer = GgufTokenizer::from_metadata(&metadata).unwrap();
+        assert_eq!(tokenizer.chat_style, ChatStyle::Inkling2);
+        assert!(tokenizer.o200k_pretokenizer && !tokenizer.minimax_pretokenizer);
+        assert!(!tokenizer.add_bos);
+        assert_eq!(tokenizer.stop_ids, vec![eos as u32]);
+        let ids = tokenizer
+            .encode_chat(&[("user".into(), "Hi".into())])
+            .unwrap();
+        let id = |token: &str| {
+            256 + INKLING_CONTROL_TOKENS
+                .iter()
+                .position(|control| *control == token)
+                .unwrap() as u32
+        };
+        assert_eq!(
+            ids[0],
+            id(inkling::MESSAGE_SYSTEM),
+            "prompt opens with <|message_system|>"
+        );
+        assert_eq!(
+            *ids.last().unwrap(),
+            id(inkling::END_MESSAGE),
+            "prompt ends with <|end_message|>"
+        );
+        let options = ChatTemplateOptions::new([]).with_reasoning_effort(Some("max".into()));
+        assert!(
+            tokenizer
+                .format_chat_with_tool_options(&[ChatTemplateMessage::new("user", "Hi")], &options)
+                .unwrap()
+                .contains("Thinking effort level: 0.99")
+        );
+        let unsupported =
+            ChatTemplateOptions::new([]).with_reasoning_effort(Some("default".into()));
+        assert!(
+            tokenizer
+                .format_chat_with_tool_options(
+                    &[ChatTemplateMessage::new("user", "Hi")],
+                    &unsupported
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn minimax_metadata_enables_nfc_without_changing_other_tokenizers() {
         // A byte-only vocabulary isolates normalization from BPE merge ranks.
         let bytes = build_gpt2_byte_to_unicode();
@@ -5866,6 +6110,7 @@ mod tests {
             merge_ranks: HashMap::new(),
             ignore_merges: false,
             minimax_pretokenizer: false,
+            o200k_pretokenizer: false,
             glm_pretokenizer: false,
             joyai_pretokenizer: false,
             deepseek_llm_pretokenizer: false,
@@ -5911,6 +6156,7 @@ mod tests {
             merge_ranks: HashMap::from([(("a".to_string(), "b".to_string()), 0)]),
             ignore_merges: true,
             minimax_pretokenizer: false,
+            o200k_pretokenizer: false,
             glm_pretokenizer: false,
             joyai_pretokenizer: false,
             deepseek_llm_pretokenizer: false,
@@ -5959,6 +6205,7 @@ mod tests {
             merge_ranks: HashMap::new(),
             ignore_merges: false,
             minimax_pretokenizer: false,
+            o200k_pretokenizer: false,
             glm_pretokenizer: false,
             joyai_pretokenizer: false,
             deepseek_llm_pretokenizer: false,
@@ -6052,6 +6299,7 @@ mod tests {
             merge_ranks: HashMap::new(),
             ignore_merges: false,
             minimax_pretokenizer: false,
+            o200k_pretokenizer: false,
             glm_pretokenizer: false,
             joyai_pretokenizer: false,
             deepseek_llm_pretokenizer: false,

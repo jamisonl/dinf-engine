@@ -28,9 +28,19 @@ CPU and Metal, using 128-row cases at 512, 2048 and 4096-token context budgets:
 | DeepSeek-V2-Lite-Chat | BF16 | ✓ | ✓ |
 
 Several larger models also pass targeted 64-row comparisons on both backends,
-including MiniMax M2.5, Nemotron-3-Nano and Qwen3.6/3.8. The remaining
-supported models (Gemma 4, Llama 4, DeepSeek V4 and V4.1, GLM-5.3 Flash and
-Nemotron-H) have request-state checks only.
+including MiniMax M2.5, Nemotron-3-Nano and Qwen3.6/3.8.
+
+Inkling 2 Mini was compared on CUDA for an IQ4_NL file and Unsloth's
+UD-Q4_K_M, with 64-row cases on a 325-token and a 10,467-token prompt. Mean
+KL is 0.0027–0.0033 and maximum KL at most 0.02, within llama.cpp's own
+CPU-versus-CUDA spread on the same history. Two of the four runs miss the
+95% top-token floor on near-ties (59 and 60 of 64; llama.cpp's two backends
+agree on 58 of 64 for the long prompt). On Metal and CPU, Inkling 2 Mini is
+checked against the engine's plain tensor path and against each other
+(identical greedy tokens after a 3,427-token prompt), not against llama.cpp.
+
+The remaining supported models (Gemma 4, Llama 4, DeepSeek V4 and V4.1, GLM-5.3
+Flash and Nemotron-H) have request-state checks only.
 
 The reference is a patched llama.cpp build, and its CPU plugin builds only on
 recent Apple Silicon. "CPU" results therefore mean Apple Silicon CPU; x86 and

@@ -69,6 +69,13 @@ mod indexed_moe_epilogue_cuda;
 #[cfg(target_os = "macos")]
 mod indexed_moe_metal;
 #[cfg(feature = "cuda")]
+mod inkling2_cuda;
+#[cfg(target_os = "macos")]
+mod inkling2_flash_metal;
+pub mod inkling2_loop;
+#[cfg(target_os = "macos")]
+mod inkling2_metal;
+#[cfg(feature = "cuda")]
 mod kv_append_cuda;
 #[cfg(target_os = "macos")]
 mod kv_append_metal;
@@ -111,6 +118,8 @@ pub mod qwen35_vision;
 pub mod qwen3moe;
 #[cfg(target_os = "macos")]
 mod ragged_metal;
+/// Expert banks in GGUF formats Candle lacks (NVFP4, IQ4_NL).
+mod raw_experts;
 #[cfg(feature = "cuda")]
 mod residual_norm_cuda;
 #[cfg(target_os = "macos")]
@@ -746,6 +755,59 @@ impl PreallocatedKvCache {
         self.len += incoming;
     }
 
+    /// Make room for `incoming` rows after the active span, growing or
+    /// compacting the storage as [`Self::append`] would, and return the key
+    /// and value storage (`[batch, heads, capacity, head_dim]` f16) with the
+    /// row where the new entries go. The caller writes them in place, then
+    /// calls [`Self::commit`].
+    #[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(dead_code))]
+    pub(crate) fn reserve(&mut self, incoming: usize) -> Result<(Tensor, Tensor, usize)> {
+        anyhow::ensure!(incoming > 0, "cannot reserve an empty KV sequence");
+        if self.start.saturating_add(self.len).saturating_add(incoming) > self.capacity {
+            let (batch, k_heads, _, k_head_dim) = self.k.dims4()?;
+            let (_, v_heads, _, v_head_dim) = self.v.dims4()?;
+            let required = self.len.saturating_add(incoming);
+            let capacity = if required <= self.capacity {
+                self.capacity
+            } else {
+                Self::next_capacity(self.capacity, required)?
+            };
+            let next_k = Tensor::zeros(
+                (batch, k_heads, capacity, k_head_dim),
+                candle_core::DType::F16,
+                self.k.device(),
+            )?;
+            let next_v = Tensor::zeros(
+                (batch, v_heads, capacity, v_head_dim),
+                candle_core::DType::F16,
+                self.v.device(),
+            )?;
+            if self.len > 0 {
+                let (active_k, active_v) = self.active_f16()?;
+                Self::scatter_append(&next_k, &active_k.contiguous()?, 0)?;
+                Self::scatter_append(&next_v, &active_v.contiguous()?, 0)?;
+            }
+            self.k = next_k;
+            self.v = next_v;
+            self.start = 0;
+            self.capacity = capacity;
+            self.allocation_lanes = batch;
+        }
+        Ok((self.k.clone(), self.v.clone(), self.start + self.len))
+    }
+
+    /// Count `incoming` rows written in place after [`Self::reserve`] as
+    /// active.
+    #[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(dead_code))]
+    pub(crate) fn commit(&mut self, incoming: usize) -> Result<()> {
+        anyhow::ensure!(
+            self.start + self.len + incoming <= self.capacity,
+            "KV commit exceeds the reserved capacity"
+        );
+        self.len += incoming;
+        Ok(())
+    }
+
     pub(crate) fn active_f16(&self) -> Result<(Tensor, Tensor)> {
         Ok((
             self.k.narrow(2, self.start, self.len)?,
@@ -909,6 +971,12 @@ pub(crate) fn kv_cache_allocation_tokens(cache: &[Option<LayerCache>]) -> Result
             allocation_slots = allocation_slots.max(slots);
             continue;
         }
+        if let Some(LayerCache::Inkling2(cache)) = layer {
+            let slots = cache.allocation_tokens();
+            lane_capacity = lane_capacity.max(slots);
+            allocation_slots = allocation_slots.max(slots);
+            continue;
+        }
         let Some(LayerCache::Attention(kv)) = layer else {
             continue;
         };
@@ -988,6 +1056,8 @@ pub enum LayerCache {
     DeltaNet(DeltaNetCache),
     /// Mamba-2 recurrent state.
     Mamba2(Mamba2Cache),
+    /// Inkling 2 per-visit KV and convolution state, in slot zero only.
+    Inkling2(Box<inkling2_loop::Inkling2Cache>),
 }
 
 /// Clone cache metadata for a speculative checkpoint.
@@ -997,6 +1067,7 @@ pub enum LayerCache {
 /// complete pre-pass state without copying the KV history.
 pub(crate) fn checkpoint_layer_cache(cache: &LayerCache) -> Result<LayerCache> {
     match cache {
+        LayerCache::Inkling2(cache) => Ok(LayerCache::Inkling2(Box::new(cache.checkpoint()?))),
         LayerCache::DeepSeek41(cache) => Ok(LayerCache::DeepSeek41(cache.clone())),
         LayerCache::DeepSeek4(cache) => Ok(LayerCache::DeepSeek4(cache.clone())),
         LayerCache::Attention(KvCache::F16 { k, v }) => Ok(LayerCache::Attention(KvCache::F16 {
@@ -1032,6 +1103,7 @@ pub(crate) fn checkpoint_layer_cache(cache: &LayerCache) -> Result<LayerCache> {
 /// safely feed two requests which append at the same position.
 pub(crate) fn fork_layer_cache(cache: &LayerCache) -> Result<LayerCache> {
     Ok(match cache {
+        LayerCache::Inkling2(cache) => LayerCache::Inkling2(Box::new(cache.fork()?)),
         LayerCache::DeepSeek41(cache) => LayerCache::DeepSeek41(cache.clone()),
         // V4 replaces immutable tensor chunks; it never writes shared rows.
         LayerCache::DeepSeek4(cache) => LayerCache::DeepSeek4(cache.clone()),
@@ -1150,6 +1222,7 @@ pub(crate) fn live_layer_cache_bytes(cache: &LayerCache) -> Result<usize> {
     let (a, b) = match cache {
         LayerCache::DeepSeek41(cache) => return Ok(cache.bytes()),
         LayerCache::DeepSeek4(cache) => return Ok(cache.bytes()),
+        LayerCache::Inkling2(cache) => return Ok(cache.bytes()),
         LayerCache::Attention(KvCache::F16 { k, v }) => (k.clone(), v.clone()),
         LayerCache::Attention(KvCache::PreallocatedF16(cache)) => cache.active_f16()?,
         LayerCache::Attention(KvCache::Quantized(_)) => {
@@ -1176,6 +1249,9 @@ pub(crate) fn commit_speculative_layer_cache(
         LayerCache::Attention(cache) => cache.discard_newest(discarded_rows),
         LayerCache::DeepSeek4(_) => {
             anyhow::bail!("V4 speculative rollback requires a full checkpoint")
+        }
+        LayerCache::Inkling2(_) => {
+            anyhow::bail!("Inkling 2 speculative rollback requires a full checkpoint")
         }
         LayerCache::DeltaNet(cache) => {
             let speculative_state = cache
@@ -2749,10 +2825,14 @@ pub fn from_stage_tensors(
             let model = muse_spark::MuseSparkStage::from_stage_tensors(stage, quant_config)?;
             Ok(Box::new(model))
         }
+        "inkling2_loop" => {
+            let model = inkling2_loop::Inkling2LoopStage::from_stage_tensors(stage, quant_config)?;
+            Ok(Box::new(model))
+        }
         arch => anyhow::bail!(
             "Unsupported model architecture: '{arch}'. \
-             Recognized: llama, mistral, qwen2, phi3, qwen3moe, qwen35, nemotron_h_moe, deepseek2, deepseek4, glm-dsa, glm5next, llama4, gemma4, minimax-m2, muse-spark \
-             (glm-dsa and muse-spark are unvalidated)"
+             Recognized: llama, mistral, qwen2, phi3, qwen3moe, qwen35, nemotron_h_moe, deepseek2, deepseek4, glm-dsa, glm5next, llama4, gemma4, minimax-m2, muse-spark, inkling2_loop \
+             (glm-dsa, muse-spark and inkling2_loop are unvalidated)"
         ),
     }
 }
@@ -4017,6 +4097,49 @@ mod tests {
                 .to_vec1::<f32>()?,
             (3..10).map(|value| value as f32).collect::<Vec<_>>()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn preallocated_kv_reserve_keeps_rows_and_compacts_or_grows() -> Result<()> {
+        let values = (0..60).map(|value| value as f32).collect::<Vec<_>>();
+        let k = Tensor::from_vec(values, (1, 1, 60, 1), &Device::Cpu)?;
+        let mut cache = None;
+        kv_cache_update(&mut cache, k.clone(), k, None)?;
+        let Some(KvCache::PreallocatedF16(dense)) = cache.as_mut() else {
+            panic!("expected preallocated f16 cache")
+        };
+        let rows = |dense: &PreallocatedKvCache| -> Result<Vec<f32>> {
+            Ok(dense
+                .active_f16()?
+                .0
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?)
+        };
+        // A reservation that fits returns the next unused row of the same storage.
+        let storage_id = dense.k.id();
+        let (k_cache, _, row) = dense.reserve(4)?;
+        assert_eq!((row, k_cache.id(), dense.len), (60, storage_id, 60));
+        dense.commit(4)?;
+        assert_eq!(dense.len, 64);
+        // After eviction, a reservation past the end compacts the live rows.
+        dense.evict_oldest(40)?;
+        let (_, _, row) = dense.reserve(8)?;
+        assert_eq!((dense.start, row, dense.capacity), (0, 24, 64));
+        assert_ne!(dense.k.id(), storage_id);
+        assert_eq!(
+            rows(dense)?,
+            (40..60)
+                .map(|v| v as f32)
+                .chain([0.0; 4])
+                .collect::<Vec<_>>()
+        );
+        dense.commit(8)?;
+        // A reservation beyond the capacity grows it.
+        let (_, _, row) = dense.reserve(64)?;
+        assert_eq!((row, dense.capacity, dense.len), (32, 128, 32));
+        assert!(dense.commit(97).is_err());
         Ok(())
     }
 
