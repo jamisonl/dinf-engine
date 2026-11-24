@@ -7,7 +7,11 @@
 //! repeat reports prefill time (prompt processing through the first sampled
 //! token) and steady-state decode time for the remaining tokens.
 //!
-//! DINF_BENCH_DRAFT=DRAFT.gguf attaches a DFlash draft and reports its pass
+//! DINF_BENCH_PROMPT_FILE=FILE takes the prompt from that file's text, cycled
+//! to PROMPT_TOKENS, instead of the repeated filler sentence. MoE routing
+//! follows the text, so real text spreads over more experts than the filler.
+//!
+//! DINF_BENCH_DRAFT=DRAFT.gguf attaches a DFlash or DSpark draft and reports its pass
 //! statistics; DINF_BENCH_DRAFT_MAX caps the drafted tokens per pass. Greedy
 //! requests keep the exact scalar path unless
 //! DINF_ALLOW_APPROXIMATE_SPECULATIVE=1 is also set, which this example turns
@@ -107,6 +111,11 @@ fn main() -> Result<()> {
             .take(pad)
             .chain(request)
             .collect()
+    } else if let Some(file) = std::env::var_os("DINF_BENCH_PROMPT_FILE") {
+        let text = std::fs::read_to_string(&file).context("reading DINF_BENCH_PROMPT_FILE")?;
+        let tokens = tokenizer.encode(&text)?;
+        ensure!(!tokens.is_empty(), "prompt file produced no tokens");
+        tokens.iter().copied().cycle().take(prompt_tokens).collect()
     } else {
         seed.iter().copied().cycle().take(prompt_tokens).collect()
     };
@@ -129,6 +138,9 @@ fn main() -> Result<()> {
             speculative: SpeculativeOptions {
                 allow_approximate: std::env::var("DINF_ALLOW_APPROXIMATE_SPECULATIVE").as_deref()
                     == Ok("1"),
+                // DINF_BENCH_DRAFT_FALLBACK=0 keeps drafting for the whole
+                // request, to measure the draft alone.
+                fallback: std::env::var("DINF_BENCH_DRAFT_FALLBACK").as_deref() != Ok("0"),
                 ..Default::default()
             },
             ..Default::default()
@@ -144,8 +156,14 @@ fn main() -> Result<()> {
     device.synchronize()?;
     eprintln!("load {:.1}s", load.elapsed().as_secs_f64());
 
+    // DINF_BENCH_TEMPERATURE overrides the temperature either way.
+    let temperature = match std::env::var("DINF_BENCH_TEMPERATURE") {
+        Ok(value) => value.parse().context("invalid DINF_BENCH_TEMPERATURE")?,
+        Err(_) if tools => 0.7,
+        Err(_) => 0.0,
+    };
     let params = SamplingParams {
-        temperature: if tools { 0.7 } else { 0.0 },
+        temperature,
         max_tokens: decode_tokens,
         tool_constraint,
         ..Default::default()
@@ -267,6 +285,11 @@ fn main() -> Result<()> {
                 stats.commit_time.as_secs_f64() * 1e3,
                 stats.fell_back
             );
+        }
+        // DINF_BENCH_PRINT_TOKENS=1 prints the first repeat's token IDs, to
+        // compare greedy runs with and without a draft.
+        if std::env::var_os("DINF_BENCH_PRINT_TOKENS").is_some() && pp.is_empty() {
+            eprintln!("tokens {:?}", session.generated());
         }
         if tools && pp.is_empty() {
             eprintln!(

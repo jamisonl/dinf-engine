@@ -3,8 +3,7 @@ use block2::RcBlock;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
-    MTLBarrierScope, MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder,
-    MTLComputeCommandEncoder, MTLSize,
+    MTLBarrierScope, MTLBlitCommandEncoder, MTLCommandBuffer, MTLComputeCommandEncoder, MTLSize,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -21,14 +20,12 @@ pub type PrevCeOutputs = Arc<Mutex<HashMap<usize, Arc<Fence>>>>;
 /// Owned by ComputeCommandEncoder via Arc<Mutex<>> so clones share state.
 pub struct EncoderState {
     /// Buffer ptrs written since last barrier (RAW/WAW detection).
-    pub prev_outputs: HashSet<usize>,
-    pub next_outputs: HashSet<usize>,
+    pub prev_outputs: Vec<usize>,
+    pub next_outputs: Vec<usize>,
     /// Buffer ptrs read since last barrier (WAR detection).
-    pub prev_inputs: HashSet<usize>,
-    pub next_inputs: HashSet<usize>,
+    pub prev_inputs: Vec<usize>,
+    pub next_inputs: Vec<usize>,
     pub needs_barrier: bool,
-    /// All inputs seen this encoder session (cross-encoder fence coordination).
-    pub all_inputs: HashSet<usize>,
     /// All outputs seen this encoder session (registered in global map at end_encoding).
     pub all_outputs: HashSet<usize>,
     /// Keep residency guards alive until the GPU finishes this encoder's work.
@@ -38,12 +35,11 @@ pub struct EncoderState {
 impl EncoderState {
     pub fn new() -> Self {
         EncoderState {
-            prev_outputs: HashSet::new(),
-            next_outputs: HashSet::new(),
-            prev_inputs: HashSet::new(),
-            next_inputs: HashSet::new(),
+            prev_outputs: Vec::with_capacity(16),
+            next_outputs: Vec::with_capacity(16),
+            prev_inputs: Vec::with_capacity(32),
+            next_inputs: Vec::with_capacity(32),
             needs_barrier: false,
-            all_inputs: HashSet::new(),
             all_outputs: HashSet::new(),
             buffers: HashMap::new(),
         }
@@ -105,18 +101,57 @@ impl ComputeCommandEncoder {
         )
     }
 
+    /// Dispatch with the threadgroup counts read from three `u32` at
+    /// `offset` in `arguments`, which earlier work in this encoder may write.
+    pub fn dispatch_thread_groups_indirect(
+        &self,
+        arguments: &Buffer,
+        offset: usize,
+        threads_per_threadgroup: MTLSize,
+    ) {
+        {
+            let ptr = arguments.raw_ptr() as usize;
+            let mut s = self.state.lock().unwrap();
+            if s.prev_outputs.contains(&ptr) {
+                s.needs_barrier = true;
+            }
+            if !s.next_inputs.contains(&ptr) {
+                s.next_inputs.push(ptr);
+            }
+            s.buffers.entry(ptr).or_insert_with(|| arguments.clone());
+        }
+        self.auto_barrier();
+        unsafe {
+            self.raw
+                .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                    arguments.as_ref(),
+                    offset,
+                    threads_per_threadgroup,
+                )
+        }
+    }
+
     fn auto_barrier(&self) {
-        let mut s = self.state.lock().unwrap();
+        let mut guard = self.state.lock().unwrap();
+        let s = &mut *guard;
         if s.needs_barrier {
             self.raw.memoryBarrierWithScope(MTLBarrierScope::Buffers);
             s.needs_barrier = false;
-            s.prev_outputs = std::mem::take(&mut s.next_outputs);
-            s.prev_inputs = std::mem::take(&mut s.next_inputs);
+            std::mem::swap(&mut s.prev_outputs, &mut s.next_outputs);
+            s.next_outputs.clear();
+            std::mem::swap(&mut s.prev_inputs, &mut s.next_inputs);
+            s.next_inputs.clear();
         } else {
-            let next_out = std::mem::take(&mut s.next_outputs);
-            s.prev_outputs.extend(next_out);
-            let next_in = std::mem::take(&mut s.next_inputs);
-            s.prev_inputs.extend(next_in);
+            for p in s.next_outputs.drain(..) {
+                if !s.prev_outputs.contains(&p) {
+                    s.prev_outputs.push(p);
+                }
+            }
+            for p in s.next_inputs.drain(..) {
+                if !s.prev_inputs.contains(&p) {
+                    s.prev_inputs.push(p);
+                }
+            }
         }
     }
 
@@ -127,8 +162,9 @@ impl ComputeCommandEncoder {
             if s.prev_outputs.contains(&ptr) {
                 s.needs_barrier = true;
             }
-            s.next_inputs.insert(ptr);
-            s.all_inputs.insert(ptr);
+            if !s.next_inputs.contains(&ptr) {
+                s.next_inputs.push(ptr);
+            }
             s.buffers.entry(ptr).or_insert_with(|| buf.clone());
         }
         unsafe {
@@ -144,13 +180,35 @@ impl ComputeCommandEncoder {
             if s.prev_outputs.contains(&ptr) || s.prev_inputs.contains(&ptr) {
                 s.needs_barrier = true;
             }
-            s.next_outputs.insert(ptr);
+            if !s.next_outputs.contains(&ptr) {
+                s.next_outputs.push(ptr);
+            }
             s.all_outputs.insert(ptr);
             s.buffers.entry(ptr).or_insert_with(|| buf.clone());
         }
         unsafe {
             self.raw
                 .setBuffer_offset_atIndex(buffer.map(|b| b.as_ref()), offset, index)
+        }
+    }
+
+    /// Bind `buffer` for writing without ordering this dispatch after the
+    /// earlier ones that touch it. Only for a dispatch whose reads and writes
+    /// of `buffer` are disjoint from those of every dispatch since the last
+    /// barrier; later readers are still ordered after it.
+    pub fn set_output_buffer_unordered(&self, index: usize, buffer: &Buffer, offset: usize) {
+        let ptr = buffer.raw_ptr() as usize;
+        {
+            let mut s = self.state.lock().unwrap();
+            if !s.next_outputs.contains(&ptr) {
+                s.next_outputs.push(ptr);
+            }
+            s.all_outputs.insert(ptr);
+            s.buffers.entry(ptr).or_insert_with(|| buffer.clone());
+        }
+        unsafe {
+            self.raw
+                .setBuffer_offset_atIndex(Some(buffer.as_ref()), offset, index)
         }
     }
 
@@ -219,7 +277,8 @@ impl ComputeCommandEncoder {
         self.raw.setComputePipelineState(pipeline.as_ref());
     }
 
-    pub fn set_label(&self, label: &str) {
+    pub fn set_label(&self, #[allow(unused_variables)] label: &str) {
+        #[cfg(feature = "debug-labels")]
         self.raw.setLabel(Some(&NSString::from_str(label)))
     }
 }

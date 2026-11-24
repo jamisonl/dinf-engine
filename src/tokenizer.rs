@@ -386,6 +386,10 @@ pub struct ChatTemplateOptions {
     /// False keeps the JSON envelope for a caller that cannot read the
     /// model's native tool syntax.
     pub native_tool_formats: bool,
+    /// Text a multimodal caller put where each image goes. Formats whose
+    /// images are message parts of their own (Inkling 2) render each
+    /// occurrence as one; elsewhere the marker is ordinary text.
+    pub image_marker: Option<String>,
 }
 
 impl ChatTemplateOptions {
@@ -403,6 +407,7 @@ impl ChatTemplateOptions {
             parallel_tool_calls: true,
             reasoning_effort: None,
             native_tool_formats: true,
+            image_marker: None,
         }
     }
 
@@ -427,6 +432,13 @@ impl ChatTemplateOptions {
     /// Opt in to native tool syntax when the response reader supports it.
     pub fn with_native_tool_formats(mut self, enabled: bool) -> Self {
         self.native_tool_formats = enabled;
+        self
+    }
+
+    /// Render each `marker` in message text as an image part, where the
+    /// format has them (see [`Self::image_marker`]).
+    pub fn with_image_marker(mut self, marker: impl Into<String>) -> Self {
+        self.image_marker = Some(marker.into());
         self
     }
 }
@@ -835,7 +847,7 @@ impl GgufTokenizer {
             .with_context(|| format!("Failed to open GGUF: {}", path.display()))?;
         validate_gguf_header_budget(&mut file)
             .with_context(|| format!("invalid GGUF header: {}", path.display()))?;
-        let metadata = match gguf_file::Content::read(&mut file) {
+        let metadata = match crate::gguf_header_io::read_candle_gguf(&mut file) {
             Ok(content) => content.metadata,
             Err(candle_error) => {
                 file.seek(SeekFrom::Start(0))?;
@@ -1462,6 +1474,22 @@ impl GgufTokenizer {
         self.encode(&text)
     }
 
+    /// [`Self::encode_chat`] for a prompt whose text holds `marker` where each
+    /// image goes. Formats whose images are message parts of their own
+    /// (Inkling 2) render each marker as one; elsewhere the marker is text and
+    /// this is `encode_chat`.
+    pub fn encode_chat_with_image_marker(
+        &self,
+        messages: &[(String, String)],
+        marker: &str,
+    ) -> Result<Vec<u32>> {
+        if self.chat_style != ChatStyle::Inkling2 {
+            return self.encode_chat(messages);
+        }
+        let text = format_inkling_chat(messages, None, None, Some(marker))?;
+        self.encode(&text)
+    }
+
     /// Find a stable system/developer prefix in the actual encoded prompt.
     /// Re-encode a prompt with an empty user turn, then compare token IDs: text
     /// lengths cannot locate a safe boundary when tokenizer merges differ.
@@ -1561,7 +1589,10 @@ impl GgufTokenizer {
                 )
                 .expect("plain DeepSeek V4.1 chat requires valid text messages")
             }
-            ChatStyle::Inkling2 => format_inkling_chat(messages, thinking_state, reasoning_effort),
+            ChatStyle::Inkling2 => {
+                format_inkling_chat(messages, thinking_state, reasoning_effort, None)
+                    .expect("plain Inkling 2 chat has valid roles and effort")
+            }
             ChatStyle::MuseSpark => {
                 let messages = messages
                     .iter()
@@ -2311,12 +2342,14 @@ fn inkling_effort_level(effort: &str) -> Option<&'static str> {
 /// the structured formatter. Unknown roles read as user turns, and earlier
 /// reasoning arrives as a leading `<think>` block from the portable tool path;
 /// it becomes a native thinking message. Thinking turned off without an
-/// effort selects level 0.
+/// effort selects level 0. Each `image_marker` in user or tool text becomes
+/// an image part.
 fn format_inkling_chat(
     messages: &[(String, String)],
     thinking_state: Option<bool>,
     reasoning_effort: Option<&str>,
-) -> String {
+    image_marker: Option<&str>,
+) -> Result<String> {
     let effort = reasoning_effort
         .filter(|effort| inkling_effort_level(effort).is_some())
         .or((thinking_state == Some(false)).then_some("none"));
@@ -2344,9 +2377,9 @@ fn format_inkling_chat(
             }
         })
         .collect::<Vec<_>>();
-    let options = ChatTemplateOptions::new([]).with_reasoning_effort(effort.map(str::to_owned));
+    let mut options = ChatTemplateOptions::new([]).with_reasoning_effort(effort.map(str::to_owned));
+    options.image_marker = image_marker.map(str::to_owned);
     inkling::format_chat(&messages, &options)
-        .expect("plain Inkling 2 chat has valid roles and effort")
 }
 
 fn muse_escape(value: &str) -> String {
@@ -5859,7 +5892,7 @@ mod tests {
                 .iter()
                 .map(|(role, content)| (role.to_string(), content.to_string()))
                 .collect::<Vec<_>>();
-            format_inkling_chat(&messages, thinking, effort)
+            format_inkling_chat(&messages, thinking, effort, None).unwrap()
         };
         // Default effort, inserted before the first non-system message.
         assert_eq!(

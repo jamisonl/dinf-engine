@@ -7,7 +7,10 @@ layout. `inkling2_official_gguf.py` combines them with the official NVFP4
 and MXFP8 expert banks. Only the header and the non-expert byte ranges are
 downloaded (about 4 GB of the 52 GB file).
 
-Usage: inkling2_fetch_dense.py OUTPUT_DIR
+Usage: inkling2_fetch_dense.py OUTPUT_DIR [LOCAL_BF16_GGUF]
+
+With LOCAL_BF16_GGUF (that same file, already downloaded) the byte ranges
+are read from it instead.
 
 OUTPUT_DIR receives `header.gguf` (the GGUF header) and `dense.bin` (each
 non-expert tensor's bytes, concatenated), with `index.json` giving each
@@ -29,10 +32,18 @@ HEADER_FETCH = 16 << 20
 LAYOUT = {0: (1, 4), 1: (1, 2), 30: (1, 2)}
 
 
+LOCAL = None
+
+
 def fetch(start: int, end: int) -> bytes:
-    request = urllib.request.Request(URL, headers={"Range": f"bytes={start}-{end - 1}"})
-    with urllib.request.urlopen(request) as response:
-        data = response.read()
+    if LOCAL is not None:
+        with open(LOCAL, "rb") as source:
+            source.seek(start)
+            data = source.read(end - start)
+    else:
+        request = urllib.request.Request(URL, headers={"Range": f"bytes={start}-{end - 1}"})
+        with urllib.request.urlopen(request) as response:
+            data = response.read()
     if len(data) != end - start:
         raise RuntimeError(f"short read {len(data)} of {end - start} at {start}")
     return data
@@ -84,8 +95,11 @@ def parse(header: bytes):
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
+    global LOCAL
+    if len(sys.argv) not in (2, 3):
         sys.exit(__doc__)
+    if len(sys.argv) == 3:
+        LOCAL = Path(sys.argv[2])
     out = Path(sys.argv[1])
     out.mkdir(parents=True, exist_ok=True)
     header = fetch(0, HEADER_FETCH)

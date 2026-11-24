@@ -206,18 +206,16 @@ impl CustomOp1 for GreedyArgmaxFinite {
         if input_bytes > storage.buffer().length() {
             candle_core::bail!("fused greedy argmax input span exceeds its Metal buffer")
         }
-        let output = device
-            .new_buffer_builder()
-            .with_size_for(2, DType::U32)
-            .with_label("dinf-greedy-argmax-finite")
-            .build()?;
+        let output = crate::architectures::inkling2_metal::alloc_scratch_buffer(
+            device,
+            2 * DType::U32.size_in_bytes(),
+        )?;
         let groups = argmax_groups(vocab);
         let chunk = vocab.div_ceil(groups);
-        let partial = device
-            .new_buffer_builder()
-            .with_size_for(groups * 3, DType::U32)
-            .with_label("dinf-greedy-argmax-partial")
-            .build()?;
+        let partial = crate::architectures::inkling2_metal::alloc_scratch_buffer(
+            device,
+            groups * 3 * DType::U32.size_in_bytes(),
+        )?;
         let (partial_pipeline, merge_pipeline) = pipelines(device)?;
         let encoder = device.command_encoder()?;
         encoder.set_label("dinf-greedy-argmax-finite");

@@ -119,7 +119,7 @@ impl SamplingParams {
         Ok(())
     }
 
-    fn has_penalty_controls(&self) -> bool {
+    pub(crate) fn has_penalty_controls(&self) -> bool {
         self.has_history_penalties() || !self.logit_bias.is_empty()
     }
 
@@ -439,7 +439,7 @@ impl SamplingRng {
         Self::seeded(counter ^ time.rotate_left(17) ^ u64::from(std::process::id()))
     }
 
-    fn next_f32(&mut self) -> f32 {
+    pub(crate) fn next_f32(&mut self) -> f32 {
         // xorshift64*: fast and sufficient for non-cryptographic token sampling.
         let mut x = self.state;
         x ^= x >> 12;
@@ -552,12 +552,289 @@ fn sample_positive_from_logits_vec(
     params: &SamplingParams,
     rng: &mut SamplingRng,
 ) -> Result<u32> {
-    anyhow::ensure!(
-        logits_vec.iter().all(|logit| logit.is_finite()),
-        "logits must be finite"
-    );
+    let mut max_logit = f32::NEG_INFINITY;
+    for &logit in &logits_vec {
+        anyhow::ensure!(logit.is_finite(), "logits must be finite");
+        if logit > max_logit {
+            max_logit = logit;
+        }
+    }
+    // Fast path for large vocabularies when top_k is disabled: sort only the
+    // high-probability head instead of O(V log V) over 200K tokens.
+    if params.top_k == 0 && logits_vec.len() > 2048 && params.temperature > 1e-6 {
+        let inv_t = 1.0 / params.temperature;
+        let head_span = (20.0 * params.temperature) as f32;
+        let head_cutoff = max_logit - head_span;
+        let zero_cutoff = max_logit - (40.0 * params.temperature) as f32;
+        let mut head: Vec<(usize, f32)> = Vec::with_capacity(256);
+        let mut tail_sum = 0.0f64;
+        for (id, &logit) in logits_vec.iter().enumerate() {
+            if logit >= head_cutoff {
+                head.push((id, logit));
+            } else if logit >= zero_cutoff {
+                tail_sum += ((f64::from(logit) - f64::from(max_logit)) * inv_t).exp();
+            }
+        }
+        if !head.is_empty() && head.len() <= logits_vec.len() / 4 {
+            head.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            let mut probs: Vec<f64> = head
+                .iter()
+                .map(|(_, logit)| ((f64::from(*logit) - f64::from(max_logit)) * inv_t).exp())
+                .collect();
+            let head_sum: f64 = probs.iter().sum();
+            let total_sum = head_sum + tail_sum;
+            if total_sum > 0.0 {
+                if params.top_p < 1.0 {
+                    if head_sum / total_sum >= params.top_p {
+                        for p in &mut probs {
+                            *p /= total_sum;
+                        }
+                        let mut cumulative = 0.0f64;
+                        let mut cutoff_idx = probs.len();
+                        for (i, &prob) in probs.iter().enumerate() {
+                            cumulative += prob;
+                            if cumulative >= params.top_p {
+                                cutoff_idx = i + 1;
+                                break;
+                            }
+                        }
+                        probs.truncate(cutoff_idx);
+                        head.truncate(cutoff_idx);
+                        let kept_sum: f64 = probs.iter().sum();
+                        if kept_sum > 0.0 {
+                            for p in &mut probs {
+                                *p /= kept_sum;
+                            }
+                        }
+                        let r = f64::from(rng.next_f32());
+                        let mut cumulative = 0.0f64;
+                        for ((token_id, _), &p) in head.iter().zip(&probs) {
+                            cumulative += p;
+                            if r < cumulative {
+                                return Ok(*token_id as u32);
+                            }
+                        }
+                        if let Some(((id, _), _)) =
+                            head.iter().zip(&probs).rfind(|(_, p)| **p > 0.0)
+                        {
+                            return Ok(*id as u32);
+                        }
+                    }
+                } else {
+                    let r = f64::from(rng.next_f32());
+                    let target = r * total_sum;
+                    if target < head_sum {
+                        let mut cumulative = 0.0f64;
+                        for ((token_id, _), &p) in head.iter().zip(&probs) {
+                            cumulative += p;
+                            if target < cumulative {
+                                return Ok(*token_id as u32);
+                            }
+                        }
+                        if let Some(((id, _), _)) =
+                            head.iter().zip(&probs).rfind(|(_, p)| **p > 0.0)
+                        {
+                            return Ok(*id as u32);
+                        }
+                    }
+                    // Rare tail draw: consume no extra RNG and finish over the sorted tail.
+                    let mut tail: Vec<(usize, f32)> = logits_vec
+                        .drain(..)
+                        .enumerate()
+                        .filter(|(_, logit)| *logit < head_cutoff)
+                        .collect();
+                    tail.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+                    let mut cumulative = head_sum;
+                    for (token_id, logit) in &tail {
+                        let p = ((f64::from(*logit) - f64::from(max_logit)) * inv_t).exp();
+                        cumulative += p;
+                        if target < cumulative {
+                            return Ok(*token_id as u32);
+                        }
+                    }
+                    return Ok(tail.first().map_or(head[0].0, |(id, _)| *id) as u32);
+                }
+            }
+        }
+    }
     let candidates: Vec<(usize, f32)> = logits_vec.drain(..).enumerate().collect();
     sample_positive_candidates(candidates, params, rng)
+}
+
+/// Compute the normalized target distribution `(token_id, prob)` for positive
+/// temperature sampling (`top_k`, `top_p`, `temperature`).
+fn positive_target_distribution(
+    logits: &[f32],
+    params: &SamplingParams,
+) -> Result<Vec<(u32, f64)>> {
+    anyhow::ensure!(!logits.is_empty(), "logits must contain at least one value");
+    let mut max_logit = f32::NEG_INFINITY;
+    for &logit in logits {
+        anyhow::ensure!(logit.is_finite(), "logits must be finite");
+        if logit > max_logit {
+            max_logit = logit;
+        }
+    }
+    let inv_t = 1.0 / params.temperature;
+    // Fast head-filtered path for large vocabularies when top_k == 0 and top_p < 1.0.
+    if params.top_k == 0
+        && params.top_p < 1.0
+        && logits.len() > 2048
+        && params.temperature > 1e-6
+    {
+        let head_cutoff = max_logit - (20.0 * params.temperature) as f32;
+        let zero_cutoff = max_logit - (40.0 * params.temperature) as f32;
+        let mut head: Vec<(usize, f32)> = Vec::with_capacity(256);
+        let mut tail_sum = 0.0f64;
+        for (id, &logit) in logits.iter().enumerate() {
+            if logit >= head_cutoff {
+                head.push((id, logit));
+            } else if logit >= zero_cutoff {
+                tail_sum += ((f64::from(logit) - f64::from(max_logit)) * inv_t).exp();
+            }
+        }
+        if !head.is_empty() && head.len() <= logits.len() / 4 {
+            head.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            let mut probs: Vec<f64> = head
+                .iter()
+                .map(|(_, logit)| ((f64::from(*logit) - f64::from(max_logit)) * inv_t).exp())
+                .collect();
+            let head_sum: f64 = probs.iter().sum();
+            let total_sum = head_sum + tail_sum;
+            if total_sum > 0.0 && head_sum / total_sum >= params.top_p {
+                let mut cumulative = 0.0f64;
+                let mut cutoff_idx = probs.len();
+                for (i, prob) in probs.iter_mut().enumerate() {
+                    *prob /= total_sum;
+                    cumulative += *prob;
+                    if cumulative >= params.top_p {
+                        cutoff_idx = i + 1;
+                        break;
+                    }
+                }
+                head.truncate(cutoff_idx);
+                probs.truncate(cutoff_idx);
+                let kept_sum: f64 = probs.iter().sum();
+                if kept_sum > 0.0 {
+                    return Ok(head
+                        .into_iter()
+                        .zip(probs)
+                        .map(|((id, _), p)| (id as u32, p / kept_sum))
+                        .collect());
+                }
+            }
+        }
+    }
+
+    let mut candidates: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+    if params.top_k > 0 && params.top_k < candidates.len() {
+        let k = params.top_k;
+        candidates.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+        candidates.truncate(k);
+    }
+    if params.top_p < 1.0 {
+        candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+    }
+    let mut probs: Vec<f64> = candidates
+        .iter()
+        .map(|(_, logit)| ((f64::from(*logit) - f64::from(max_logit)) * inv_t).exp())
+        .collect();
+    let sum: f64 = probs.iter().sum();
+    if sum > 0.0 {
+        for p in &mut probs {
+            *p /= sum;
+        }
+    }
+    if params.top_p < 1.0 {
+        let mut cumulative = 0.0f64;
+        let mut cutoff_idx = probs.len();
+        for (i, &p) in probs.iter().enumerate() {
+            cumulative += p;
+            if cumulative >= params.top_p {
+                cutoff_idx = i + 1;
+                break;
+            }
+        }
+        candidates.truncate(cutoff_idx);
+        probs.truncate(cutoff_idx);
+        let kept_sum: f64 = probs.iter().sum();
+        if kept_sum > 0.0 {
+            for p in &mut probs {
+                *p /= kept_sum;
+            }
+        }
+    }
+    Ok(candidates
+        .into_iter()
+        .zip(probs)
+        .filter(|(_, p)| *p > 0.0)
+        .map(|((id, _), p)| (id as u32, p))
+        .collect())
+}
+
+/// Exact Leviathan et al. (2023) speculative rejection sampling step.
+///
+/// Given target logits, a `proposed` token sampled from sparse draft
+/// distribution `draft_dist` (`(token_id, q_prob)` pairs summing to 1), either
+/// accepts `proposed` with probability `min(1, p(proposed) / q(proposed))` or
+/// rejects it and samples from the exact residual `normalize(max(0, p - q))`.
+/// The output distribution is mathematically identical to sampling from the
+/// target distribution `p` for any valid (even truncated) `draft_dist`.
+pub(crate) fn verify_rejection_sample_host(
+    logits: &[f32],
+    proposed: u32,
+    draft_dist: &[(u32, f32)],
+    params: &SamplingParams,
+    rng: &mut SamplingRng,
+) -> Result<(u32, bool)> {
+    params.validate()?;
+    anyhow::ensure!(
+        params.temperature > 0.0,
+        "rejection sampling requires positive temperature"
+    );
+    let target_dist = positive_target_distribution(logits, params)?;
+    anyhow::ensure!(!target_dist.is_empty(), "target distribution is empty");
+    let p_d = target_dist
+        .iter()
+        .find(|&&(id, _)| id == proposed)
+        .map_or(0.0, |&(_, p)| p);
+    let q_d = draft_dist
+        .iter()
+        .find(|&&(id, _)| id == proposed)
+        .map_or(0.0, |&(_, q)| f64::from(q));
+    if q_d > 0.0 && p_d > 0.0 {
+        if p_d >= q_d || f64::from(rng.next_f32()) * q_d < p_d {
+            return Ok((proposed, true));
+        }
+    }
+    let mut residual: Vec<(u32, f64)> = Vec::with_capacity(target_dist.len());
+    let mut residual_sum = 0.0f64;
+    for &(id, p) in &target_dist {
+        let q = draft_dist
+            .iter()
+            .find(|&&(qid, _)| qid == id)
+            .map_or(0.0, |&(_, q)| f64::from(q));
+        let r = (p - q).max(0.0);
+        if r > 0.0 {
+            residual.push((id, r));
+            residual_sum += r;
+        }
+    }
+    let (pool, total) = if residual_sum > 0.0 {
+        (&residual, residual_sum)
+    } else {
+        let t: f64 = target_dist.iter().map(|&(_, p)| p).sum();
+        (&target_dist, t)
+    };
+    let target = f64::from(rng.next_f32()) * total;
+    let mut cumulative = 0.0f64;
+    for &(id, w) in pool {
+        cumulative += w;
+        if target < cumulative {
+            return Ok((id, false));
+        }
+    }
+    Ok((pool.last().expect("non-empty distribution").0, false))
 }
 
 fn sample_positive_candidates(
@@ -1478,5 +1755,49 @@ mod tests {
             .map(|_| sample_token_with_rng(&logits, &params, &mut rng).unwrap())
             .collect::<HashSet<_>>();
         assert_eq!(samples, HashSet::from([0, 2]));
+    }
+
+    #[test]
+    fn rejection_sampling_preserves_exact_target_distribution() {
+        // Target logits over 6 tokens (with top_p = 0.92 excluding token 5).
+        let target_logits = vec![2.4f32, 1.9, 1.3, 0.7, 0.1, -3.0];
+        let params = SamplingParams {
+            temperature: 0.7,
+            top_k: 0,
+            top_p: 0.92,
+            ..Default::default()
+        };
+        let exact_p = positive_target_distribution(&target_logits, &params).unwrap();
+        // Deliberately mismatched and truncated draft distribution, including mass
+        // on token 5 which is outside the target's top_p nucleus.
+        let draft_q: Vec<(u32, f32)> = vec![(0, 0.25), (1, 0.35), (2, 0.15), (5, 0.25)];
+        let mut rng = SamplingRng::seeded(12345);
+        let trials = 120_000usize;
+        let mut counts = vec![0usize; target_logits.len()];
+        for _ in 0..trials {
+            let u = rng.next_f32();
+            let mut cum = 0.0f32;
+            let mut proposed = draft_q.last().unwrap().0;
+            for &(id, q) in &draft_q {
+                cum += q;
+                if u < cum {
+                    proposed = id;
+                    break;
+                }
+            }
+            let (tok, _) =
+                verify_rejection_sample_host(&target_logits, proposed, &draft_q, &params, &mut rng)
+                    .unwrap();
+            counts[tok as usize] += 1;
+        }
+        // Token 5 is outside target's top_p nucleus and must NEVER be emitted.
+        assert_eq!(counts[5], 0);
+        for &(id, p) in &exact_p {
+            let empirical = counts[id as usize] as f64 / trials as f64;
+            assert!(
+                (empirical - p).abs() < 0.006,
+                "token {id}: empirical={empirical:.4}, exact={p:.4}"
+            );
+        }
     }
 }

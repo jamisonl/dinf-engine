@@ -25,6 +25,7 @@ pub struct InferenceMetrics {
     stage_prefill_samples: VecDeque<WeightedSample>,
     inference_count: u64,
     tokens_served: u64,
+    last_completed_at: Option<Instant>,
 }
 
 const MAX_SAMPLES: usize = 16;
@@ -49,6 +50,7 @@ impl InferenceMetrics {
             stage_prefill_samples: VecDeque::with_capacity(MAX_SAMPLES),
             inference_count: 0,
             tokens_served: 0,
+            last_completed_at: None,
         }
     }
 
@@ -63,6 +65,8 @@ impl InferenceMetrics {
 
     /// Record one completed inference.
     /// `prompt_tokens` is the number of tokens in the prompt (for prefill tok/s).
+    /// A zero `prefill_duration` adds no prefill-rate sample; callers pass it
+    /// when the prompt time measures something other than prompt throughput.
     /// `ttft` is time-to-first-token (None if not measured, e.g. non-head pipeline stages).
     pub fn record(
         &mut self,
@@ -110,6 +114,7 @@ impl InferenceMetrics {
         ttft: Option<Duration>,
         solo: bool,
     ) {
+        self.last_completed_at = Some(Instant::now());
         self.inference_count += 1;
         self.tokens_served = self
             .tokens_served
@@ -163,6 +168,7 @@ impl InferenceMetrics {
         layer_count: usize,
         total_layers: usize,
     ) {
+        self.last_completed_at = Some(Instant::now());
         self.inference_count += 1;
         self.tokens_served = self
             .tokens_served
@@ -209,6 +215,11 @@ impl InferenceMetrics {
             let weight = token_weight(prefill_tokens, PREFILL_WEIGHT_TOKENS);
             push_sample(&mut self.stage_prefill_samples, equivalent_tok_s, weight);
         }
+    }
+
+    /// When the most recent request finished, if any has.
+    pub fn last_completed_at(&self) -> Option<Instant> {
+        self.last_completed_at
     }
 
     /// Returns (avg_decode_tok_s, avg_prefill_tok_s, avg_ttft_ms, inference_count).
@@ -424,6 +435,27 @@ mod tests {
         assert!((s.decode_tok_s - 9.0).abs() < 0.01);
         assert_eq!(s.prefill_tok_s, 0.0);
         assert_eq!(s.avg_ttft_ms, 0.0);
+    }
+
+    #[test]
+    fn zero_prefill_time_keeps_ttft_but_adds_no_prefill_rate() {
+        let mut m = InferenceMetrics::new();
+        assert_eq!(m.last_completed_at(), None);
+        let before = Instant::now();
+        // A prompt that started on an idle GPU: its 388 ms is the clock ramp.
+        m.record(
+            58,
+            48,
+            Duration::from_millis(570),
+            Duration::ZERO,
+            Some(Duration::from_millis(388)),
+        );
+        let s = m.snapshot();
+        assert_eq!(s.prefill_tok_s, 0.0);
+        assert_eq!(s.stage_prefill_tok_s, 0.0);
+        assert!((s.avg_ttft_ms - 388.0).abs() < 0.01);
+        assert!(s.decode_tok_s > 0.0);
+        assert!(m.last_completed_at().is_some_and(|at| at >= before));
     }
 
     #[test]

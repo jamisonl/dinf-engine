@@ -559,6 +559,20 @@ kernel void dinf_scalar_q6k_swiglu_r2_sg2(
     }
 }
 
+// BF16 rows read as 32-value blocks: each weight widened to f32 exactly,
+// then rounded to half (exact for magnitudes from 2^-14 up).
+typedef struct {
+    ushort v[32];
+} block_bf16_rows;
+
+void dequantize_bf16_rows(device const block_bf16_rows *xb, short il, thread half4x4 &reg) {
+    device const ushort4 *q = (device const ushort4 *)(xb->v + 16 * il);
+    FOR_UNROLL (short i = 0; i < 4; ++i) {
+        const uint4 bits = uint4(q[i]) << 16;
+        reg[i] = half4(as_type<float4>(bits));
+    }
+}
+
 template<
     typename block_q,
     short nl,
@@ -1448,6 +1462,8 @@ template [[host_name("dinf_tensor_qmatmul_q8_0_h8")]] kernel decltype(dinf_tenso
 template [[host_name("dinf_tensor_qmatmul_q8_0_h16")]] kernel decltype(dinf_tensor_qmatmul_half_input<block_q8_0, 2, 16, dequantize_q8_0>) dinf_tensor_qmatmul_half_input<block_q8_0, 2, 16, dequantize_q8_0>;
 template [[host_name("dinf_tensor_qmatmul_q8_0_h32")]] kernel decltype(dinf_tensor_qmatmul_half_input<block_q8_0, 2, 32, dequantize_q8_0>) dinf_tensor_qmatmul_half_input<block_q8_0, 2, 32, dequantize_q8_0>;
 template [[host_name("dinf_tensor_qmatmul_q8_0_h128")]] kernel q8_0_h128_fn dinf_tensor_qmatmul_half_input<block_q8_0, 2, 128, dequantize_q8_0>;
+
+template [[host_name("dinf_tensor_qmatmul_bf16_h128")]] kernel decltype(dinf_tensor_qmatmul_half_input<block_bf16_rows, 2, 128, dequantize_bf16_rows>) dinf_tensor_qmatmul_half_input<block_bf16_rows, 2, 128, dequantize_bf16_rows>;
 "#;
 
 type PipelineCache = HashMap<(DeviceId, &'static str), Option<ComputePipeline>>;
@@ -1709,6 +1725,26 @@ pub(crate) struct MetalTensorQMatMul {
 }
 
 impl MetalTensorQMatMul {
+    /// Raw Q4_0 Metal weight buffer `(weights_u8, out_dim, in_dim)` when this
+    /// projection is Q4_0, for single-token fused matvec paths.
+    pub(super) fn q4_0_weights(&self) -> Option<(&Tensor, usize, usize)> {
+        if self.dtype == GgmlDType::Q4_0 {
+            Some((&self.weights, self.out_dim, self.in_dim))
+        } else {
+            None
+        }
+    }
+
+    /// Raw Q8_0 Metal weight buffer `(weights_u8, out_dim, in_dim)` when this
+    /// projection is Q8_0, for single-token fused matvec + softcap paths.
+    pub(super) fn q8_0_weights(&self) -> Option<(&Tensor, usize, usize)> {
+        if self.dtype == GgmlDType::Q8_0 {
+            Some((&self.weights, self.out_dim, self.in_dim))
+        } else {
+            None
+        }
+    }
+
     /// Decode independent rows with the scalar F32 reduction in one GPU
     /// dispatch. Small generic GEMMs round through half and waste tile work.
     pub(super) fn forward_decode_rows(&self, input: &Tensor) -> Result<Tensor> {
@@ -3493,6 +3529,137 @@ fn dispatch_legacy_qmatmul(
         .map_err(candle_core::MetalError::from)?;
     }
     Ok(())
+}
+
+/// Prompt rows staged in half for [`bf16_prefill_matmul_half`].
+pub(super) struct HalfRows {
+    buffer: Arc<candle_metal_kernels::metal::Buffer>,
+    rows: usize,
+    width: usize,
+}
+
+/// `input` `[rows, in]` F32 or F16 on a Metal 4 device as half rows, or `None` for
+/// what the BF16 prompt kernels do not take.
+pub(super) fn bf16_prefill_half(input: &Tensor) -> Result<Option<HalfRows>> {
+    let device = input.device();
+    if !supports_metal_tensor(device)?
+        || (input.dtype() != DType::F32 && input.dtype() != DType::F16)
+        || input.rank() != 2
+    {
+        return Ok(None);
+    }
+    let (rows, width) = input.dims2()?;
+    if !width.is_multiple_of(32) || rows == 0 {
+        return Ok(None);
+    }
+    let metal = device.as_metal_device()?;
+    let input = input.contiguous()?;
+    let (storage, layout) = input.storage_and_layout();
+    let candle_core::Storage::Metal(storage) = &*storage else {
+        return Ok(None);
+    };
+    let buffer = if input.dtype() == DType::F16 && layout.start_offset() == 0 {
+        Arc::new(storage.buffer().clone())
+    } else if input.dtype() == DType::F32 {
+        cast_input_to_half(metal, storage, layout, rows * width)?
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(HalfRows {
+        buffer,
+        rows,
+        width,
+    }))
+}
+
+/// `input` `[rows, in]` F32 through BF16 `weight` `[out, in]` on the Metal 4
+/// matrix units, as F32 `[rows, out]`, with the activations in half. `None`
+/// without Metal 4 or for shapes it does not take.
+pub(super) fn bf16_prefill_matmul(input: &Tensor, weight: &Tensor) -> Result<Option<Tensor>> {
+    if weight.dtype() != DType::BF16 || !weight.is_contiguous() {
+        return Ok(None);
+    }
+    match bf16_prefill_half(input)? {
+        Some(half) => bf16_prefill_matmul_half(&half, weight),
+        None => Ok(None),
+    }
+}
+
+/// [`bf16_prefill_matmul`] of rows already staged in half. The matrix units
+/// read the BF16 weights from device memory as they are; without that
+/// kernel, the half-input tile kernel the Q8_0 prompts use stages each row
+/// in half (exact for magnitudes from 2^-14 up).
+pub(super) fn bf16_prefill_matmul_half(half: &HalfRows, weight: &Tensor) -> Result<Option<Tensor>> {
+    let device = weight.device();
+    if !supports_metal_tensor(device)? || weight.dtype() != DType::BF16 || !weight.is_contiguous() {
+        return Ok(None);
+    }
+    let (rows, in_dim) = (half.rows, half.width);
+    let (out_dim, width) = weight.dims2()?;
+    if width != in_dim {
+        return Ok(None);
+    }
+    let metal = device.as_metal_device()?;
+    if let Some(output) = super::inkling2_tensor_metal::try_half_rows_times_bf16_transposed(
+        &half.buffer,
+        rows,
+        weight,
+    )? {
+        return Ok(Some(output));
+    }
+    let Some(pipeline) = named_pipeline(metal, "dinf_tensor_qmatmul_bf16_h128")? else {
+        return Ok(None);
+    };
+    let (weight_storage, weight_layout) = weight.storage_and_layout();
+    let candle_core::Storage::Metal(weight_storage) = &*weight_storage else {
+        return Ok(None);
+    };
+    let half = &half.buffer;
+    let output = metal
+        .new_buffer_builder()
+        .with_size_for(rows * out_dim, DType::F32)
+        .with_label("dinf-bf16-prefill")
+        .build()?;
+    {
+        let encoder = metal.command_encoder()?;
+        encoder.set_label("dinf-bf16-prefill");
+        encoder.set_compute_pipeline_state(&pipeline);
+        let encoder_ref: &candle_metal_kernels::metal::ComputeCommandEncoder = encoder.as_ref();
+        encoder_ref.set_input_buffer(
+            0,
+            Some(weight_storage.buffer()),
+            weight_layout.start_offset() * DType::BF16.size_in_bytes(),
+        );
+        encoder_ref.set_input_buffer(1, Some(half), 0);
+        encoder_ref.set_output_buffer(2, Some(&output), 0);
+        encoder_ref.set_bytes(3, &(in_dim as u32));
+        encoder_ref.set_bytes(4, &(out_dim as u32));
+        encoder_ref.set_bytes(5, &(rows as u32));
+        encoder_ref.set_bytes(6, &((in_dim * 2) as u32));
+        encoder_ref.set_bytes(7, &0u32);
+        encoder_ref.set_threadgroup_memory_length(0, 64 * 32 * DType::F16.size_in_bytes());
+        encoder_ref.dispatch_thread_groups(
+            objc2_metal::MTLSize {
+                width: rows.div_ceil(LARGE_TILE_TOKENS),
+                height: out_dim.div_ceil(64),
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+    Ok(Some(Tensor::from((
+        candle_core::Storage::Metal(MetalStorage::new(
+            output,
+            metal.clone(),
+            rows * out_dim,
+            DType::F32,
+        )),
+        Shape::from((rows, out_dim)),
+    ))))
 }
 
 #[cfg(test)]

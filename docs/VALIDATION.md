@@ -38,6 +38,9 @@ CPU-versus-CUDA spread on the same history. Two of the four runs miss the
 agree on 58 of 64 for the long prompt). On Metal and CPU, Inkling 2 Mini is
 checked against the engine's plain tensor path and against each other
 (identical greedy tokens after a 3,427-token prompt), not against llama.cpp.
+The official checkpoint's NVFP4 and MXFP8 experts run in Metal kernels that
+match the host path, and its greedy output with them matches the host path
+token for token.
 
 The remaining supported models (Gemma 4, Llama 4, DeepSeek V4 and V4.1, GLM-5.3
 Flash and Nemotron-H) have request-state checks only.

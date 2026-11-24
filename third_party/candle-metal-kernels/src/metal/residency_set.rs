@@ -1,12 +1,14 @@
 use super::{Buffer, Device};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLAllocation, MTLDevice as _, MTLResidencySet, MTLResidencySetDescriptor};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Keeps Metal buffers resident in GPU memory, removing the need for `useResource` calls.
 ///
 /// Add the set to the command queue once via `MTLCommandQueue::addResidencySet`. Then
 /// register every buffer at allocation time and unregister at free time.
+#[derive(Clone)]
 pub struct ResidencySet {
     raw: Option<Arc<ResidencyState>>,
 }
@@ -16,6 +18,8 @@ pub(crate) struct ResidencyState {
     raw: Retained<ProtocolObject<dyn MTLResidencySet>>,
     // Metal residency set methods do not support concurrent calls.
     lock: Mutex<()>,
+    deferred: AtomicBool,
+    dirty: AtomicBool,
 }
 
 unsafe impl Send for ResidencyState {}
@@ -25,7 +29,17 @@ impl ResidencyState {
     pub(crate) fn remove(&self, allocation: &ProtocolObject<dyn MTLAllocation>) {
         let _guard = self.lock.lock().unwrap_or_else(|error| error.into_inner());
         self.raw.removeAllocation(allocation);
+        self.dirty.store(false, Ordering::Release);
         self.raw.commit();
+    }
+
+    pub(crate) fn commit_if_dirty(&self) {
+        if self.dirty.load(Ordering::Acquire) {
+            let _guard = self.lock.lock().unwrap_or_else(|error| error.into_inner());
+            if self.dirty.swap(false, Ordering::AcqRel) {
+                self.raw.commit();
+            }
+        }
     }
 }
 
@@ -45,8 +59,24 @@ impl ResidencySet {
                 Arc::new(ResidencyState {
                     raw,
                     lock: Mutex::new(()),
+                    deferred: AtomicBool::new(false),
+                    dirty: AtomicBool::new(false),
                 })
             }),
+        }
+    }
+
+    /// Batch residency commits until `commit_if_dirty()` is called before
+    /// command buffer submission (eliminates hundreds of per-buffer commits/token).
+    pub(crate) fn enable_deferred_commit(&self) {
+        if let Some(state) = &self.raw {
+            state.deferred.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn commit_if_dirty(&self) {
+        if let Some(state) = &self.raw {
+            state.commit_if_dirty();
         }
     }
 
@@ -79,13 +109,20 @@ impl ResidencySet {
 
     fn insert_buffers(&self, bufs: &[&Buffer]) {
         if let Some(set) = &self.raw {
+            let mut added = 0u64;
             let _guard = set.lock.lock().unwrap_or_else(|error| error.into_inner());
             for buf in bufs {
-                buf.register_residency(set);
-                set.raw.addAllocation(as_allocation(buf));
+                if buf.register_residency(set) {
+                    set.raw.addAllocation(as_allocation(buf));
+                    added += 1;
+                }
             }
-            if !bufs.is_empty() {
-                set.raw.commit();
+            if added > 0 {
+                if set.deferred.load(Ordering::Relaxed) {
+                    set.dirty.store(true, Ordering::Release);
+                } else {
+                    set.raw.commit();
+                }
             }
         }
     }
@@ -107,7 +144,11 @@ impl ResidencySet {
                 buf.unregister_residency(set);
             }
             if !bufs.is_empty() {
-                set.raw.commit();
+                if set.deferred.load(Ordering::Relaxed) {
+                    set.dirty.store(true, Ordering::Release);
+                } else {
+                    set.raw.commit();
+                }
             }
         }
     }

@@ -64,7 +64,7 @@ constant constexpr float IMASKED = -1.0e30f;
         threadgroup_barrier(mem_flags::mem_threadgroup);                        \
     }
 
-template <int D>
+template <int D, typename BiasT>
 kernel void inkling_flash_attention(
     device half *q [[buffer(0)]],
     device half *k [[buffer(1)]],
@@ -72,11 +72,13 @@ kernel void inkling_flash_attention(
     device float *o [[buffer(3)]],
     constant InklingFlashParams &p [[buffer(4)]],
     device float2 *row_stats [[buffer(5)]],
-    device const float *bias [[buffer(6)]],
+    device const BiasT *bias [[buffer(6)]],
     uint3 group [[threadgroup_position_in_grid]],
     ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup float s_data[IBQ * IBK];
     threadgroup half p_data[IBQ * IBK];
+    threadgroup float row_alpha[IBQ];
+    threadgroup uint any_rescale;
 
     const int rows = int(p.q_seq);
     const int q_start = int(group.x / p.splits) * IBQ;
@@ -116,7 +118,7 @@ kernel void inkling_flash_attention(
     const int query = q_start + row;
     const bool row_valid = query < rows;
     const int position = int(p.q_offset) + query;
-    device const float *row_bias =
+    device const BiasT *row_bias =
         bias + (ulong(min(query, rows - 1)) * p.heads + head) * p.bias_stride;
     const int extent = int(p.extent);
 
@@ -137,7 +139,7 @@ kernel void inkling_flash_attention(
     float row_max = IMASKED;
     float row_sum = 0.0f;
     if (split == 0 && row_valid) {
-        row_max = row_bias[extent + 1];
+        row_max = float(row_bias[extent + 1]);
         row_sum = 1.0f;
     }
     for (int kb = kb_begin; kb < kb_end; kb += IBK) {
@@ -151,7 +153,7 @@ kernel void inkling_flash_attention(
             valid[c] = row_valid && key < int(p.kv_seq) && key <= position
                 && (p.window == 0 || key + int(p.window) > position);
             values[c] = valid[c]
-                ? s_data[row * IBK + col] + row_bias[min(position - key, extent)]
+                ? s_data[row * IBK + col] + float(row_bias[min(position - key, extent)])
                 : IMASKED;
             block_max = max(block_max, values[c]);
         }
@@ -159,36 +161,42 @@ kernel void inkling_flash_attention(
             block_max = max(block_max, simd_shuffle_xor(block_max, offset));
         }
         const float new_max = max(row_max, block_max);
+        const float alpha = row_sum > 0.0f ? exp(row_max - new_max) : 0.0f;
+        if (tid == 0) {
+            any_rescale = 0u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (part == 0) {
+            row_alpha[row] = alpha;
+            if (alpha != 1.0f) {
+                any_rescale = 1u;
+            }
+        }
         float block_sum = 0.0f;
         for (int c = 0; c < ICOLS; ++c) {
-            block_sum += valid[c] ? exp(values[c] - new_max) : 0.0f;
+            const float probability = valid[c] ? exp(values[c] - new_max) : 0.0f;
+            block_sum += probability;
+            p_data[row * IBK + part * ICOLS + c] = half(probability);
         }
         for (ushort offset = 1; offset < IPARTS; offset <<= 1) {
             block_sum += simd_shuffle_xor(block_sum, offset);
         }
-        row_sum = row_sum * exp(row_max - new_max) + block_sum;
+        row_sum = row_sum * alpha + block_sum;
         row_max = new_max;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    const float inv_sum = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
-    for (int kb = kb_begin; kb < kb_end; kb += IBK) {
-        INKLING_SCORES(kb);
-        for (int c = 0; c < ICOLS; ++c) {
-            const int col = part * ICOLS + c;
-            const int key = kb + col;
-            const bool valid = row_valid && key < int(p.kv_seq) && key <= position
-                && (p.window == 0 || key + int(p.window) > position);
-            const float probability = valid
-                ? exp(s_data[row * IBK + col] + row_bias[min(position - key, extent)] - row_max)
-                : 0.0f;
-            p_data[row * IBK + col] = half(probability);
+        if (any_rescale != 0u) {
+            for (ushort i = 0; i < output.get_capacity(); ++i) {
+                if (output.is_valid_element(i)) {
+                    const auto at = output.get_multidimensional_index(i);
+                    output[i] *= row_alpha[int(at[1])];
+                }
+            }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         auto v_slice = v_t.slice(0, kb);
         pv.run(p_t, v_slice, output);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    const float inv_sum = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
 
     const int o_row_stride = int(p.splits) * D;
     auto o_t = tensor(oh, dextents<int32_t, 2>(D, rows), array<int, 2>({1, o_row_stride}));
@@ -209,7 +217,8 @@ kernel void inkling_flash_attention(
     }
 }
 
-template [[host_name("inkling_flash_attention_128")]] kernel decltype(inkling_flash_attention<128>) inkling_flash_attention<128>;
+template [[host_name("inkling_flash_attention_128")]] kernel decltype(inkling_flash_attention<128, float>) inkling_flash_attention<128, float>;
+template [[host_name("inkling_flash_attention_128_f16")]] kernel decltype(inkling_flash_attention<128, half>) inkling_flash_attention<128, half>;
 
 kernel void inkling_flash_attention_merge(
     device const float *partials [[buffer(0)]],
@@ -351,7 +360,7 @@ impl CustomOp3 for InklingFlash {
             || k_stride[3] != 1
             || v_stride[3] != 1
             || self.bias.dims() != [q_seq, heads, self.extent + 2]
-            || self.bias.dtype() != DType::F32
+            || (self.bias.dtype() != DType::F32 && self.bias.dtype() != DType::F16)
             || !self.bias.is_contiguous()
         {
             candle_core::bail!("Inkling 2 flash attention geometry differs")
@@ -421,7 +430,15 @@ impl CustomOp3 for InklingFlash {
         } else {
             (None, None)
         };
-        let attention = pipeline(device, "inkling_flash_attention_128")?;
+        let bias_f16 = self.bias.dtype() == DType::F16;
+        let attention = pipeline(
+            device,
+            if bias_f16 {
+                "inkling_flash_attention_128_f16"
+            } else {
+                "inkling_flash_attention_128"
+            },
+        )?;
         {
             let encoder = device.command_encoder()?;
             encoder.set_label("inkling2-flash-attention");
@@ -437,7 +454,7 @@ impl CustomOp3 for InklingFlash {
             e.set_input_buffer(
                 6,
                 Some(bias_storage.buffer()),
-                bias_layout.start_offset() * DType::F32.size_in_bytes(),
+                bias_layout.start_offset() * self.bias.dtype().size_in_bytes(),
             );
             e.dispatch_thread_groups(
                 objc2_metal::MTLSize {

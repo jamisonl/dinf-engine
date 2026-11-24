@@ -35,6 +35,13 @@ mod api;
 /// buffers stay bounded (Metal releases them only at a device wait).
 pub(crate) const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 512;
 
+/// Prompt length of the request [`PipelineStage::warmup`] serves on CUDA:
+/// past the 64-token point where prompt kernels such as Inkling 2's
+/// tensor-core attention take over, and as long as a contended scheduler
+/// chunk, while costing only tens of milliseconds on a large model.
+#[cfg(feature = "cuda")]
+const CUDA_WARMUP_PROMPT_TOKENS: usize = 128;
+
 pub mod architectures;
 /// Continuous-batching and speculative-decoding session helpers.
 pub mod continuous;
@@ -55,6 +62,7 @@ pub(crate) mod deepseek4_gguf;
 mod device_stages;
 /// Native image diffusion, independent of autoregressive generation sessions.
 pub mod diffusion;
+mod gguf_header_io;
 mod gguf_limits;
 /// GGUF metadata parsing, stage loading, and memory estimation.
 pub mod gguf_loader;
@@ -441,8 +449,8 @@ fn resolve_speculative_block_size(
 /// A pipeline stage wrapping a model architecture with its layer range.
 pub struct PipelineStage {
     arch: Box<dyn ModelArchitecture>,
-    speculative: Option<architectures::dflash2::DFlash2Draft>,
-    speculative_cache: Option<architectures::dflash2::DFlash2Cache>,
+    speculative: Option<architectures::speculative_draft::SpeculativeDraft>,
+    speculative_cache: Option<architectures::speculative_draft::SpeculativeCache>,
     speculative_draft_max_tokens: Option<usize>,
     position: StagePosition,
     cache: Vec<Option<LayerCache>>,
@@ -529,7 +537,7 @@ pub struct PipelineStage {
 /// sessions on one loaded model without allowing their cache state to mix.
 pub struct PipelineStageSessionState {
     cache: Vec<Option<LayerCache>>,
-    speculative_cache: Option<architectures::dflash2::DFlash2Cache>,
+    speculative_cache: Option<architectures::speculative_draft::SpeculativeCache>,
     next_position: usize,
     kv_cache_tokens: usize,
     kv_cache_lane_capacity_tokens: usize,
@@ -568,6 +576,7 @@ struct PipelineStageSessionCheckpoint {
 /// proposed prefix to commit.
 pub(crate) struct SpeculativeVerification {
     pub(crate) proposed: Vec<u32>,
+    pub(crate) draft_distributions: Option<Vec<Vec<(u32, f32)>>>,
     pub(crate) logits: candle_core::Tensor,
     pub(crate) draft_time: Duration,
     pub(crate) target_started: Instant,
@@ -860,7 +869,8 @@ impl PipelineStage {
         })
     }
 
-    /// Attach a DFlash 2 GGUF to a full Qwen target stage.
+    /// Attach a block drafter GGUF: DFlash 2 for Qwen targets, DSpark for
+    /// Inkling 2 Mini.
     ///
     /// The draft shares the target embedding and output head. Split-range and
     /// quantized-KV stages keep using the normal decode path for now.
@@ -881,16 +891,16 @@ impl PipelineStage {
                 && Arc::strong_count(&self.kv_token_budget) == 1,
             "attach the speculative draft before target inference starts or session states are created"
         );
-        let shared = self.arch.speculative_shared_weights().ok_or_else(|| {
-            anyhow::anyhow!("{} cannot host a DFlash 2 draft", self.arch.family())
-        })?;
-        let draft =
-            architectures::dflash2::DFlash2Draft::from_gguf(gguf_path, &self.device, shared)?;
+        let draft = architectures::speculative_draft::SpeculativeDraft::from_gguf(
+            gguf_path,
+            &self.device,
+            self.arch.as_ref(),
+        )?;
         anyhow::ensure!(
             draft
                 .target_layers()
                 .iter()
-                .all(|layer| *layer < self.arch.layer_count()),
+                .all(|layer| *layer < self.arch.speculative_feature_limit()),
             "DFlash target layer IDs exceed the loaded target"
         );
         let fixed_cache_bytes = self
@@ -945,9 +955,17 @@ impl PipelineStage {
     pub fn speculative_draft_max_tokens(&self) -> Option<usize> {
         self.speculative.as_ref().map(|draft| {
             self.speculative_draft_max_tokens
+                .or(draft.default_draft_tokens())
                 .unwrap_or(draft.block_size() - 1)
                 .min(draft.block_size() - 1)
         })
+    }
+
+    /// The attached drafter's acceptance floor for the adaptive fallback.
+    pub(crate) fn speculative_fallback_floor_tenths(&self) -> (usize, usize) {
+        self.speculative
+            .as_ref()
+            .map_or((15, 25), |draft| draft.fallback_floor_tenths())
     }
 
     /// Runtime options this stage applies to requests.
@@ -1071,11 +1089,29 @@ impl PipelineStage {
             return Ok(None);
         };
         let preferred = self.preferred_speculative_block_size()?.unwrap();
-        resolve_speculative_block_size(max, preferred, self.speculative_draft_max_tokens).map(Some)
+        let cap = self.speculative_draft_max_tokens.or(self
+            .speculative
+            .as_ref()
+            .and_then(|draft| draft.default_draft_tokens()));
+        resolve_speculative_block_size(max, preferred, cap).map(Some)
     }
 
     pub(crate) fn uses_pre_m5_speculative_policy(&self) -> Result<bool> {
         architectures::uses_pre_m5_speculative_policy(&self.device)
+    }
+
+    pub(crate) fn speculative_allows_short_block(&self) -> bool {
+        self.speculative
+            .as_ref()
+            .is_some_and(|draft| draft.allows_short_block())
+    }
+
+    pub(crate) fn speculative_supports_rejection_sampling(&self) -> bool {
+        self.device.is_metal()
+            && self
+                .speculative
+                .as_ref()
+                .is_some_and(|draft| draft.supports_rejection_sampling())
     }
 
     /// Run a forward pass through this stage.
@@ -2190,11 +2226,22 @@ impl PipelineStage {
     /// `commit_speculative_verification` or `abort_speculative_verification`.
     /// Return `None` before drafting when the block would exceed context or
     /// require cache eviction, so the caller can run the next scalar token.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn begin_speculative_verification(
         &mut self,
         state: &mut PipelineStageSessionState,
         anchor: u32,
         block_size: usize,
+    ) -> Result<Option<SpeculativeVerification>> {
+        self.begin_speculative_verification_with_sampling(state, anchor, block_size, None)
+    }
+
+    pub(crate) fn begin_speculative_verification_with_sampling(
+        &mut self,
+        state: &mut PipelineStageSessionState,
+        anchor: u32,
+        block_size: usize,
+        sampling: Option<&architectures::speculative_draft::DraftSampling>,
     ) -> Result<Option<SpeculativeVerification>> {
         if !self.preflight_speculative_session(state, block_size)? {
             return Ok(None);
@@ -2209,12 +2256,27 @@ impl PipelineStage {
             .as_ref()
             .context("session has no DFlash cache")?;
         let draft_started = Instant::now();
-        let proposed = draft.draft(draft_cache, anchor, start_pos, block_size)?;
+        let proposal = draft.draft_with_sampling(
+            draft_cache,
+            anchor,
+            start_pos,
+            block_size,
+            self.arch.as_ref(),
+            sampling,
+        )?;
         let draft_time = draft_started.elapsed();
+        let proposed = proposal.tokens;
+        let draft_distributions = proposal.distributions;
         anyhow::ensure!(
-            proposed.len() + 1 == block_size,
+            !proposed.is_empty() && proposed.len() < block_size,
             "DFlash draft block length changed"
         );
+        if let Some(dists) = &draft_distributions {
+            anyhow::ensure!(
+                dists.len() == proposed.len(),
+                "draft distribution count does not match proposed tokens"
+            );
+        }
         let layer_ids = draft.target_layers().to_vec();
         let mut inputs = Vec::with_capacity(proposed.len() + 1);
         inputs.push(anchor);
@@ -2257,6 +2319,7 @@ impl PipelineStage {
         }
         Ok(Some(SpeculativeVerification {
             proposed,
+            draft_distributions,
             logits,
             draft_time,
             target_started,
@@ -3014,6 +3077,65 @@ impl PipelineStage {
 
         // Clear KV cache so real inference starts fresh
         self.clear_cache();
+
+        // CUDA loads some kernels on first launch (cuBLAS among them), and
+        // prompt-sized chunks and on-device token selection take paths the
+        // passes above never reach. Without this the first request pays for
+        // them, and its time to first token understates the prompt
+        // throughput. The work only saves time, so a failure is logged and
+        // the stage still serves.
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            let tokens = CUDA_WARMUP_PROMPT_TOKENS
+                .min(self.context_length.saturating_sub(2))
+                .min(
+                    self.max_total_kv_tokens
+                        .map_or(usize::MAX, |max| max.saturating_sub(2)),
+                );
+            if tokens > 4 {
+                let warmed = if self.position == StagePosition::Solo {
+                    self.warm_cuda_request(tokens)
+                } else {
+                    make_input(tokens)
+                        .and_then(|input| self.forward(input, tokens, 0))
+                        .and_then(|_| Ok(self.device.synchronize()?))
+                };
+                self.clear_cache();
+                if let Err(error) = warmed {
+                    tracing::warn!(
+                        tokens,
+                        error = %format!("{error:#}"),
+                        "CUDA prompt warmup failed; the first request will load its kernels"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Serve one greedy request the way the continuous scheduler does: a
+    /// `tokens`-long prompt chunk through the session path, the first token
+    /// chosen on the device, and one decode step.
+    #[cfg(feature = "cuda")]
+    fn warm_cuda_request(&mut self, tokens: usize) -> Result<()> {
+        let vocab = self.vocab_size.max(1);
+        let prompt = (0..tokens)
+            .map(|index| ((index * 7919 + 17) % vocab) as u32)
+            .collect();
+        let params = sampling::SamplingParams {
+            temperature: 0.0,
+            max_tokens: 2,
+            ..Default::default()
+        };
+        let mut session = continuous::GenerationSession::new(self, prompt, params, Vec::new());
+        session.set_speculative_decoding_enabled(self, false);
+        let mut served = Ok(());
+        while served.is_ok() && !session.is_finished() {
+            served = session.step(self).map(drop);
+        }
+        session.discard_cache(self);
+        served?;
+        self.device.synchronize()?;
         Ok(())
     }
 
@@ -4099,6 +4221,15 @@ mod session_state_tests {
                 &[start_pos as f32, (start_pos + seq_len) as f32],
                 &Device::Cpu,
             )?))
+        }
+
+        fn embed_tokens(&self, tokens: &[u32]) -> Result<Tensor> {
+            Tensor::from_vec(
+                tokens.iter().map(|token| *token as f32).collect::<Vec<_>>(),
+                (tokens.len(), 1),
+                &Device::Cpu,
+            )
+            .map_err(Into::into)
         }
 
         fn family(&self) -> &str {
@@ -5912,7 +6043,8 @@ mod session_state_tests {
         stage.cache = vec![None, None];
         stage.kv_budget_bytes_per_token = 1024;
         if let Some(context) = draft_context {
-            let draft = crate::architectures::dflash2::DFlash2Draft::test_zero_draft(2, context)?;
+            let draft: crate::architectures::speculative_draft::SpeculativeDraft =
+                crate::architectures::dflash2::DFlash2Draft::test_zero_draft(2, context)?.into();
             stage.fixed_cache_bytes = draft.cache_budget_bytes()?;
             stage.speculative_cache = Some(draft.new_cache());
             stage.speculative = Some(draft);

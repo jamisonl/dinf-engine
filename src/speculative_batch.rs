@@ -40,6 +40,7 @@ impl PipelineStage {
                     anchor,
                     state.next_position,
                     block_size,
+                    self.arch.as_ref(),
                 )
                 .map_err(Terminal)?;
             draft_times.push(started.elapsed());
@@ -132,6 +133,7 @@ impl PipelineStage {
             .map(
                 |(((output, inputs), draft_time), checkpoint)| SpeculativeVerification {
                     proposed: inputs[1..].to_vec(),
+                    draft_distributions: None,
                     inputs,
                     logits: output.logits,
                     captures: output.captures,

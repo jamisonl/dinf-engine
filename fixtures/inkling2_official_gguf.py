@@ -19,7 +19,13 @@ layout dinf-engine reads, with every weight exact:
 - The official gate/up bank interleaves gate and up rows; both are
   de-interleaved to `[gate; up]`, as llama.cpp's converter does.
 
-Usage: inkling2_official_gguf.py OFFICIAL_DIR DENSE_DIR OUTPUT.gguf
+Usage: inkling2_official_gguf.py [--dense q8_0|q4_0] OFFICIAL_DIR DENSE_DIR OUTPUT.gguf
+
+`--dense q8_0` stores the BF16 dense tensors (projections, output head and
+token table) as Q8_0, quantized as ggml's `quantize_row_q8_0_ref` does;
+`--dense q4_0` stores the projections as Q4_0 (`quantize_row_q4_0_ref`)
+and the output head and token table as Q8_0, so the output head stays
+wider. The expert banks stay exact.
 
 OFFICIAL_DIR holds `model-00001-of-00001.safetensors` and
 `hf_quant_config.json`; DENSE_DIR is the output of inkling2_fetch_dense.py.
@@ -34,7 +40,7 @@ from pathlib import Path
 import numpy as np
 
 GGUF_MAGIC = b"GGUF"
-NVFP4, F8_E4M3, I8, F32 = 40, 43, 24, 0
+NVFP4, F8_E4M3, I8, F32, Q8_0, Q4_0, BF16 = 40, 43, 24, 0, 8, 2, 30
 
 
 def read_header(path: Path):
@@ -136,10 +142,56 @@ def nvfp4_blocks(packed: np.ndarray, scales: np.ndarray) -> np.ndarray:
     return blocks.reshape(rows, cols // 64 * 36)
 
 
+def q8_0_blocks(raw: np.ndarray, row: int) -> np.ndarray:
+    """BF16 bytes of `[rows, row]` as Q8_0 blocks, as `quantize_row_q8_0_ref`:
+    an F16 scale `amax / 127` and 32 int8 values `round(x / scale)`, rounding
+    half away from zero."""
+    values = bf16_rows(raw)
+    amax = np.abs(values).max(axis=1)
+    scale = amax / 127.0
+    inverse = np.divide(1.0, scale, out=np.zeros_like(scale), where=scale != 0)
+    scaled = values * inverse[:, None]
+    quants = (np.sign(scaled) * np.floor(np.abs(scaled) + 0.5)).astype(np.int8)
+    blocks = np.empty((values.shape[0], 34), dtype=np.uint8)
+    blocks[:, :2] = scale.astype(np.float16).view(np.uint8).reshape(-1, 2)
+    blocks[:, 2:] = quants.view(np.uint8)
+    assert row % 32 == 0
+    return blocks
+
+
+def bf16_rows(raw: np.ndarray) -> np.ndarray:
+    bits = np.frombuffer(raw.tobytes(), dtype=np.uint16).astype(np.uint32) << 16
+    return bits.view(np.float32).reshape(-1, 32)
+
+
+def q4_0_blocks(raw: np.ndarray, row: int) -> np.ndarray:
+    """BF16 bytes as Q4_0 blocks, as `quantize_row_q4_0_ref`: the signed
+    value of largest magnitude over -8 as the F16 scale, then 16 bytes with
+    weight j in the low nibble of byte j and weight j + 16 in the high one."""
+    assert row % 32 == 0
+    values = bf16_rows(raw)
+    index = np.abs(values).argmax(axis=1)
+    peak = values[np.arange(values.shape[0]), index]
+    scale = peak / -8.0
+    inverse = np.divide(1.0, scale, out=np.zeros_like(scale), where=scale != 0)
+    quants = np.minimum(15, (values * inverse[:, None] + 8.5).astype(np.int32)).astype(np.uint8)
+    blocks = np.empty((values.shape[0], 18), dtype=np.uint8)
+    blocks[:, :2] = scale.astype(np.float16).view(np.uint8).reshape(-1, 2)
+    blocks[:, 2:] = quants[:, :16] | (quants[:, 16:] << 4)
+    return blocks
+
+
 def main() -> None:
-    if len(sys.argv) != 4:
+    args = sys.argv[1:]
+    dense_type = None
+    if args[:1] == ["--dense"] and len(args) > 1:
+        dense_type = {"q8_0": Q8_0, "q4_0": Q4_0}.get(args[1])
+        if dense_type is None:
+            sys.exit(__doc__)
+        args = args[2:]
+    if len(args) != 3:
         sys.exit(__doc__)
-    official, dense_dir, target = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+    official, dense_dir, target = Path(args[0]), Path(args[1]), Path(args[2])
     if target.exists():
         sys.exit(f"{target} exists; choose a new output path")
     weights = Safetensors(official / "model-00001-of-00001.safetensors")
@@ -157,9 +209,16 @@ def main() -> None:
     for name, dims, kind in infos:
         if not name.endswith("_exps.weight"):
             entry = index[name]
-            outputs.append(
-                (name, dims, kind, lambda e=entry: dense[e["offset"] : e["offset"] + e["length"]])
-            )
+            raw = lambda e=entry: dense[e["offset"] : e["offset"] + e["length"]]
+            if dense_type is not None and kind == BF16 and len(dims) == 2 and dims[0] % 32 == 0:
+                table = name in ("output.weight", "token_embd.weight")
+                kind = Q8_0 if dense_type == Q8_0 or table else Q4_0
+                quantize = q8_0_blocks if kind == Q8_0 else q4_0_blocks
+                outputs.append(
+                    (name, dims, kind, lambda raw=raw, row=dims[0], q=quantize: q(raw(), row))
+                )
+            else:
+                outputs.append((name, dims, kind, raw))
             continue
         layer = int(name.split(".")[1])
         source = f"model.llm.layers.{layer}.mlp.experts." + (
@@ -218,7 +277,13 @@ def main() -> None:
         elements = 1
         for d in dims:
             elements *= d
-        return elements // 64 * 36 if kind == NVFP4 else elements * sizes[kind]
+        if kind == NVFP4:
+            return elements // 64 * 36
+        if kind == Q8_0:
+            return elements // 32 * 34
+        if kind == Q4_0:
+            return elements // 32 * 18
+        return elements * sizes[kind]
 
     with open(target, "wb") as out:
         out.write(GGUF_MAGIC + struct.pack("<IQQ", 3, len(outputs), kvs))

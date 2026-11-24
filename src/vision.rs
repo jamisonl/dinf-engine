@@ -13,6 +13,9 @@ use candle_nn::{LayerNorm, RmsNorm};
 
 use crate::gguf_limits::{validate_gguf_header_budget, validate_layer_count};
 
+mod inkling2;
+pub use inkling2::{Inkling2ImagePlan, Inkling2VisionEncoder};
+
 const LLAMA4_PROJECTOR_TYPE: &str = "llama4";
 const GEMMA4_PROJECTOR_TYPE: &str = "gemma4v";
 const GEMMA4_POOLING_KERNEL: usize = 3;

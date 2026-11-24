@@ -12,7 +12,9 @@ use candle_core::DType;
 #[cfg(target_os = "macos")]
 use candle_core::IndexOp;
 
-use super::architectures::{AttentionSpan, MropePositionIds, StageInput, StageOutput};
+use super::architectures::{
+    AttentionSpan, ImageEmbeddingSpan, MropePositionIds, StageInput, StageOutput,
+};
 use super::sampling::{SamplingHistory, SamplingParams, SamplingRng};
 use super::{PipelineStage, PipelineStageSessionState, StagePosition, TextRequestContext};
 
@@ -36,6 +38,10 @@ struct SpeculativeSpeedMonitor {
     recent: VecDeque<(usize, Duration)>,
     total_tokens: usize,
     total_time: Duration,
+    /// Committed tokens per pass, in tenths, below which the acceptance
+    /// policy falls back: over the recent window, and over the whole request
+    /// after 32 passes. Zero means the DFlash defaults (1.5 and 2.5).
+    floor_tenths: (usize, usize),
 }
 
 impl SpeculativeSpeedMonitor {
@@ -80,12 +86,16 @@ impl SpeculativeSpeedMonitor {
     }
 
     fn acceptance_should_fallback(&self, passes: usize) -> bool {
+        let (recent, overall) = match self.floor_tenths {
+            (0, 0) => (15, 25),
+            floor => floor,
+        };
         if passes < 32 {
             self.recent.len() >= SPECULATIVE_SPEED_WINDOW
-                && self.recent.iter().map(|(tokens, _)| tokens).sum::<usize>() * 2
-                    < SPECULATIVE_SPEED_WINDOW * 3
+                && self.recent.iter().map(|(tokens, _)| tokens).sum::<usize>() * 10
+                    < SPECULATIVE_SPEED_WINDOW * recent
         } else {
-            self.total_tokens.saturating_mul(2) < passes.saturating_mul(5)
+            self.total_tokens.saturating_mul(10) < passes.saturating_mul(overall)
         }
     }
 
@@ -174,6 +184,8 @@ pub struct GenerationSession {
     cache: PipelineStageSessionState,
     prompt_tokens: Vec<u32>,
     prompt_embeddings: Option<candle_core::Tensor>,
+    prompt_image_spans: Vec<ImageEmbeddingSpan>,
+    has_prompt_images: bool,
     prompt_bidirectional_spans: Vec<AttentionSpan>,
     prompt_positions: Option<MropePositionIds>,
     /// Signed Qwen position delta retained for every cached decode token.
@@ -316,6 +328,48 @@ impl GenerationSession {
         Ok(session)
     }
 
+    /// Start a fresh lane with sparse encoded image spans embedded lazily
+    /// during chunked prefill.
+    pub fn new_with_image_spans(
+        stage: &PipelineStage,
+        prompt_tokens: Vec<u32>,
+        image_spans: Vec<ImageEmbeddingSpan>,
+        params: SamplingParams,
+        stop_ids: Vec<u32>,
+    ) -> Result<Self> {
+        validate_image_spans(stage, prompt_tokens.len(), &image_spans)?;
+        let mut session = Self::new(stage, prompt_tokens, params, stop_ids);
+        session.prompt_image_spans = image_spans;
+        session.has_prompt_images = true;
+        Ok(session)
+    }
+
+    /// Start a fresh lane with sparse encoded image spans and a Qwen T/H/W
+    /// rotary schedule, prefilled in chunks.
+    pub fn new_with_positioned_image_spans(
+        stage: &PipelineStage,
+        prompt_tokens: Vec<u32>,
+        image_spans: Vec<ImageEmbeddingSpan>,
+        positions: MropePositionIds,
+        params: SamplingParams,
+        stop_ids: Vec<u32>,
+    ) -> Result<Self> {
+        validate_image_spans(stage, prompt_tokens.len(), &image_spans)?;
+        anyhow::ensure!(
+            positions.len() == prompt_tokens.len(),
+            "M-RoPE schedule has {} positions for {} prompt tokens",
+            positions.len(),
+            prompt_tokens.len()
+        );
+        let decode_delta = positions.decode_delta(prompt_tokens.len())?;
+        let mut session = Self::new(stage, prompt_tokens, params, stop_ids);
+        session.prompt_image_spans = image_spans;
+        session.has_prompt_images = true;
+        session.prompt_positions = Some(positions);
+        session.mrope_decode_delta = Some(decode_delta);
+        Ok(session)
+    }
+
     /// Create a generation lane with deterministic sampling.
     pub fn new_seeded(
         stage: &PipelineStage,
@@ -377,6 +431,8 @@ impl GenerationSession {
             sampling_history: SamplingHistory::new(&prompt_tokens, &params),
             prompt_tokens,
             prompt_embeddings: None,
+            prompt_image_spans: Vec::new(),
+            has_prompt_images: false,
             prompt_bidirectional_spans: Vec::new(),
             prompt_positions: None,
             mrope_decode_delta,
@@ -539,7 +595,7 @@ impl GenerationSession {
         Ok(Some(self.accept_token(token)))
     }
 
-    /// Whether a text prompt still needs its first sampled token.
+    /// Whether a prompt still needs its first sampled token via chunked prefill.
     pub fn is_text_prefilling(&self) -> bool {
         self.next_input_token.is_none() && !self.finished && self.prompt_embeddings.is_none()
     }
@@ -549,7 +605,10 @@ impl GenerationSession {
         stage: &mut PipelineStage,
         max_tokens: usize,
     ) -> Result<Option<GenerationStep>> {
-        let context = if !self.cache.has_embedded_prompt && self.mrope_decode_delta.is_none() {
+        let context = if !self.has_prompt_images
+            && !self.cache.has_embedded_prompt
+            && self.mrope_decode_delta.is_none()
+        {
             Some(TextRequestContext::new(self.prompt_tokens.len())?)
         } else {
             None
@@ -565,22 +624,42 @@ impl GenerationSession {
         }
         if self.effective_skip == 0
             && let Some(scope) = self.prompt_cache_scope.as_deref()
-            && let Some((mut cache, logits, reused)) =
-                stage.reuse_prompt(scope, &self.prompt_tokens, !self.speculative_disabled)?
         {
-            if let Some(context) = context {
-                anyhow::ensure!(
-                    stage.prepare_text_request_with_session(&mut cache, context)?,
-                    "prompt snapshot arithmetic changed after admission"
-                );
-            }
-            self.cache = cache;
-            self.effective_skip = reused;
-            self.reused_prompt_tokens = reused;
-            if reused == self.prompt_tokens.len() {
-                let logits = logits.context("exact prompt cache hit requires logits")?;
-                let token = self.sample_logits(&logits)?;
-                return Ok(Some(self.accept_token(token)));
+            if self.has_prompt_images {
+                let first_image_start = self
+                    .prompt_image_spans
+                    .first()
+                    .map_or(0, |span| span.start);
+                let pre_image_reusable = first_image_start > 0
+                    && self
+                        .prompt_positions
+                        .as_ref()
+                        .is_none_or(|positions| positions.is_identity_prefix(first_image_start));
+                if pre_image_reusable
+                    && let Some((cache, reused)) = stage
+                        .reuse_prompt_prefix(scope, &self.prompt_tokens[..first_image_start])?
+                {
+                    self.cache = cache;
+                    self.effective_skip = reused;
+                    self.reused_prompt_tokens = reused;
+                }
+            } else if let Some((mut cache, logits, reused)) =
+                stage.reuse_prompt(scope, &self.prompt_tokens, !self.speculative_disabled)?
+            {
+                if let Some(context) = context {
+                    anyhow::ensure!(
+                        stage.prepare_text_request_with_session(&mut cache, context)?,
+                        "prompt snapshot arithmetic changed after admission"
+                    );
+                }
+                self.cache = cache;
+                self.effective_skip = reused;
+                self.reused_prompt_tokens = reused;
+                if reused == self.prompt_tokens.len() {
+                    let logits = logits.context("exact prompt cache hit requires logits")?;
+                    let token = self.sample_logits(&logits)?;
+                    return Ok(Some(self.accept_token(token)));
+                }
             }
         }
 
@@ -596,17 +675,19 @@ impl GenerationSession {
             {
                 end = end.min(boundary);
             }
+            if !self.prompt_image_spans.is_empty() {
+                let Some(aligned_end) = self.align_chunk_end_for_image_spans(
+                    start,
+                    end,
+                    remaining < max_tokens,
+                )? else {
+                    break;
+                };
+                end = aligned_end;
+            }
             anyhow::ensure!(end > start, "prompt adds no tokens beyond cached prefix");
             let len = end - start;
-            let tokens = &self.prompt_tokens[start..end];
-            let input = if let Some(delta) = self.mrope_decode_delta {
-                StageInput::positioned_activations(
-                    stage.embed_tokens(tokens)?,
-                    MropePositionIds::text_with_delta(start, delta, len)?,
-                )
-            } else {
-                StageInput::Tokens(tokens.to_vec())
-            };
+            let input = self.build_prefill_chunk_input(stage, start, end)?;
             let complete = end == self.prompt_tokens.len();
             let shared = self.shared_prompt_prefix == Some(end);
             let needs_logits = complete || (shared && self.prompt_cache_scope.is_some());
@@ -627,7 +708,8 @@ impl GenerationSession {
                     stage.prefill_cache_only_with_session(&mut self.cache, input, len, start)?;
                 }
                 self.effective_skip = end;
-                remaining -= len;
+                self.prune_consumed_image_spans(end);
+                remaining = remaining.saturating_sub(len);
                 if remaining > 0 {
                     // Metal retains a pass's temporary buffers until a device
                     // wait; release them before queuing the next chunk.
@@ -646,6 +728,9 @@ impl GenerationSession {
                 anyhow::bail!("solo stage returned activations")
             };
             if (complete || shared)
+                && !self.has_prompt_images
+                && !self.cache.has_embedded_prompt
+                && self.mrope_decode_delta.is_none()
                 && let Some(scope) = self.prompt_cache_scope.as_deref()
                 && let Some(ticket) = stage.capture_prompt(
                     scope,
@@ -659,16 +744,20 @@ impl GenerationSession {
                 self.prompt_cache_tickets.push(ticket);
             }
             self.effective_skip = end;
-            remaining -= len;
+            self.prune_consumed_image_spans(end);
+            remaining = remaining.saturating_sub(len);
             if complete {
+                self.cache.mrope_decode_delta = self.mrope_decode_delta;
+                self.prompt_positions = None;
                 let token = self.sample_logits(&logits)?;
                 // Only a reserved scope that may retain a cancelled prefix
                 // needs an extra full-device completion barrier here. Other
                 // requests keep their existing sampling/error ordering.
-                if self
-                    .prompt_cache_scope
-                    .as_deref()
-                    .is_some_and(|scope| stage.reserved_prompt_scope_registered(scope))
+                if !self.has_prompt_images
+                    && self
+                        .prompt_cache_scope
+                        .as_deref()
+                        .is_some_and(|scope| stage.reserved_prompt_scope_registered(scope))
                 {
                     stage.device().synchronize()?;
                     self.completed_input_cursor = Some(end);
@@ -679,8 +768,145 @@ impl GenerationSession {
         // Bound completed work, not just command submission. This also exposes
         // GPU failures before a sibling lane's token leaves this scheduler tick.
         stage.device().synchronize()?;
-        self.completed_input_cursor = Some(self.effective_skip);
+        self.completed_input_cursor = (!self.has_prompt_images).then_some(self.effective_skip);
         Ok(None)
+    }
+
+    fn align_chunk_end_for_image_spans(
+        &self,
+        start: usize,
+        mut end: usize,
+        made_progress: bool,
+    ) -> Result<Option<usize>> {
+        for span in &self.prompt_image_spans {
+            if !span.bidirectional {
+                continue;
+            }
+            let span_end = span.end()?;
+            if span_end <= start {
+                continue;
+            }
+            if span.start >= end {
+                break;
+            }
+            if span_end > end {
+                if span.start > start {
+                    // Stop right before the bidirectional image span so the next
+                    // chunk starts cleanly at its first token.
+                    end = span.start;
+                } else if made_progress {
+                    // Yield after earlier chunks in this budget so the oversized
+                    // bidirectional span starts cleanly on the next tick.
+                    return Ok(None);
+                } else {
+                    // This chunk starts at the bidirectional image span and no
+                    // work has run yet in this tick; process the whole image in
+                    // one chunk so its local mask stays intact.
+                    end = span_end;
+                }
+                break;
+            }
+        }
+        Ok(Some(end))
+    }
+
+    fn build_prefill_chunk_input(
+        &self,
+        stage: &PipelineStage,
+        start: usize,
+        end: usize,
+    ) -> Result<StageInput> {
+        let len = end - start;
+        let tokens = &self.prompt_tokens[start..end];
+        let overlapping = self
+            .prompt_image_spans
+            .iter()
+            .filter_map(|span| match span.end() {
+                Ok(span_end) if span_end > start && span.start < end => Some(Ok((span, span_end))),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if overlapping.is_empty() {
+            if let Some(positions) = self.prompt_positions.as_ref() {
+                if positions.is_identity_prefix(end) {
+                    return Ok(StageInput::Tokens(tokens.to_vec()));
+                }
+                return Ok(StageInput::positioned_activations(
+                    stage.embed_tokens(tokens)?,
+                    positions.slice(start, len)?,
+                ));
+            }
+            if let Some(delta) = self.mrope_decode_delta {
+                return Ok(StageInput::positioned_activations(
+                    stage.embed_tokens(tokens)?,
+                    MropePositionIds::text_with_delta(start, delta, len)?,
+                ));
+            }
+            return Ok(StageInput::Tokens(tokens.to_vec()));
+        }
+
+        let mut pieces = Vec::with_capacity(overlapping.len() * 2 + 1);
+        let mut bidirectional_spans = Vec::new();
+        let mut cursor = start;
+        for (span, span_end) in overlapping {
+            if span.start > cursor {
+                pieces.push(stage.embed_tokens(&self.prompt_tokens[cursor..span.start])?);
+            }
+            let ov_start = span.start.max(start);
+            let ov_end = span_end.min(end);
+            let ov_len = ov_end - ov_start;
+            if span.bidirectional {
+                anyhow::ensure!(
+                    ov_start == span.start && ov_end == span_end,
+                    "bidirectional image span [{}, {}) was split across prefill chunk [{}, {})",
+                    span.start,
+                    span_end,
+                    start,
+                    end
+                );
+                bidirectional_spans.push(AttentionSpan {
+                    start: span.start,
+                    len: ov_len,
+                });
+            }
+            pieces.push(span.embeddings.narrow(0, ov_start - span.start, ov_len)?);
+            cursor = ov_end;
+        }
+        if cursor < end {
+            pieces.push(stage.embed_tokens(&self.prompt_tokens[cursor..end])?);
+        }
+        let embeddings = if pieces.len() == 1 {
+            pieces.pop().expect("single piece")
+        } else {
+            let refs = pieces.iter().collect::<Vec<_>>();
+            candle_core::Tensor::cat(&refs, 0)?
+        };
+        anyhow::ensure!(
+            embeddings.dim(0)? == len,
+            "prefill chunk embeddings had {} rows; expected {len}",
+            embeddings.dim(0)?
+        );
+        if let Some(positions) = self.prompt_positions.as_ref() {
+            Ok(StageInput::positioned_activations_with_spans(
+                embeddings,
+                bidirectional_spans,
+                positions.slice(start, len)?,
+            ))
+        } else {
+            Ok(StageInput::activations_with_spans(
+                embeddings,
+                bidirectional_spans,
+            ))
+        }
+    }
+
+    fn prune_consumed_image_spans(&mut self, consumed_end: usize) {
+        if !self.prompt_image_spans.is_empty() {
+            self.prompt_image_spans
+                .retain(|span| span.end().is_ok_and(|span_end| span_end > consumed_end));
+        }
     }
 
     fn speculative_eligible(&self, stage: &PipelineStage) -> bool {
@@ -690,6 +916,7 @@ impl GenerationSession {
             && stage.session_speculative_ready(&self.cache)
             && self.mrope_decode_delta.is_none()
             && self.prompt_embeddings.is_none()
+            && !self.has_prompt_images
             && !self.finished
     }
 
@@ -714,15 +941,45 @@ impl GenerationSession {
     ) -> Result<Option<GenerationStep>> {
         self.params.validate()?;
         let pass_started = Instant::now();
-        let block_size = stage
+        let remaining = self.params.max_tokens.saturating_sub(self.generated.len());
+        let mut block_size = stage
             .effective_speculative_block_size()?
             .context("DFlash block size is missing")?;
-        if block_size > self.params.max_tokens.saturating_sub(self.generated.len()) {
+        if stage.speculative_allows_short_block() {
+            if remaining < 2 {
+                return Ok(None);
+            }
+            block_size = block_size.min(remaining);
+        } else if remaining < block_size {
             return Ok(None);
         }
         let pre_m5 = stage.uses_pre_m5_speculative_policy()?;
-        let Some(verification) =
-            stage.begin_speculative_verification(&mut self.cache, anchor, block_size)?
+        let draft_sampling = if stage.speculative_supports_rejection_sampling()
+            && self.params.temperature > 0.0
+            && self.params.seed.is_none()
+            && !self.params.has_penalty_controls()
+            && self.params.tool_constraint.is_none()
+            && std::env::var("DINF_DSPARK_REJECTION_SAMPLING").as_deref() != Ok("0")
+        {
+            let mut step_u = [0.0f32; 8];
+            for u in &mut step_u {
+                *u = self.rng.next_f32();
+            }
+            Some(crate::architectures::speculative_draft::DraftSampling {
+                temperature: self.params.temperature as f32,
+                top_k: self.params.top_k,
+                top_p: self.params.top_p as f32,
+                step_u,
+            })
+        } else {
+            None
+        };
+        let Some(verification) = stage.begin_speculative_verification_with_sampling(
+            &mut self.cache,
+            anchor,
+            block_size,
+            draft_sampling.as_ref(),
+        )?
         else {
             return Ok(None);
         };
@@ -772,20 +1029,41 @@ impl GenerationSession {
             };
 
             for (index, proposed) in verification.proposed.iter().copied().enumerate() {
-                let token = if let Some(greedy) = greedy.as_ref() {
-                    greedy[index]
-                } else if let Some(rows) = &mut rows {
-                    history.sample_host(
-                        rows.next().context("missing verification row")?,
+                let (token, step_accepted) = if let Some(greedy) = greedy.as_ref() {
+                    let tok = greedy[index];
+                    (tok, tok == proposed)
+                } else if let Some(dists) = verification.draft_distributions.as_ref() {
+                    let row = if let Some(rows) = &mut rows {
+                        rows.next().context("missing verification row")?
+                    } else {
+                        verification
+                            .logits
+                            .get(index)?
+                            .to_dtype(DType::F32)?
+                            .to_vec1::<f32>()?
+                    };
+                    crate::sampling::verify_rejection_sample_host(
+                        &row,
+                        proposed,
+                        &dists[index],
                         &self.params,
                         &mut rng,
                     )?
+                } else if let Some(rows) = &mut rows {
+                    let tok = history.sample_host(
+                        rows.next().context("missing verification row")?,
+                        &self.params,
+                        &mut rng,
+                    )?;
+                    (tok, tok == proposed)
                 } else {
-                    history.sample(&verification.logits.get(index)?, &self.params, &mut rng)?
+                    let tok =
+                        history.sample(&verification.logits.get(index)?, &self.params, &mut rng)?;
+                    (tok, tok == proposed)
                 };
                 outputs.push(token);
                 history.push(token);
-                if token == proposed {
+                if step_accepted {
                     accepted += 1;
                 } else {
                     rejected = true;
@@ -868,6 +1146,7 @@ impl GenerationSession {
         self.speculative_speed.record_pass(outputs.len(), wall_time);
         let policy = stage.options().speculative;
         let elapsed_time_policy = policy.elapsed_time_fallback;
+        self.speculative_speed.floor_tenths = stage.speculative_fallback_floor_tenths();
         let (reached_hardware_limit, adaptive_fallback) = self.speculative_speed.fallback_decision(
             pre_m5,
             self.speculative_stats.passes,
@@ -1190,6 +1469,7 @@ impl GenerationSession {
     /// their tensor content is not represented by the token IDs alone.
     pub fn terminal_cache_tokens(&self, stage: &PipelineStage) -> Option<usize> {
         if self.prompt_embeddings.is_some()
+            || self.has_prompt_images
             || self.cache.has_embedded_prompt
             || self.mrope_decode_delta.is_some()
             || self.cache.resume_invalidated
@@ -1216,12 +1496,14 @@ impl GenerationSession {
 
     /// Enable text prompt reuse within a trusted caller's scope. Derive the
     /// scope from a trusted identity, never from unauthenticated request input.
-    /// Embedded prompts never reuse it.
+    /// Monolithic embedded prompts never reuse it; sparse-image prompts may
+    /// read a cached text prefix before the first image without publishing new
+    /// snapshots.
     pub fn enable_prompt_cache(&mut self, scope: String) {
         if self.generated.is_empty()
             && self.prompt_embeddings.is_none()
             && !self.cache.has_embedded_prompt
-            && self.mrope_decode_delta.is_none()
+            && (self.mrope_decode_delta.is_none() || self.has_prompt_images)
             && !scope.is_empty()
             && scope.len() <= 128
         {
@@ -1234,6 +1516,7 @@ impl GenerationSession {
     pub fn set_shared_prompt_prefix(&mut self, tokens: usize) {
         if self.generated.is_empty()
             && self.prompt_embeddings.is_none()
+            && !self.has_prompt_images
             && !self.cache.has_embedded_prompt
             && self.mrope_decode_delta.is_none()
             && tokens >= 64
@@ -1277,6 +1560,7 @@ impl GenerationSession {
             && self.prompt_cache_scope.as_deref() == Some(scope)
             && stage.reserved_prompt_scope_registered(scope)
             && self.prompt_embeddings.is_none()
+            && !self.has_prompt_images
             && self.prompt_positions.is_none()
             && self.prompt_bidirectional_spans.is_empty()
             && self.mrope_decode_delta.is_none()
@@ -1299,6 +1583,7 @@ impl GenerationSession {
             && cursor <= self.prompt_tokens.len()
             && !self.cache.resume_invalidated
             && self.prompt_embeddings.is_none()
+            && !self.has_prompt_images
             && self.prompt_positions.is_none()
             && self.prompt_bidirectional_spans.is_empty()
             && self.mrope_decode_delta.is_none()
@@ -1324,6 +1609,38 @@ impl GenerationSession {
         stage.prune_prompt_cache();
         stage.clear_session_state(&mut self.cache);
     }
+}
+
+fn validate_image_spans(
+    stage: &PipelineStage,
+    prompt_len: usize,
+    image_spans: &[ImageEmbeddingSpan],
+) -> Result<()> {
+    anyhow::ensure!(prompt_len > 0, "generation prompt must contain a token");
+    anyhow::ensure!(
+        !image_spans.is_empty(),
+        "image prompt must contain at least one image span"
+    );
+    let hidden_dim = stage.hidden_dim();
+    let mut prior_end = 0usize;
+    for span in image_spans {
+        let (rows, width) = span.embeddings.dims2()?;
+        anyhow::ensure!(rows > 0, "image embedding span cannot be empty");
+        anyhow::ensure!(
+            width == hidden_dim,
+            "image embedding width {width} does not match decoder width {hidden_dim}"
+        );
+        let end = span
+            .start
+            .checked_add(rows)
+            .context("image embedding span overflow")?;
+        anyhow::ensure!(
+            span.start >= prior_end && end <= prompt_len,
+            "image embedding spans must be sorted, non-overlapping, and within prompt bounds"
+        );
+        prior_end = end;
+    }
+    Ok(())
 }
 
 /// Fair FIFO admission plus round-robin tick scheduling.
@@ -1401,7 +1718,7 @@ mod tests {
     use super::{ContinuousScheduler, GenerationSession, SpeculativeSpeedMonitor};
     use candle_core::{Device, Tensor};
 
-    use crate::architectures::StageInput;
+    use crate::architectures::{ImageEmbeddingSpan, MropePositionIds, StageInput};
     use crate::sampling::{
         SamplingHistory, SamplingParams, SamplingRng, apply_sampling_penalties,
         sample_token_with_rng,
@@ -2878,6 +3195,184 @@ mod tests {
         drop((resumed, cold));
         stage.revoke_reserved_prompt_scope(scope);
         assert_eq!(stage.total_kv_cache_allocation_tokens(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_image_prompt_chunks_prefill_and_reuses_pre_image_text_cache() -> anyhow::Result<()> {
+        let mut stage = crate::session_state_tests::test_stage();
+        let scope = "user:multimodal-prefix";
+        let prefix = vec![0u32; 6];
+        let params = SamplingParams {
+            temperature: 0.0,
+            seed: Some(7),
+            max_tokens: 3,
+            ..Default::default()
+        };
+
+        let mut warm = GenerationSession::new(&stage, prefix.clone(), params.clone(), vec![]);
+        warm.enable_prompt_cache(scope.into());
+        while !warm.is_finished() {
+            warm.step(&mut stage)?;
+        }
+        warm.publish_prompt_cache(&mut stage);
+        warm.discard_cache(&mut stage);
+
+        let image_rows = candle_core::Tensor::from_vec(
+            vec![0.25f32; 2 * stage.hidden_dim()],
+            (2, stage.hidden_dim()),
+            stage.device(),
+        )?;
+        let mut tokens = prefix;
+        tokens.extend_from_slice(&[0, 0, 1, 1]);
+        let mut session = GenerationSession::new_with_image_spans(
+            &stage,
+            tokens.clone(),
+            vec![ImageEmbeddingSpan {
+                start: 6,
+                embeddings: image_rows.clone(),
+                bidirectional: false,
+            }],
+            params.clone(),
+            vec![],
+        )?;
+        session.enable_prompt_cache(scope.into());
+        assert!(session.is_text_prefilling());
+
+        // First budgeted step reuses the 6-token cached text prefix and processes
+        // only the 2-token image chunk without sampling yet.
+        assert!(session.step_with_prefill_budget(&mut stage, 2)?.is_none());
+        assert_eq!(session.reused_prompt_tokens(), 6);
+        assert_eq!(session.next_position(&stage), 8);
+        assert!(session.prompt_image_spans.is_empty());
+
+        // Second budgeted step processes the trailing 2 text tokens and samples.
+        let first = session
+            .step_with_prefill_budget(&mut stage, 2)?
+            .expect("final prefill chunk should sample");
+        let mut chunked_tokens = vec![first.token];
+        while !session.is_finished() {
+            chunked_tokens.push(session.step(&mut stage)?.token);
+        }
+        assert_eq!(session.terminal_cache_tokens(&stage), None);
+        session.publish_prompt_cache(&mut stage);
+        assert_eq!(stage.prompt_cache_match_tokens(scope, &tokens), (0, 6));
+        session.discard_cache(&mut stage);
+
+        // Compare against monolithic embeddings on a cold session.
+        let full_embeddings = candle_core::Tensor::cat(
+            &[
+                &stage.embed_tokens(&tokens[..6])?,
+                &image_rows,
+                &stage.embed_tokens(&tokens[8..])?,
+            ],
+            0,
+        )?;
+        let mut monolithic = GenerationSession::new_with_embeddings(
+            &stage,
+            tokens,
+            full_embeddings,
+            params,
+            vec![],
+        )?;
+        let mut monolithic_tokens = Vec::new();
+        while !monolithic.is_finished() {
+            monolithic_tokens.push(monolithic.step(&mut stage)?.token);
+        }
+        monolithic.discard_cache(&mut stage);
+        assert_eq!(chunked_tokens, monolithic_tokens);
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_bidirectional_image_span_never_splits_across_prefill_chunks() -> anyhow::Result<()> {
+        let mut stage = crate::session_state_tests::test_stage();
+        let params = SamplingParams {
+            temperature: 0.0,
+            seed: Some(11),
+            max_tokens: 2,
+            ..Default::default()
+        };
+        let image_rows = candle_core::Tensor::from_vec(
+            vec![0.5f32; 6 * stage.hidden_dim()],
+            (6, stage.hidden_dim()),
+            stage.device(),
+        )?;
+        let tokens = vec![0u32; 14];
+        let mut session = GenerationSession::new_with_image_spans(
+            &stage,
+            tokens,
+            vec![ImageEmbeddingSpan {
+                start: 5,
+                embeddings: image_rows,
+                bidirectional: true,
+            }],
+            params,
+            vec![],
+        )?;
+
+        // Budget 3: [0..3)
+        assert!(session.step_with_prefill_budget(&mut stage, 3)?.is_none());
+        assert_eq!(session.next_position(&stage), 3);
+
+        // Budget 3: snaps to [3..5) so the bidirectional span [5..11) is not split.
+        assert!(session.step_with_prefill_budget(&mut stage, 3)?.is_none());
+        assert_eq!(session.next_position(&stage), 5);
+
+        // Budget 3: starts at the bidirectional span, so processes all of [5..11) atomically.
+        assert!(session.step_with_prefill_budget(&mut stage, 3)?.is_none());
+        assert_eq!(session.next_position(&stage), 11);
+        assert!(session.prompt_image_spans.is_empty());
+
+        // Budget 3: [11..14) finishes prefill and samples.
+        assert!(session.step_with_prefill_budget(&mut stage, 3)?.is_some());
+        assert_eq!(session.next_position(&stage), 14);
+        session.discard_cache(&mut stage);
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_positioned_image_prompt_chunks_and_sets_mrope_decode_delta() -> anyhow::Result<()> {
+        let mut stage = crate::session_state_tests::test_stage();
+        let params = SamplingParams {
+            temperature: 0.0,
+            seed: Some(13),
+            max_tokens: 2,
+            ..Default::default()
+        };
+        let image_rows = candle_core::Tensor::from_vec(
+            vec![0.1f32; 4 * stage.hidden_dim()],
+            (4, stage.hidden_dim()),
+            stage.device(),
+        )?;
+        let tokens = vec![0u32; 10];
+        let positions = MropePositionIds::new(
+            vec![0, 1, 2, 3, 4, 4, 4, 4, 6, 7],
+            vec![0, 1, 2, 3, 4, 4, 5, 5, 6, 7],
+            vec![0, 1, 2, 3, 4, 5, 4, 5, 6, 7],
+        )?;
+        let mut session = GenerationSession::new_with_positioned_image_spans(
+            &stage,
+            tokens,
+            vec![ImageEmbeddingSpan {
+                start: 4,
+                embeddings: image_rows,
+                bidirectional: false,
+            }],
+            positions,
+            params,
+            vec![],
+        )?;
+
+        while session.is_text_prefilling() {
+            let _ = session.step_with_prefill_budget(&mut stage, 3)?;
+        }
+        assert_eq!(session.cache.mrope_decode_delta, Some(-2));
+        assert!(session.prompt_positions.is_none());
+        assert_eq!(session.generated().len(), 1);
+        session.step(&mut stage)?;
+        assert_eq!(session.generated().len(), 2);
+        session.discard_cache(&mut stage);
         Ok(())
     }
 }

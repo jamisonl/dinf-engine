@@ -2592,9 +2592,13 @@ const FLASH_MIN_TOKENS: usize = 64;
 /// Queries per tensor-core prompt block (`DINF_FA_BQ`).
 const FLASH_QUERY_TILE: usize = 64;
 
-/// Keys per attention split: one step of four keys for each of a block's
-/// eight warps. More splits keep the GPU busy for a few queries.
-const KEYS_PER_SPLIT: usize = 32;
+/// Keys per attention split: four steps of four keys for each of a block's
+/// eight warps. More splits keep the GPU busy for a few queries; fewer keep
+/// the combine pass short.
+const KEYS_PER_SPLIT: usize = 128;
+/// Up to this many keys one split per query finishes in the first pass,
+/// which costs less than a combine launch.
+const SINGLE_SPLIT_KEYS: usize = 256;
 /// Most splits per query and head.
 const MAX_SPLITS: usize = 1024;
 /// Blocks the first pass aims for.
@@ -2725,10 +2729,11 @@ pub(super) fn attention(
 
     // Enough splits to fill the GPU for a few queries, few for long chunks.
     let wanted = (TARGET_BLOCKS / (tokens * heads)).max(1);
-    let splits = keys
-        .div_ceil(KEYS_PER_SPLIT)
-        .min(wanted)
-        .clamp(1, MAX_SPLITS);
+    let splits = if keys <= SINGLE_SPLIT_KEYS {
+        1
+    } else {
+        keys.div_ceil(KEYS_PER_SPLIT).min(wanted).clamp(1, MAX_SPLITS)
+    };
     let chunk = keys.div_ceil(splits);
     let splits = keys.div_ceil(chunk);
     let mut partial = if splits > 1 {
@@ -4020,4 +4025,70 @@ pub(super) fn gemm_nt(a: &Tensor, w: &Tensor) -> Result<Tensor> {
     } else {
         partial.sum(0)
     }
+}
+
+/// `x` `[tokens, cols]` (F32) times BF16 rows `w` `[rows, cols]` transposed,
+/// as one cuBLAS product with BF16 inputs and F32 accumulation and output
+/// (no cast of the result). Returns `[tokens, rows]` F32.
+pub(crate) fn bf16_matmul(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+    use candle_core::cuda_backend::cudarc::cublas::{result::gemm_ex, sys};
+    let device = device_of(x)?;
+    let (tokens, cols) = x.dims2()?;
+    let (rows, w_cols) = w.dims2()?;
+    if w_cols != cols || w.dtype() != DType::BF16 || !w.is_contiguous() {
+        candle_core::bail!("Inkling 2 BF16 product geometry differs")
+    }
+    let xb = x.to_dtype(DType::BF16)?.contiguous()?;
+    let (m, n, k) = (
+        to_i32(rows, "product rows")?,
+        to_i32(tokens, "product tokens")?,
+        to_i32(cols, "product width")?,
+    );
+    let out = output(&device, tokens * rows)?;
+    let stream = device.cuda_stream();
+    let blas = device.cublas_handle();
+    let holds = hold(&[&xb, w]);
+    let mut pointers = Vec::with_capacity(2);
+    let mut guards = Vec::with_capacity(2);
+    for (storage, layout) in &holds {
+        let candle_core::Storage::Cuda(storage) = &**storage else {
+            return cuda_only();
+        };
+        same_device(&device, storage)?;
+        let (base, guard) = storage.as_cuda_slice::<half::bf16>()?.device_ptr(&stream);
+        pointers.push(base + (layout.start_offset() * 2) as u64);
+        guards.push(guard);
+    }
+    let (out_ptr, out_guard) = out.device_ptr(&stream);
+    let (alpha, beta) = (1.0f32, 0.0f32);
+    // Column-major: out^T [rows, tokens] = w (as [cols, rows])^T x^T.
+    // SAFETY: pointers are live device buffers of the checked shapes, on the
+    // stream the handle is bound to.
+    unsafe {
+        gemm_ex(
+            *blas.handle(),
+            sys::cublasOperation_t::CUBLAS_OP_T,
+            sys::cublasOperation_t::CUBLAS_OP_N,
+            m,
+            n,
+            k,
+            (&alpha as *const f32).cast(),
+            pointers[1] as *const std::ffi::c_void,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            k,
+            pointers[0] as *const std::ffi::c_void,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            k,
+            (&beta as *const f32).cast(),
+            out_ptr as *mut std::ffi::c_void,
+            sys::cudaDataType_t::CUDA_R_32F,
+            m,
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+    }
+    .map_err(|error| candle_core::Error::Msg(format!("Inkling 2 BF16 product: {error:?}")))?;
+    drop(out_guard);
+    drop(guards);
+    Ok(wrap(&device, out, (tokens, rows)))
 }

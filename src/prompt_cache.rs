@@ -42,13 +42,23 @@ pub(crate) struct PromptCache {
     pub(crate) entries: VecDeque<PromptEntry>,
     max_bytes: usize,
     automatic_bytes: bool,
+    // Caller-chosen byte ceiling for the automatic limit; `None` scales it
+    // from admitted KV memory alone.
+    byte_ceiling: Option<usize>,
     max_entries: usize,
     ttl: Duration,
+    // Idle lifetime of entries in reserved scopes. Their owner revokes them
+    // explicitly, so they outlive a pause between turns of one conversation.
+    reserved_ttl: Duration,
     // Registered reserved scopes. Only trusted caller code should register
     // these. Removing membership fences active/queued requests without
     // tombstones.
     reserved_scopes: Vec<String>,
 }
+
+/// Largest automatic snapshot byte limit, reached only on machines whose
+/// admitted KV memory is at least four times this.
+const AUTOMATIC_PROMPT_CACHE_CEILING_BYTES: usize = 16 * 1024 * 1024 * 1024;
 
 /// Prefix for prompt-cache scopes that must be registered with
 /// [`PipelineStage::register_reserved_prompt_scope`] before use.
@@ -60,9 +70,21 @@ impl Default for PromptCache {
             entries: VecDeque::new(),
             max_bytes: 512 * 1024 * 1024,
             automatic_bytes: true,
+            byte_ceiling: None,
             max_entries: 4,
             ttl: Duration::from_secs(300),
+            reserved_ttl: Duration::from_secs(3600),
             reserved_scopes: Vec::new(),
+        }
+    }
+}
+
+impl PromptCache {
+    fn ttl_for(&self, scope: &str) -> Duration {
+        if scope.starts_with(RESERVED_PROMPT_SCOPE_PREFIX) {
+            self.reserved_ttl
+        } else {
+            self.ttl
         }
     }
 }
@@ -125,7 +147,7 @@ impl PipelineStage {
                 .iter()
                 .filter(|entry| {
                     entry.pending.is_none()
-                        && entry.last_used.elapsed() < self.prompt_cache.ttl
+                        && entry.last_used.elapsed() < self.prompt_cache.ttl_for(scope)
                         && entry.scope == scope
                         && entry.draft == draft
                         && tokens.starts_with(&entry.tokens)
@@ -155,8 +177,10 @@ impl PipelineStage {
             entries: VecDeque::new(),
             max_bytes,
             automatic_bytes: false,
+            byte_ceiling: None,
             max_entries,
             ttl,
+            reserved_ttl: ttl,
             reserved_scopes: std::mem::take(&mut self.prompt_cache.reserved_scopes),
         };
     }
@@ -167,16 +191,40 @@ impl PipelineStage {
         self.prompt_cache.max_bytes
     }
 
+    /// Choose the snapshot byte ceiling for the automatic limit, or `None`
+    /// to scale it from admitted KV memory alone. A chosen ceiling may use up
+    /// to half of the admitted resident KV bytes; aggregate allocation
+    /// admission still bounds every retained snapshot. Explicit
+    /// [`Self::set_prompt_cache_limits`] values are left unchanged.
+    pub fn set_prompt_cache_byte_ceiling(&mut self, ceiling: Option<usize>) {
+        self.prompt_cache.byte_ceiling = ceiling;
+        if !self.prompt_cache.automatic_bytes {
+            return;
+        }
+        match (self.max_total_kv_tokens, ceiling) {
+            (Some(resident), _) => self.configure_prompt_cache_headroom(resident),
+            (None, Some(ceiling)) => self.prompt_cache.max_bytes = ceiling,
+            (None, None) => self.prompt_cache.max_bytes = PromptCache::default().max_bytes,
+        }
+        while self.prompt_cache_bytes() > self.prompt_cache.max_bytes {
+            self.prompt_cache.entries.pop_front();
+        }
+    }
+
     pub(crate) fn configure_prompt_cache_headroom(&mut self, resident_tokens: usize) {
         if !self.prompt_cache.automatic_bytes {
             return;
         }
-        // At most a quarter of admitted resident KV bytes (one eighth of total
-        // old/new allocation headroom), with an absolute 4 GiB ceiling. Never
-        // infer free RAM here: the caller's model-memory admission owns that.
+        // Scale with the machine: at most a quarter of admitted resident KV
+        // bytes (one eighth of total old/new allocation headroom), up to
+        // 16 GiB. A caller-chosen ceiling may use up to half. Never infer free
+        // RAM here: the caller's model-memory admission owns that.
         let resident_bytes = resident_tokens
             .saturating_mul(usize::try_from(self.kv_budget_bytes_per_token).unwrap_or(usize::MAX));
-        self.prompt_cache.max_bytes = (resident_bytes / 4).min(4 * 1024 * 1024 * 1024);
+        self.prompt_cache.max_bytes = match self.prompt_cache.byte_ceiling {
+            Some(ceiling) => ceiling.min(resident_bytes / 2),
+            None => (resident_bytes / 4).min(AUTOMATIC_PROMPT_CACHE_CEILING_BYTES),
+        };
         while self.prompt_cache_bytes() > self.prompt_cache.max_bytes {
             self.prompt_cache.entries.pop_front();
         }
@@ -185,9 +233,14 @@ impl PipelineStage {
     /// Expire published snapshots by idle TTL and pending snapshots when their
     /// request ticket dies. Reserved scope membership gates both lifetimes.
     pub fn prune_prompt_cache(&mut self) {
-        let ttl = self.prompt_cache.ttl;
+        let (ttl, reserved_ttl) = (self.prompt_cache.ttl, self.prompt_cache.reserved_ttl);
         let scopes = &self.prompt_cache.reserved_scopes;
         self.prompt_cache.entries.retain(|entry| {
+            let ttl = if entry.scope.starts_with(RESERVED_PROMPT_SCOPE_PREFIX) {
+                reserved_ttl
+            } else {
+                ttl
+            };
             (!entry.scope.starts_with(RESERVED_PROMPT_SCOPE_PREFIX)
                 || scopes.iter().any(|scope| scope == &entry.scope))
                 && match &entry.pending {
@@ -313,7 +366,37 @@ impl PipelineStage {
             })
             .max_by_key(|(_, entry)| entry.tokens.len())
             .map(|(index, _)| index);
-        let Some(index) = index else { return Ok(None) };
+        let Some(index) = index else {
+            // A miss costs a full prefill. Report how close the best published
+            // snapshot in this scope came, so a diverging prompt can be told
+            // apart from an evicted or expired one.
+            let published = self.prompt_cache.entries.iter().filter(|entry| {
+                entry.pending.is_none() && entry.scope == scope && entry.draft == draft
+            });
+            let (snapshots, shared_tokens, snapshot_tokens) =
+                published.fold((0usize, 0usize, 0usize), |(count, shared, len), entry| {
+                    let common = entry
+                        .tokens
+                        .iter()
+                        .zip(tokens)
+                        .take_while(|(cached, wanted)| cached == wanted)
+                        .count();
+                    if count == 0 || common > shared {
+                        (count + 1, common, entry.tokens.len())
+                    } else {
+                        (count + 1, shared, len)
+                    }
+                });
+            tracing::info!(
+                prompt_tokens = tokens.len(),
+                draft_decoding = draft,
+                snapshots,
+                shared_tokens,
+                snapshot_tokens,
+                "Continuous prompt cache miss"
+            );
+            return Ok(None);
+        };
         let entry = &self.prompt_cache.entries[index];
         let state = self.fork_prompt_state(&entry.state)?;
         let logits = entry.logits.clone();
@@ -331,6 +414,61 @@ impl PipelineStage {
             "Continuous prompt cache hit"
         );
         Ok(Some((state, logits, reused)))
+    }
+
+    /// Reuse the longest cached plain-text prefix strictly before the first
+    /// image of a multimodal prompt, regardless of whether the prior turn had
+    /// speculative drafting enabled. The forked state drops any draft cache
+    /// because multimodal sessions always run scalar target decode.
+    pub(crate) fn reuse_prompt_prefix(
+        &mut self,
+        scope: &str,
+        tokens: &[u32],
+    ) -> Result<Option<(PipelineStageSessionState, usize)>> {
+        self.prune_prompt_cache();
+        if !self.prompt_scope_allowed(scope) || tokens.is_empty() {
+            return Ok(None);
+        }
+        let Ok(context) = TextRequestContext::new(tokens.len()) else {
+            return Ok(None);
+        };
+        if self.desired_text_arithmetic(context).is_some() {
+            return Ok(None);
+        }
+        let index = self
+            .prompt_cache
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.pending.is_none()
+                    && entry.scope == scope
+                    && entry.state.text_arithmetic.is_none()
+                    && tokens.starts_with(&entry.tokens)
+                    && self.can_fork_prompt_state(&entry.state)
+            })
+            .max_by_key(|(_, entry)| (entry.tokens.len(), !entry.draft))
+            .map(|(index, _)| index);
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        let entry = &self.prompt_cache.entries[index];
+        let mut state = self.fork_prompt_state(&entry.state)?;
+        state.speculative_cache = None;
+        let reused = entry.tokens.len();
+        let mut entry = self
+            .prompt_cache
+            .entries
+            .remove(index)
+            .expect("entry exists");
+        entry.last_used = Instant::now();
+        self.prompt_cache.entries.push_back(entry);
+        tracing::info!(
+            reused_prompt_tokens = reused,
+            draft_decoding = false,
+            "Continuous prompt cache hit (multimodal text prefix)"
+        );
+        Ok(Some((state, reused)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -691,6 +829,62 @@ mod tests {
         let fork = stage.fork_prompt_state(&state)?;
         assert!(retired.upgrade().is_none());
         assert_eq!(fork.next_position, state.next_position);
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_byte_limit_scales_with_admitted_kv_and_honors_a_chosen_ceiling() -> Result<()> {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let mut stage = test_stage();
+        stage.kv_budget_bytes_per_token = 1024 * 1024;
+        // 8 GiB resident: a quarter of it.
+        stage.set_max_total_kv_tokens(2 * 8 * 1024)?;
+        assert_eq!(stage.prompt_cache_max_bytes(), 2 * GIB);
+        // 128 GiB resident: the automatic ceiling binds.
+        stage.set_max_total_kv_tokens(2 * 128 * 1024)?;
+        assert_eq!(stage.prompt_cache_max_bytes(), 16 * GIB);
+        // A chosen ceiling replaces it, up to half of resident memory.
+        stage.set_prompt_cache_byte_ceiling(Some(GIB));
+        assert_eq!(stage.prompt_cache_max_bytes(), GIB);
+        stage.set_prompt_cache_byte_ceiling(Some(1024 * GIB));
+        assert_eq!(stage.prompt_cache_max_bytes(), 64 * GIB);
+        stage.set_max_total_kv_tokens(2 * 8 * 1024)?;
+        assert_eq!(stage.prompt_cache_max_bytes(), 4 * GIB);
+        stage.set_prompt_cache_byte_ceiling(None);
+        assert_eq!(stage.prompt_cache_max_bytes(), 2 * GIB);
+        // Explicit limits are not automatic and stay as set.
+        stage.set_prompt_cache_limits(7, 4, Duration::from_secs(60));
+        stage.set_prompt_cache_byte_ceiling(Some(GIB));
+        assert_eq!(stage.prompt_cache_max_bytes(), 7);
+        Ok(())
+    }
+
+    #[test]
+    fn reserved_scope_snapshots_outlive_the_shared_idle_ttl() -> Result<()> {
+        let mut stage = test_stage();
+        let owned = "reserved:owned";
+        assert!(stage.register_reserved_prompt_scope(owned.into()));
+        for scope in [owned, "pool"] {
+            let mut cold = generation(&stage, scope, &[0, 1]);
+            finish(&mut stage, &mut cold)?;
+        }
+        let idle = |stage: &mut PipelineStage, by: Duration| {
+            for entry in &mut stage.prompt_cache.entries {
+                entry.last_used = Instant::now() - by;
+            }
+        };
+        // A pause longer than the shared TTL keeps the owned conversation warm.
+        let shared_ttl = stage.prompt_cache.ttl;
+        idle(&mut stage, shared_ttl + Duration::from_secs(1));
+        assert_eq!(stage.prompt_cache_match_tokens("pool", &[0, 1, 1]), (0, 0));
+        assert_eq!(stage.prompt_cache_match_tokens(owned, &[0, 1, 1]), (0, 2));
+        assert!(stage.reuse_prompt("pool", &[0, 1, 1], true)?.is_none());
+        assert!(stage.reuse_prompt(owned, &[0, 1, 1], true)?.is_some());
+        let reserved_ttl = stage.prompt_cache.reserved_ttl;
+        idle(&mut stage, reserved_ttl + Duration::from_secs(1));
+        assert_eq!(stage.prompt_cache_match_tokens(owned, &[0, 1, 1]), (0, 0));
+        assert!(stage.reuse_prompt(owned, &[0, 1, 1], true)?.is_none());
+        assert_eq!(stage.prompt_cache_bytes(), 0);
         Ok(())
     }
 

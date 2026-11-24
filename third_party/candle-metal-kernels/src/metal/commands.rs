@@ -15,8 +15,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 // https://docs.rs/objc2/latest/objc2/rc/struct.Retained.html
 pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
-const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 50;
-
 static TIMING_ENABLED: AtomicBool = AtomicBool::new(false);
 static TIMING_DRAINED_BUFFERS: AtomicU64 = AtomicU64::new(0);
 static TIMING_VALID_TIMESTAMP_BUFFERS: AtomicU64 = AtomicU64::new(0);
@@ -191,6 +189,7 @@ struct EntryState {
     current: CommandBuffer,
     in_flight: Vec<CommandBuffer>,
     current_encoder: Option<ComputeCommandEncoder>,
+    buffers_since_wait: usize,
 }
 
 impl EntryState {
@@ -199,6 +198,7 @@ impl EntryState {
             current: cb,
             in_flight: vec![],
             current_encoder: None,
+            buffers_since_wait: 0,
         }
     }
 }
@@ -207,10 +207,12 @@ pub struct Commands {
     state: Mutex<EntryState>,
     compute_count: AtomicUsize,
     command_queue: CommandQueue,
-    /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc)
-    /// per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
-    compute_per_buffer: usize,
+    /// Explicit override from `CANDLE_METAL_COMPUTE_PER_BUFFER`, if set.
+    /// Otherwise uses progressive ramp-up (8 -> 24 -> 64 -> 128 -> 256 -> 512) after each wait so
+    /// the GPU starts quickly while keeping steady-state command buffer count low.
+    compute_per_buffer_override: Option<usize>,
     device: Device,
+    residency_set: ResidencySet,
     /// Global cross-encoder output map. Maps buffer pointer to the fence of the last encoder
     /// that wrote it, enabling cross-command-buffer ordering for HazardTrackingModeUntracked.
     prev_ce_outputs: PrevCeOutputs,
@@ -224,15 +226,13 @@ impl Commands {
         command_queue: CommandQueue,
         residency_set: &ResidencySet,
     ) -> Result<Self, MetalKernelError> {
-        let compute_per_buffer = match std::env::var("CANDLE_METAL_COMPUTE_PER_BUFFER") {
-            Ok(val) => val
-                .parse()
-                .unwrap_or(DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER),
-            _ => DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER,
-        };
+        let compute_per_buffer_override = std::env::var("CANDLE_METAL_COMPUTE_PER_BUFFER")
+            .ok()
+            .and_then(|val| val.parse().ok());
 
         if let Some(raw) = residency_set.raw() {
             command_queue.addResidencySet(raw);
+            residency_set.enable_deferred_commit();
         }
 
         let device = Device::new(command_queue.device());
@@ -242,16 +242,32 @@ impl Commands {
             state: Mutex::new(EntryState::new(cb)),
             compute_count: AtomicUsize::new(0),
             command_queue,
-            compute_per_buffer,
+            compute_per_buffer_override,
             device,
+            residency_set: residency_set.clone(),
             prev_ce_outputs: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    #[inline]
+    fn buffer_limit(&self, buffers_since_wait: usize) -> usize {
+        if let Some(limit) = self.compute_per_buffer_override {
+            return limit;
+        }
+        match buffers_since_wait {
+            0 => 8,
+            1 => 24,
+            2 => 64,
+            3 => 128,
+            4 => 256,
+            _ => 512,
+        }
     }
 
     pub fn command_encoder(&self) -> Result<CommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.state.lock().unwrap();
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
-        let flush = count >= self.compute_per_buffer;
+        let flush = count >= self.buffer_limit(state_guard.buffers_since_wait);
 
         if flush {
             self.commit_swap_locked(&mut state_guard, 1)?;
@@ -283,7 +299,7 @@ impl Commands {
     pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.state.lock().unwrap();
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
-        let flush = count >= self.compute_per_buffer;
+        let flush = count >= self.buffer_limit(state_guard.buffers_since_wait);
 
         if flush {
             self.commit_swap_locked(&mut state_guard, 1)?;
@@ -336,6 +352,7 @@ impl Commands {
         let to_wait = {
             let mut state = self.state.lock()?;
             self.commit_swap_locked(&mut state, 0)?;
+            state.buffers_since_wait = 0;
             std::mem::take(&mut state.in_flight)
         };
 
@@ -392,6 +409,8 @@ impl Commands {
             self.end_encoding(enc);
         }
 
+        self.residency_set.commit_if_dirty();
+
         match state.current.status() {
             MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {
                 state.current.commit();
@@ -401,6 +420,7 @@ impl Commands {
         let new_cb = create_command_buffer(&self.command_queue)?;
         let old_cb = std::mem::replace(&mut state.current, new_cb);
         state.in_flight.push(old_cb);
+        state.buffers_since_wait = state.buffers_since_wait.saturating_add(1);
         self.compute_count.store(reset_to, Ordering::Release);
 
         Ok(())

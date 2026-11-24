@@ -25,6 +25,30 @@ pub(crate) const CONTENT_XML: &str = "<|content_xml|>";
 pub(crate) const CONTENT_INVOKE_TOOL_JSON: &str = "<|content_invoke_tool_json|>";
 pub(crate) const END_MESSAGE: &str = "<|end_message|>";
 pub(crate) const END_SAMPLING: &str = "<|content_model_end_sampling|>";
+/// An image part's content type; its body is [`IMAGE_TOKEN`], which the
+/// caller expands to the image's rows.
+pub(crate) const CONTENT_IMAGE: &str = "<|content_image|>";
+pub(crate) const IMAGE_TOKEN: &str = "<|unused_200054|>";
+
+/// A user or tool message's parts in order: `Some(text)`, or `None` for an
+/// image where the caller's marker stood. Empty text between images is
+/// dropped; a message without images is one text part.
+fn content_parts<'a>(content: &'a str, marker: Option<&str>) -> Vec<Option<&'a str>> {
+    let Some(marker) = marker.filter(|marker| !marker.is_empty() && content.contains(*marker))
+    else {
+        return vec![Some(content)];
+    };
+    let mut parts = Vec::new();
+    for (index, text) in content.split(marker).enumerate() {
+        if index > 0 {
+            parts.push(None);
+        }
+        if !text.is_empty() {
+            parts.push(Some(text));
+        }
+    }
+    parts
+}
 
 /// The thinking-effort system message for a template effort level.
 pub(super) fn effort_message(level: &str) -> String {
@@ -183,12 +207,33 @@ pub(super) fn format_chat(
             out.push_str(&effort_message(level));
             effort_emitted = true;
         }
+        let marker = options.image_marker.as_deref();
+        let parts = content_parts(&message.content, marker);
+        anyhow::ensure!(
+            matches!(role, "user" | "tool") || parts.iter().all(Option::is_some),
+            "Inkling 2 images are only supported in user and tool messages"
+        );
+        // Each part repeats the message header, as the template renders
+        // a content list.
+        let render = |out: &mut String, header: &str| {
+            for part in &parts {
+                match part {
+                    Some(text) => out.push_str(&format!(
+                        "{header}{CONTENT_TEXT}{}{END_MESSAGE}",
+                        escape_text(text)
+                    )),
+                    None => out.push_str(&format!(
+                        "{header}{CONTENT_IMAGE}{IMAGE_TOKEN}{END_MESSAGE}"
+                    )),
+                }
+            }
+        };
         let body = escape_text(&message.content);
         match role {
             "system" => out.push_str(&format!(
                 "{MESSAGE_SYSTEM}{CONTENT_TEXT}{body}{END_MESSAGE}"
             )),
-            "user" => out.push_str(&format!("{MESSAGE_USER}{CONTENT_TEXT}{body}{END_MESSAGE}")),
+            "user" => render(&mut out, MESSAGE_USER),
             "tool" => {
                 // The header names the tool: the message's own name, else the
                 // earlier call with this ID.
@@ -200,10 +245,8 @@ pub(super) fn format_chat(
                         .find(|call| call.id.as_deref() == Some(id))
                         .map(|call| call.name.clone())
                 });
-                out.push_str(&format!(
-                    "{MESSAGE_TOOL}{}{CONTENT_TEXT}{body}{END_MESSAGE}",
-                    name.unwrap_or_default()
-                ));
+                let header = format!("{MESSAGE_TOOL}{}", name.unwrap_or_default());
+                render(&mut out, &header);
             }
             _ => {
                 let header = format!("{MESSAGE_MODEL}{}", message.name.as_deref().unwrap_or(""));
@@ -313,6 +356,36 @@ mod tests {
             &ChatTemplateOptions::new([]).with_reasoning_effort(Some("none".into())),
         )?;
         assert!(system.ends_with("Thinking effort level: 0<|end_message|>"));
+        Ok(())
+    }
+
+    #[test]
+    fn image_markers_become_image_parts() -> Result<()> {
+        const MARK: &str = "\u{1}IMG\u{1}";
+        let messages = [
+            ChatTemplateMessage::new("user", format!("{MARK}What is this?{MARK}{MARK}")),
+            ChatTemplateMessage::new("tool", format!("<|x{MARK}")).with_name("camera"),
+        ];
+        let options = ChatTemplateOptions::new([]).with_image_marker(MARK);
+        assert_eq!(
+            format_chat(&messages, &options)?,
+            concat!(
+                "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>",
+                "<|message_user|><|content_image|><|unused_200054|><|end_message|>",
+                "<|message_user|><|content_text|>What is this?<|end_message|>",
+                "<|message_user|><|content_image|><|unused_200054|><|end_message|>",
+                "<|message_user|><|content_image|><|unused_200054|><|end_message|>",
+                "<|message_tool|>camera<|content_text|>< |x<|end_message|>",
+                "<|message_tool|>camera<|content_image|><|unused_200054|><|end_message|>",
+            )
+        );
+        // Without the option the marker is text; images elsewhere are refused.
+        let plain = format_chat(&messages[..1], &ChatTemplateOptions::new([]))?;
+        assert!(!plain.contains(CONTENT_IMAGE));
+        for role in ["system", "assistant"] {
+            let message = ChatTemplateMessage::new(role, format!("see {MARK}"));
+            assert!(format_chat(&[message], &options).is_err(), "{role}");
+        }
         Ok(())
     }
 

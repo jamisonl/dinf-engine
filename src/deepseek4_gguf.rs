@@ -41,7 +41,7 @@ enum Version {
 }
 
 impl Version {
-    fn read(file: &mut File) -> Result<Self> {
+    fn read<R: Read>(file: &mut R) -> Result<Self> {
         let magic = read_u32(file)?;
         anyhow::ensure!(
             magic == GGUF_MAGIC || magic == 0x4747_5546,
@@ -55,7 +55,7 @@ impl Version {
         }
     }
 
-    fn read_len(self, file: &mut File) -> Result<u64> {
+    fn read_len<R: Read>(self, file: &mut R) -> Result<u64> {
         match self {
             Self::V1 => Ok(read_u32(file)? as u64),
             Self::V2 | Self::V3 => read_u64(file),
@@ -401,12 +401,26 @@ impl RawTensor {
         self.dtype
     }
 
+    /// BF16 values already typed on their device (Inkling 2 on Metal keeps
+    /// its BF16 projections this way); [`Self::bytes`] is then BF16.
+    pub(crate) fn bf16(shape: Vec<usize>, values: Tensor) -> Result<Self> {
+        anyhow::ensure!(
+            values.dtype() == DType::BF16 && values.dims() == shape.as_slice(),
+            "typed BF16 GGUF storage must be BF16 of its tensor's shape"
+        );
+        Ok(Self {
+            shape,
+            dtype: DeepSeek4DType::BF16,
+            bytes: values,
+        })
+    }
+
     pub fn bytes(&self) -> &Tensor {
         &self.bytes
     }
 
     pub fn byte_len(&self) -> usize {
-        self.bytes.elem_count()
+        self.bytes.elem_count() * self.bytes.dtype().size_in_bytes()
     }
 
     /// View one row of a packed rank-3 expert tensor as a rank-2 matrix.
@@ -1064,7 +1078,23 @@ impl RawGgufContent {
         // callers that enter the DeepSeek/raw path directly rather than via
         // the standard GGUF loader preflight.
         let header_stats = validate_gguf_header_budget(file)?;
-        let file_size = file.metadata()?.len();
+        // Thousands of small reads per header; see `gguf_header_io`.
+        let mut reader = crate::gguf_header_io::HeaderReader::new(file)?;
+        let file_size = reader.file_bytes();
+        let content = Self::read_header(&mut reader, file_size, header_stats);
+        let finished = reader.finish();
+        match (content, finished) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error.into()),
+            (Ok(content), Ok(())) => Ok(content),
+        }
+    }
+
+    fn read_header<R: Read + Seek>(
+        file: &mut R,
+        file_size: u64,
+        header_stats: crate::gguf_limits::GgufHeaderStats,
+    ) -> Result<Self> {
         file.seek(SeekFrom::Start(0))?;
         let version = Version::read(file)?;
         let tensor_count = version.read_len(file)?;
@@ -1269,8 +1299,8 @@ pub fn is_deepseek4(path: &Path) -> Result<bool> {
     ))
 }
 
-fn read_value(
-    file: &mut File,
+fn read_value<R: Read + Seek>(
+    file: &mut R,
     version: Version,
     file_size: u64,
     value_type: u32,
@@ -1352,7 +1382,7 @@ fn min_value_disk_bytes(version: Version, value_type: u32) -> Option<u64> {
     })
 }
 
-fn read_string(file: &mut File, version: Version, file_size: u64) -> Result<String> {
+fn read_string<R: Read + Seek>(file: &mut R, version: Version, file_size: u64) -> Result<String> {
     let len = version.read_len(file)?;
     anyhow::ensure!(len <= MAX_STRING_LENGTH, "GGUF string is too long");
     let current = file.stream_position()?;
@@ -1382,25 +1412,25 @@ fn value_as_u64(value: &Value) -> Option<u64> {
     }
 }
 
-fn read_u8(file: &mut File) -> Result<u8> {
+fn read_u8<R: Read>(file: &mut R) -> Result<u8> {
     let mut bytes = [0u8; 1];
     file.read_exact(&mut bytes)?;
     Ok(bytes[0])
 }
 
-fn read_u16(file: &mut File) -> Result<u16> {
+fn read_u16<R: Read>(file: &mut R) -> Result<u16> {
     let mut bytes = [0u8; 2];
     file.read_exact(&mut bytes)?;
     Ok(u16::from_le_bytes(bytes))
 }
 
-fn read_u32(file: &mut File) -> Result<u32> {
+fn read_u32<R: Read>(file: &mut R) -> Result<u32> {
     let mut bytes = [0u8; 4];
     file.read_exact(&mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn read_u64(file: &mut File) -> Result<u64> {
+fn read_u64<R: Read>(file: &mut R) -> Result<u64> {
     let mut bytes = [0u8; 8];
     file.read_exact(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))

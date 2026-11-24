@@ -84,14 +84,14 @@ impl DFlash2Cache {
     }
 }
 
-enum DraftQMatMul {
+pub(super) enum DraftQMatMul {
     Candle(QMatMul),
     #[cfg(target_os = "macos")]
     MetalTensor(super::tensor_qmatmul_metal::MetalTensorQMatMul),
 }
 
 impl DraftQMatMul {
-    fn from_qtensor(qt: Arc<QTensor>, _device: &Device) -> Result<Self> {
+    pub(super) fn from_qtensor(qt: Arc<QTensor>, _device: &Device) -> Result<Self> {
         #[cfg(target_os = "macos")]
         if let Some(matmul) = super::tensor_qmatmul_metal::MetalTensorQMatMul::try_from_qtensor(
             Arc::clone(&qt),
@@ -102,7 +102,20 @@ impl DraftQMatMul {
         Ok(Self::Candle(QMatMul::from_arc(qt)?))
     }
 
-    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+    /// [`Self::forward`] for `[rows, in]` inputs of a few rows, read once in
+    /// decode's per-row reduction on Metal; other inputs as `forward`.
+    pub(super) fn forward_rows(&self, input: &Tensor) -> Result<Tensor> {
+        #[cfg(target_os = "macos")]
+        if let Self::MetalTensor(matmul) = self
+            && input.rank() == 2
+            && (2..=8).contains(&input.dim(0)?)
+        {
+            return matmul.forward_decode_rows(input).map_err(Into::into);
+        }
+        self.forward(input)
+    }
+
+    pub(super) fn forward(&self, input: &Tensor) -> Result<Tensor> {
         match self {
             Self::Candle(matmul) => {
                 if let Some(output) = super::qwen3moe::dflash_cpu_projection(matmul, input)? {
@@ -126,13 +139,13 @@ impl DraftQMatMul {
     }
 }
 
-struct RmsNorm {
-    weight: Tensor,
-    eps: f64,
+pub(super) struct RmsNorm {
+    pub(super) weight: Tensor,
+    pub(super) eps: f64,
 }
 
 impl RmsNorm {
-    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let dtype = input.dtype();
         let input = input.to_dtype(DType::F32)?;
         if dtype == DType::F32
@@ -156,13 +169,16 @@ impl RmsNorm {
     }
 }
 
-fn take_qtensor(tensors: &mut HashMap<String, Arc<QTensor>>, name: &str) -> Result<Arc<QTensor>> {
+pub(super) fn take_qtensor(
+    tensors: &mut HashMap<String, Arc<QTensor>>,
+    name: &str,
+) -> Result<Arc<QTensor>> {
     tensors
         .remove(name)
         .with_context(|| format!("missing DFlash tensor {name}"))
 }
 
-fn take_norm(
+pub(super) fn take_norm(
     tensors: &mut HashMap<String, Arc<QTensor>>,
     name: &str,
     device: &Device,
@@ -172,7 +188,7 @@ fn take_norm(
     Ok(RmsNorm { weight, eps })
 }
 
-fn take_linear(
+pub(super) fn take_linear(
     tensors: &mut HashMap<String, Arc<QTensor>>,
     name: &str,
     device: &Device,
@@ -1106,7 +1122,7 @@ fn append_rolling_kv(
     Ok(())
 }
 
-fn repeat_kv(input: Tensor, repeats: usize) -> Result<Tensor> {
+pub(super) fn repeat_kv(input: Tensor, repeats: usize) -> Result<Tensor> {
     if repeats == 1 {
         return Ok(input);
     }
@@ -1166,14 +1182,14 @@ fn apply_rope(input: &Tensor, start_pos: usize, cos: &Tensor, sin: &Tensor) -> R
     candle_nn::rotary_emb::rope(&input.contiguous()?, &cos, &sin).map_err(Into::into)
 }
 
-fn metadata_string(md: &HashMap<String, gguf_file::Value>, key: &str) -> Result<String> {
+pub(super) fn metadata_string(md: &HashMap<String, gguf_file::Value>, key: &str) -> Result<String> {
     match md.get(key) {
         Some(gguf_file::Value::String(value)) => Ok(value.clone()),
         _ => anyhow::bail!("missing or invalid DFlash metadata key {key}"),
     }
 }
 
-fn metadata_usize(md: &HashMap<String, gguf_file::Value>, key: &str) -> Result<usize> {
+pub(super) fn metadata_usize(md: &HashMap<String, gguf_file::Value>, key: &str) -> Result<usize> {
     match md.get(key) {
         Some(gguf_file::Value::U32(value)) => Ok(*value as usize),
         Some(gguf_file::Value::U64(value)) => usize::try_from(*value).context(key.to_string()),
@@ -1182,7 +1198,10 @@ fn metadata_usize(md: &HashMap<String, gguf_file::Value>, key: &str) -> Result<u
     }
 }
 
-fn metadata_usize_array(md: &HashMap<String, gguf_file::Value>, key: &str) -> Result<Vec<usize>> {
+pub(super) fn metadata_usize_array(
+    md: &HashMap<String, gguf_file::Value>,
+    key: &str,
+) -> Result<Vec<usize>> {
     let Some(gguf_file::Value::Array(values)) = md.get(key) else {
         anyhow::bail!("missing or invalid DFlash metadata key {key}");
     };
@@ -1197,7 +1216,7 @@ fn metadata_usize_array(md: &HashMap<String, gguf_file::Value>, key: &str) -> Re
         .collect()
 }
 
-fn metadata_f64(md: &HashMap<String, gguf_file::Value>, key: &str) -> Result<f64> {
+pub(super) fn metadata_f64(md: &HashMap<String, gguf_file::Value>, key: &str) -> Result<f64> {
     match md.get(key) {
         Some(gguf_file::Value::F32(value)) => Ok(*value as f64),
         Some(gguf_file::Value::F64(value)) => Ok(*value),

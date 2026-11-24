@@ -666,11 +666,10 @@ impl CustomOp2 for RmsNorm {
         }
 
         let device = input.device();
-        let output = device
-            .new_buffer_builder()
-            .with_size_for(elements, DType::F32)
-            .with_label("dinf-rmsnorm")
-            .build()?;
+        let output = super::inkling2_metal::alloc_scratch_buffer(
+            device,
+            elements * DType::F32.size_in_bytes(),
+        )?;
         let pipeline = pipeline(device, "dinf_rmsnorm_f32")?;
         let encoder = device.command_encoder()?;
         encoder.set_label("dinf-rmsnorm");

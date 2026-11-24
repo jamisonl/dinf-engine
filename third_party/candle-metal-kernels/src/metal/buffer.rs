@@ -67,7 +67,7 @@ impl Buffer {
         Buffer { raw, residency }
     }
 
-    pub(crate) fn register_residency(&self, set: &Arc<ResidencyState>) {
+    pub(crate) fn register_residency(&self, set: &Arc<ResidencyState>) -> bool {
         let mut sets = self
             .residency
             .sets
@@ -75,6 +75,9 @@ impl Buffer {
             .unwrap_or_else(|error| error.into_inner());
         if !sets.iter().any(|old| Arc::ptr_eq(old, set)) {
             sets.push(set.clone());
+            true
+        } else {
+            false
         }
     }
 

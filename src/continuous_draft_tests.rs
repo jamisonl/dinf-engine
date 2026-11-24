@@ -200,7 +200,8 @@ fn stage(draft: bool) -> Result<(PipelineStage, Arc<Mutex<Calls>>)> {
     let calls = Arc::new(Mutex::new(Calls::default()));
     stage.arch = Box::new(CausalTarget(Arc::clone(&calls)));
     if draft {
-        let draft = crate::architectures::dflash2::DFlash2Draft::test_zero_draft(8, 128)?;
+        let draft: crate::architectures::speculative_draft::SpeculativeDraft =
+            crate::architectures::dflash2::DFlash2Draft::test_zero_draft(8, 128)?.into();
         stage.fixed_cache_bytes = draft.cache_budget_bytes()?;
         stage.speculative_cache = Some(draft.new_cache());
         stage.speculative = Some(draft);

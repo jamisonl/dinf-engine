@@ -808,7 +808,7 @@ fn account_split_header_bytes(total: &mut u64, header_bytes: u64) -> Result<()> 
 /// Split GGUF files may keep model metadata only in the first shard.
 fn read_model_architecture(first_shard: &Path) -> Result<String> {
     let (mut file, _) = open_validated_gguf(first_shard)?;
-    match gguf_file::Content::read(&mut file) {
+    match crate::gguf_header_io::read_candle_gguf(&mut file) {
         Ok(content) => md_get_str(&content.metadata, "general.architecture"),
         Err(candle_error) => deepseek4_gguf::read_architecture(first_shard).with_context(|| {
             format!(
@@ -2008,7 +2008,7 @@ pub fn read_gguf_metadata(path: &Path) -> Result<GgufMetadata> {
         return parse_gguf_metadata(&content.metadata);
     }
     let (mut file, _) = open_validated_gguf(path)?;
-    match gguf_file::Content::read(&mut file) {
+    match crate::gguf_header_io::read_candle_gguf(&mut file) {
         Ok(content) => parse_gguf_metadata(&content.metadata),
         // Inkling 2 NVFP4 files: Candle rejects the tensor type, not the metadata.
         Err(candle_error) => {
@@ -2027,7 +2027,7 @@ pub fn read_gguf_metadata(path: &Path) -> Result<GgufMetadata> {
 /// quant type that Candle does not know yet.
 pub fn read_gguf_metadata_map(path: &Path) -> Result<HashMap<String, gguf_file::Value>> {
     let (mut file, _) = open_validated_gguf(path)?;
-    match gguf_file::Content::read(&mut file) {
+    match crate::gguf_header_io::read_candle_gguf(&mut file) {
         Ok(content) => Ok(content.metadata),
         Err(candle_error) => {
             // Re-read the validated descriptor, not a fresh open of the path.
@@ -2414,9 +2414,11 @@ pub fn load_stage_tensors(
         return load_stage_tensors_deepseek4(&shard_paths, range, device);
     }
 
+    // On Metal and CUDA, Inkling 2 always takes the byte-preserving reader so
+    // expert banks and BF16 weights can go to the GPU as raw bytes.
     if architecture == "inkling2_loop"
         && shard_paths.len() == 1
-        && has_tensor_types_candle_lacks(&shard_paths[0])?
+        && (device.is_metal() || device.is_cuda() || has_tensor_types_candle_lacks(&shard_paths[0])?)
     {
         return load_stage_tensors_mixed(&shard_paths[0], range, device);
     }
@@ -2434,7 +2436,7 @@ pub fn load_stage_tensors(
     let mut shard_metadata = ShardMetadata::new(shard_paths.len());
     for (shard_index, path) in shard_paths.iter().enumerate() {
         let (mut f, stats) = open_validated_gguf(path)?;
-        let content = gguf_file::Content::read(&mut f)
+        let content = crate::gguf_header_io::read_candle_gguf(&mut f)
             .with_context(|| format!("Failed to parse shard header: {}", path.display()))?;
         account_split_header_bytes(
             &mut aggregate_header_bytes,
@@ -2546,7 +2548,7 @@ impl StageTensorLoader {
         let mut shard_metadata = ShardMetadata::new(shard_paths.len());
         for (shard_index, path) in shard_paths.iter().enumerate() {
             let (mut file, stats) = open_validated_gguf(path)?;
-            let content = gguf_file::Content::read(&mut file)
+            let content = crate::gguf_header_io::read_candle_gguf(&mut file)
                 .with_context(|| format!("Failed to parse GGUF header: {}", path.display()))?;
             account_split_header_bytes(
                 &mut aggregate_header_bytes,
@@ -3095,6 +3097,243 @@ fn load_stage_tensors_deepseek4(
     })
 }
 
+/// One tensor's header fields as the memory estimate reads them.
+struct EstimateTensorInfo {
+    shape: candle_core::Shape,
+    ggml_dtype: GgmlDType,
+}
+
+/// A tensor whose GGUF type Candle cannot load (Inkling 2's NVFP4 and MXFP8
+/// expert banks). The estimate charges its exact bytes where
+/// [`load_stage_tensors_mixed`] keeps it.
+struct EstimateRawTensor {
+    name: String,
+    bytes: u64,
+    dtype: deepseek4_gguf::DeepSeek4DType,
+}
+
+/// A GGUF header for the memory estimate. Inkling 2 is read with the
+/// byte-preserving reader, as its loader reads it, so types Candle lacks do
+/// not fail the estimate before the model can be assigned.
+struct EstimateHeader {
+    metadata: HashMap<String, gguf_file::Value>,
+    tensor_infos: HashMap<String, EstimateTensorInfo>,
+    raw_only: Vec<EstimateRawTensor>,
+    tensor_data_offset: u64,
+}
+
+impl EstimateHeader {
+    fn read(file: &mut std::fs::File, architecture: &str, path: &Path) -> Result<Self> {
+        if architecture != "inkling2_loop" {
+            let content = crate::gguf_header_io::read_candle_gguf(file)
+                .with_context(|| format!("Failed to parse GGUF header: {}", path.display()))?;
+            return Ok(Self {
+                tensor_infos: content
+                    .tensor_infos
+                    .into_iter()
+                    .map(|(name, info)| {
+                        (
+                            name,
+                            EstimateTensorInfo {
+                                shape: info.shape,
+                                ggml_dtype: info.ggml_dtype,
+                            },
+                        )
+                    })
+                    .collect(),
+                metadata: content.metadata,
+                raw_only: Vec::new(),
+                tensor_data_offset: content.tensor_data_offset,
+            });
+        }
+        let content = RawGgufContent::read(file)
+            .with_context(|| format!("Failed to parse GGUF header: {}", path.display()))?;
+        let mut tensor_infos = HashMap::with_capacity(content.tensor_infos.len());
+        let mut raw_only = Vec::new();
+        for (name, info) in content.tensor_infos {
+            match info.dtype.candle_dtype() {
+                Some(ggml_dtype) => {
+                    tensor_infos.insert(
+                        name,
+                        EstimateTensorInfo {
+                            shape: candle_core::Shape::from(info.shape.clone()),
+                            ggml_dtype,
+                        },
+                    );
+                }
+                None => raw_only.push(EstimateRawTensor {
+                    bytes: usize_to_u64(info.byte_len()?),
+                    dtype: info.dtype,
+                    name,
+                }),
+            }
+        }
+        Ok(Self {
+            metadata: content.metadata,
+            tensor_infos,
+            raw_only,
+            tensor_data_offset: content.tensor_data_offset,
+        })
+    }
+}
+
+/// Inkling 2 on Metal and CUDA always loads through [`load_stage_tensors_mixed`],
+/// which keeps raw NVFP4/IQ4_NL banks and BF16 matrices/embeddings unwidened
+/// on the GPU (rows widen only when gathered), packs MXFP8 weights and scales
+/// into 36-byte blocks per 32 weights, and keeps quantized weights in place.
+/// The generic estimate assumed dense F32 embedding and output tables plus
+/// double-staged BF16 layer weights, over-counting the official 19.0 GB GGUF
+/// by ~7–9 GB and rejecting 24 GB CUDA GPUs.
+fn estimate_inkling2_accelerator_profile(
+    gguf_path: &Path,
+    model_id: &str,
+    total_layers: usize,
+    device: &Device,
+) -> Result<StageMemoryProfile> {
+    use deepseek4_gguf::DeepSeek4DType;
+    let (mut file, _) = open_validated_gguf(gguf_path)?;
+    let content = RawGgufContent::read(&mut file)
+        .with_context(|| format!("Failed to parse GGUF header: {}", gguf_path.display()))?;
+    let mut profile = StageMemoryProfile {
+        model_id: model_id.to_string(),
+        total_layers,
+        layer_gpu_bytes: vec![0; total_layers],
+        layer_gpu_transient_bytes: vec![0; total_layers],
+        layer_cpu_bytes: vec![0; total_layers],
+        layer_cpu_transient_bytes: vec![0; total_layers],
+        ..StageMemoryProfile::default()
+    };
+    let mut embedding_bytes = 0u64;
+    let mut embedding_cpu_transient = 0u64;
+    let mut has_output_weight = false;
+    for (name, info) in &content.tensor_infos {
+        let file_bytes = usize_to_u64(info.byte_len()?);
+        let (gpu_bytes, cpu_transient) = match info.dtype {
+            // MXFP8 values and `.mx_scale` I8 scales combine into one 36-byte
+            // block per 32 weights on the GPU. CUDA packs on the host before
+            // upload; Metal packs on the GPU.
+            DeepSeek4DType::F8E4M3 => {
+                let elems = info.element_count()?;
+                anyhow::ensure!(
+                    elems.is_multiple_of(32),
+                    "Inkling 2 MXFP8 tensor {name} element count {elems} is not a multiple of 32"
+                );
+                let packed = usize_to_u64(elems / 32 * 36);
+                let host_peak = if device.is_cuda() {
+                    file_bytes.saturating_add(packed)
+                } else {
+                    file_bytes
+                };
+                (packed, host_peak)
+            }
+            DeepSeek4DType::I8 => (0, file_bytes),
+            DeepSeek4DType::BF16 => {
+                if info.shape.len() >= 2 {
+                    // 2-D projections, output head, token table, and 3-D expert
+                    // banks (narrowed to F16) stay 2 bytes per weight on GPU.
+                    (file_bytes, file_bytes)
+                } else {
+                    (dequantized_f32_bytes(info.element_count()?), file_bytes)
+                }
+            }
+            DeepSeek4DType::F16 if info.shape.len() < 3 => {
+                (dequantized_f32_bytes(info.element_count()?), file_bytes)
+            }
+            _ if is_token_embedding(name) => {
+                let kept_packed = device.is_metal() && info.dtype == DeepSeek4DType::Q8_0;
+                let resident = if kept_packed {
+                    file_bytes
+                } else {
+                    dequantized_f32_bytes(info.element_count()?)
+                };
+                (resident, file_bytes)
+            }
+            _ => (file_bytes, file_bytes),
+        };
+        if let Some(rest) = name.strip_prefix("blk.") {
+            let layer = rest
+                .split_once('.')
+                .and_then(|(index, _)| index.parse::<usize>().ok())
+                .with_context(|| format!("Inkling 2 tensor {name} has no layer index"))?;
+            anyhow::ensure!(
+                layer < total_layers,
+                "Inkling 2 tensor {name} names layer {layer} beyond the model"
+            );
+            profile.layer_gpu_bytes[layer] =
+                profile.layer_gpu_bytes[layer].saturating_add(gpu_bytes);
+            profile.layer_cpu_transient_bytes[layer] =
+                profile.layer_cpu_transient_bytes[layer].max(cpu_transient);
+        } else if is_token_embedding(name) {
+            embedding_bytes = embedding_bytes.saturating_add(gpu_bytes);
+            embedding_cpu_transient = embedding_cpu_transient.max(cpu_transient);
+        } else if name == "output.weight" {
+            has_output_weight = true;
+            profile.output_gpu_bytes = profile.output_gpu_bytes.saturating_add(gpu_bytes);
+            profile.output_cpu_transient_bytes =
+                profile.output_cpu_transient_bytes.max(cpu_transient);
+        } else {
+            profile.common_gpu_bytes = profile.common_gpu_bytes.saturating_add(gpu_bytes);
+            profile.common_cpu_transient_bytes =
+                profile.common_cpu_transient_bytes.max(cpu_transient);
+        }
+    }
+    profile.embedding_gpu_bytes = embedding_bytes;
+    profile.head_embedding_gpu_bytes = Some(embedding_bytes);
+    profile.tail_embedding_gpu_bytes = Some(if has_output_weight {
+        0
+    } else {
+        embedding_bytes
+    });
+    profile.head_embedding_cpu_bytes = Some(0);
+    profile.tail_embedding_cpu_bytes = Some(0);
+    profile.head_embedding_cpu_transient_bytes = Some(embedding_cpu_transient);
+    profile.tail_embedding_cpu_transient_bytes = Some(0);
+    Ok(profile)
+}
+
+/// Charge raw-only layer tensors where [`load_stage_tensors_mixed`] places
+/// them: NVFP4 and IQ4_NL banks (and, on Metal, MXFP8 values and scales) on
+/// the accelerator, everything else in host memory. Each is read into a host
+/// buffer first, so that buffer is the layer's CPU construction peak.
+fn account_raw_only_tensors(
+    raw_only: &[EstimateRawTensor],
+    device: &Device,
+    profile: &mut StageMemoryProfile,
+) -> Result<()> {
+    use deepseek4_gguf::DeepSeek4DType;
+    for tensor in raw_only {
+        let layer = tensor
+            .name
+            .strip_prefix("blk.")
+            .and_then(|rest| rest.split_once('.'))
+            .and_then(|(index, _)| index.parse::<usize>().ok())
+            .with_context(|| {
+                format!(
+                    "raw GGUF tensor {} is outside the layer blocks the estimate charges",
+                    tensor.name
+                )
+            })?;
+        anyhow::ensure!(
+            layer < profile.layer_gpu_bytes.len(),
+            "raw GGUF tensor {} names layer {layer} beyond the model",
+            tensor.name
+        );
+        let in_place = matches!(tensor.dtype, DeepSeek4DType::NVFP4 | DeepSeek4DType::IQ4NL)
+            || (device.is_metal()
+                && matches!(tensor.dtype, DeepSeek4DType::F8E4M3 | DeepSeek4DType::I8));
+        if in_place && (device.is_metal() || device.is_cuda()) {
+            profile.layer_gpu_bytes[layer] =
+                profile.layer_gpu_bytes[layer].saturating_add(tensor.bytes);
+        } else {
+            profile.layer_cpu_bytes[layer] =
+                profile.layer_cpu_bytes[layer].saturating_add(tensor.bytes);
+        }
+        profile.layer_cpu_transient_bytes[layer] =
+            profile.layer_cpu_transient_bytes[layer].max(tensor.bytes);
+    }
+    Ok(())
+}
+
 /// Whether a GGUF file holds a tensor type that Candle 0.11 cannot load.
 fn has_tensor_types_candle_lacks(path: &Path) -> Result<bool> {
     let (mut file, _) = open_validated_gguf(path)?;
@@ -3143,7 +3382,7 @@ fn load_stage_tensors_mixed(
         .map(|(name, info)| (info.offset, name.clone()))
         .collect::<Vec<_>>();
     names.sort();
-    let raw_device = if device.is_cuda() {
+    let raw_device = if device.is_cuda() || device.is_metal() {
         device
     } else {
         &Device::Cpu
@@ -3160,6 +3399,33 @@ fn load_stage_tensors_mixed(
             .read_tensor_bytes(&mut file, &name)
             .with_context(|| format!("Failed to read tensor: {name}"))?;
         match info.dtype.candle_dtype() {
+            Some(dtype)
+                if metadata.architecture == "inkling2_loop"
+                    && crate::architectures::inkling2_loop::loads_as_device_bytes(
+                        &name, dtype, device,
+                    ) =>
+            {
+                let shape = info.shape.clone();
+                let raw = if dtype == GgmlDType::BF16 {
+                    RawTensor::bf16(
+                        shape.clone(),
+                        candle_core::Tensor::from_raw_buffer(
+                            &bytes,
+                            candle_core::DType::BF16,
+                            &shape,
+                            device,
+                        )?,
+                    )?
+                } else {
+                    let len = bytes.len();
+                    RawTensor::new(
+                        shape,
+                        info.dtype,
+                        candle_core::Tensor::from_vec(bytes, len, device)?,
+                    )?
+                };
+                raw_tensors.insert(name, Arc::new(raw));
+            }
             Some(dtype) => {
                 let load_device =
                     if tensor_loads_on_cpu(&metadata.architecture, &name, dtype, device.is_metal())
@@ -3174,10 +3440,16 @@ fn load_stage_tensors_mixed(
             }
             None => {
                 let (shape, dtype, len) = (info.shape.clone(), info.dtype, bytes.len());
+                // Metal also builds MXFP8 blocks from their values and scales
+                // on the GPU.
                 let in_place = matches!(
                     dtype,
                     deepseek4_gguf::DeepSeek4DType::NVFP4 | deepseek4_gguf::DeepSeek4DType::IQ4NL
-                );
+                ) || (device.is_metal()
+                    && matches!(
+                        dtype,
+                        deepseek4_gguf::DeepSeek4DType::F8E4M3 | deepseek4_gguf::DeepSeek4DType::I8
+                    ));
                 let raw = RawTensor::new(
                     shape,
                     dtype,
@@ -3231,8 +3503,8 @@ fn load_stage_tensors_single(
 ) -> Result<StageTensors> {
     let (mut file, _) = open_validated_gguf(gguf_path)?;
 
-    let content =
-        gguf_file::Content::read(&mut file).with_context(|| "Failed to parse GGUF file header")?;
+    let content = crate::gguf_header_io::read_candle_gguf(&mut file)
+        .with_context(|| "Failed to parse GGUF file header")?;
 
     let mut shard_metadata = ShardMetadata::new(1);
     shard_metadata.record(0, &content.metadata, content.tensor_infos.len())?;
@@ -3510,6 +3782,12 @@ pub fn estimate_stage_memory_profile(
             device,
         );
     }
+    if architecture == "inkling2_loop"
+        && (device.is_metal() || device.is_cuda())
+        && shard_paths.len() == 1
+    {
+        return estimate_inkling2_accelerator_profile(&shard_paths[0], model_id, total_layers, device);
+    }
     let mut profile = StageMemoryProfile {
         model_id: model_id.to_string(),
         total_layers,
@@ -3545,14 +3823,25 @@ pub fn estimate_stage_memory_profile(
 
     for (shard_index, path) in shard_paths.iter().enumerate() {
         let (mut file, stats) = open_validated_gguf(path)?;
-        let content = gguf_file::Content::read(&mut file)
-            .with_context(|| format!("Failed to parse GGUF header: {}", path.display()))?;
+        let content = EstimateHeader::read(&mut file, &architecture, path)?;
         account_split_header_bytes(
             &mut aggregate_header_bytes,
             stats.parsed_bytes(content.tensor_data_offset),
         )?;
-        register_shard_tensors(&mut tensor_owners, shard_index, content.tensor_infos.keys())?;
-        shard_metadata.record(shard_index, &content.metadata, content.tensor_infos.len())?;
+        register_shard_tensors(
+            &mut tensor_owners,
+            shard_index,
+            content
+                .tensor_infos
+                .keys()
+                .chain(content.raw_only.iter().map(|tensor| &tensor.name)),
+        )?;
+        shard_metadata.record(
+            shard_index,
+            &content.metadata,
+            content.tensor_infos.len() + content.raw_only.len(),
+        )?;
+        account_raw_only_tensors(&content.raw_only, device, &mut profile)?;
 
         if let Some(info) = content.tensor_infos.get("token_embd.weight") {
             validate_embedding_vocabulary(&metadata, info.shape.dims())?;
@@ -7361,6 +7650,82 @@ mod tests {
         ]);
         md.shrink_to_fit();
         md
+    }
+
+    #[test]
+    fn raw_only_inkling_banks_are_charged_where_the_mixed_loader_keeps_them() {
+        use deepseek4_gguf::DeepSeek4DType;
+        let raw = |name: &str, bytes: u64, dtype| EstimateRawTensor {
+            name: name.into(),
+            bytes,
+            dtype,
+        };
+        let banks = [
+            raw("blk.0.ffn_gate_up_exps.weight", 1000, DeepSeek4DType::NVFP4),
+            raw("blk.1.ffn_down_exps.weight", 300, DeepSeek4DType::F8E4M3),
+            raw("blk.1.ffn_down_exps.scale", 20, DeepSeek4DType::I8),
+        ];
+        let mut cpu = StageMemoryProfile {
+            layer_gpu_bytes: vec![0; 2],
+            layer_cpu_bytes: vec![0; 2],
+            layer_cpu_transient_bytes: vec![0; 2],
+            ..StageMemoryProfile::default()
+        };
+        account_raw_only_tensors(&banks, &Device::Cpu, &mut cpu).unwrap();
+        // Without an accelerator every bank stays in host memory.
+        assert_eq!(cpu.layer_gpu_bytes, vec![0, 0]);
+        assert_eq!(cpu.layer_cpu_bytes, vec![1000, 320]);
+        assert_eq!(cpu.layer_cpu_transient_bytes, vec![1000, 300]);
+
+        let outside = [raw("token_embd.weight", 8, DeepSeek4DType::NVFP4)];
+        assert!(account_raw_only_tensors(&outside, &Device::Cpu, &mut cpu).is_err());
+        let beyond = [raw("blk.2.ffn_down_exps.weight", 8, DeepSeek4DType::NVFP4)];
+        assert!(account_raw_only_tensors(&beyond, &Device::Cpu, &mut cpu).is_err());
+    }
+
+    /// The official Inkling 2 Mini NVFP4 GGUF must pass the memory
+    /// estimate: Candle cannot parse its header, so the estimate has to use
+    /// the byte-preserving reader. Point DINF_INKLING2_GGUF at the file.
+    #[test]
+    #[ignore = "needs the official Inkling 2 Mini NVFP4 GGUF (DINF_INKLING2_GGUF)"]
+    fn estimates_the_official_inkling2_nvfp4_gguf() {
+        let path = std::path::PathBuf::from(
+            std::env::var("DINF_INKLING2_GGUF").expect("DINF_INKLING2_GGUF"),
+        );
+        let file_bytes = std::fs::metadata(&path).unwrap().len();
+        #[cfg(target_os = "macos")]
+        let device = Device::new_metal(0).unwrap_or(Device::Cpu);
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
+        #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
+        let device = Device::Cpu;
+        let profile =
+            estimate_stage_memory_profile(&path, "inkling-2-mini-nvfp4", 24, &device).unwrap();
+        let layers: u64 = profile
+            .layer_gpu_bytes
+            .iter()
+            .chain(&profile.layer_cpu_bytes)
+            .sum();
+        // Every layer weight is charged once, and the expert banks dominate.
+        assert!(layers > file_bytes / 2, "layers {layers} of {file_bytes}");
+        assert!(layers <= file_bytes * 2, "layers {layers} of {file_bytes}");
+        if device.is_metal() || device.is_cuda() {
+            // The Metal and CUDA loaders keep every tensor's GGUF bytes on the
+            // GPU (with 36-byte in-memory MXFP8 blocks), so the stage estimate
+            // must not exceed the file by more than its small staging slack.
+            let (accelerator, _, _) = profile.stage_memory_components(0, 24, 24).unwrap();
+            assert!(
+                accelerator <= file_bytes + file_bytes / 20,
+                "Accelerator stage estimate {accelerator} exceeds file {file_bytes} by more than 5%"
+            );
+        }
+        eprintln!(
+            "inkling2 estimate on {:?}: layer gpu {} B, layer cpu {} B, embedding gpu {} B",
+            device.location(),
+            profile.layer_gpu_bytes.iter().sum::<u64>(),
+            profile.layer_cpu_bytes.iter().sum::<u64>(),
+            profile.embedding_gpu_bytes,
+        );
     }
 
     #[test]

@@ -31,6 +31,9 @@ mod dflash2_conv_metal;
 mod dflash2_selector_metal;
 #[cfg(target_os = "macos")]
 mod dflash2_topk_metal;
+pub(crate) mod dspark;
+#[cfg(target_os = "macos")]
+mod dspark_metal;
 #[cfg(target_os = "macos")]
 mod flash_attention_metal;
 #[cfg(target_os = "macos")]
@@ -69,12 +72,14 @@ mod indexed_moe_epilogue_cuda;
 #[cfg(target_os = "macos")]
 mod indexed_moe_metal;
 #[cfg(feature = "cuda")]
-mod inkling2_cuda;
+pub(crate) mod inkling2_cuda;
 #[cfg(target_os = "macos")]
 mod inkling2_flash_metal;
 pub mod inkling2_loop;
 #[cfg(target_os = "macos")]
-mod inkling2_metal;
+pub(crate) mod inkling2_metal;
+#[cfg(target_os = "macos")]
+mod inkling2_tensor_metal;
 #[cfg(feature = "cuda")]
 mod kv_append_cuda;
 #[cfg(target_os = "macos")]
@@ -120,10 +125,15 @@ pub mod qwen3moe;
 mod ragged_metal;
 /// Expert banks in GGUF formats Candle lacks (NVFP4, IQ4_NL).
 mod raw_experts;
+#[cfg(target_os = "macos")]
+mod raw_experts_metal;
+#[cfg(target_os = "macos")]
+mod raw_prompt_moe_metal;
 #[cfg(feature = "cuda")]
 mod residual_norm_cuda;
 #[cfg(target_os = "macos")]
 pub(crate) mod sdpa_f16kv_metal;
+pub(crate) mod speculative_draft;
 #[cfg(target_os = "macos")]
 mod tensor_qmatmul_metal;
 #[cfg(target_os = "macos")]
@@ -307,6 +317,36 @@ pub struct AttentionSpan {
     pub len: usize,
 }
 
+/// Encoded image rows that replace a contiguous placeholder run in a prompt.
+///
+/// Retaining only the image rows (instead of a full-prompt `[seq, hidden]`
+/// embedding tensor) lets solo prefill chunk long multimodal conversations and
+/// reuse any cached text prefix before the first image.
+#[derive(Debug, Clone)]
+pub struct ImageEmbeddingSpan {
+    /// First token position in the expanded prompt covered by this image.
+    pub start: usize,
+    /// Encoded image embeddings shaped `[len, hidden_dim]`.
+    pub embeddings: Tensor,
+    /// Whether tokens inside this span attend bidirectionally (Gemma 4).
+    pub bidirectional: bool,
+}
+
+impl ImageEmbeddingSpan {
+    /// Number of token positions covered by this image span.
+    pub fn len(&self) -> Result<usize> {
+        let (rows, _) = self.embeddings.dims2()?;
+        Ok(rows)
+    }
+
+    /// Exclusive end position of this image span in the expanded prompt.
+    pub fn end(&self) -> Result<usize> {
+        self.start
+            .checked_add(self.len()?)
+            .context("image embedding span position overflow")
+    }
+}
+
 /// Three-axis rotary positions used by Qwen multimodal prompts.
 ///
 /// Text tokens use the same value on every axis. Image tokens use independent
@@ -398,6 +438,35 @@ impl MropePositionIds {
     /// Return all three axes as borrowed slices in temporal/height/width order.
     pub fn axes(&self) -> [&[u32]; 3] {
         [&self.temporal, &self.height, &self.width]
+    }
+
+    /// Slice a contiguous non-empty subrange `[start..start + len)` of positions.
+    pub fn slice(&self, start: usize, len: usize) -> Result<Self> {
+        let end = start
+            .checked_add(len)
+            .context("M-RoPE slice range overflow")?;
+        anyhow::ensure!(
+            len > 0 && end <= self.len(),
+            "M-RoPE slice [{start}..{end}) out of bounds for length {}",
+            self.len()
+        );
+        Self::new(
+            self.temporal[start..end].to_vec(),
+            self.height[start..end].to_vec(),
+            self.width[start..end].to_vec(),
+        )
+    }
+
+    /// Whether every position in `[0..len)` uses ordinary 1D text coordinates
+    /// (`temporal == height == width == index`).
+    pub fn is_identity_prefix(&self, len: usize) -> bool {
+        len <= self.len()
+            && (0..len).all(|index| {
+                let expected = u32::try_from(index).ok();
+                expected == Some(self.temporal[index])
+                    && expected == Some(self.height[index])
+                    && expected == Some(self.width[index])
+            })
     }
 
     /// Signed offset needed to continue decoding after this prefill.
@@ -559,6 +628,34 @@ impl PreallocatedKvCache {
             len: k_len,
             capacity,
             allocation_lanes: k_batch,
+        })
+    }
+
+    /// Empty storage for `heads` key and value heads of `head_dim`, with
+    /// room for `incoming` rows, for a caller that writes its first rows in
+    /// place through [`Self::reserve`] instead of handing them over.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn empty_f16(
+        heads: usize,
+        head_dim: usize,
+        incoming: usize,
+        device: &candle_core::Device,
+    ) -> Result<Self> {
+        let capacity = Self::next_capacity(0, incoming)?;
+        let zeros = || {
+            Tensor::zeros(
+                (1, heads, capacity, head_dim),
+                candle_core::DType::F16,
+                device,
+            )
+        };
+        Ok(Self {
+            k: zeros()?,
+            v: zeros()?,
+            start: 0,
+            len: 0,
+            capacity,
+            allocation_lanes: 1,
         })
     }
 
@@ -1250,9 +1347,7 @@ pub(crate) fn commit_speculative_layer_cache(
         LayerCache::DeepSeek4(_) => {
             anyhow::bail!("V4 speculative rollback requires a full checkpoint")
         }
-        LayerCache::Inkling2(_) => {
-            anyhow::bail!("Inkling 2 speculative rollback requires a full checkpoint")
-        }
+        LayerCache::Inkling2(cache) => cache.commit_speculative(committed_row, discarded_rows),
         LayerCache::DeltaNet(cache) => {
             let speculative_state = cache
                 .speculative_state
@@ -1437,6 +1532,30 @@ pub trait ModelArchitecture: Send + Sync {
 
     /// Return the target embedding and output head needed by a draft model.
     fn speculative_shared_weights(&self) -> Option<SpeculativeSharedWeights> {
+        None
+    }
+
+    /// One past the largest feature ID `forward_with_layer_inputs` accepts.
+    /// Layered targets take layer inputs; looped targets may also name visits.
+    fn speculative_feature_limit(&self) -> usize {
+        self.layer_count()
+    }
+
+    /// Token embeddings as the target's first layer reads them, for drafts
+    /// that borrow the target's input table (`[tokens, hidden]`, F32).
+    fn speculative_embed_normed(&self, _tokens: &[u32]) -> Result<Tensor> {
+        anyhow::bail!("{} does not lend its embeddings to a draft", self.family())
+    }
+
+    /// The target's output head without its logit transforms, over the
+    /// unpadded vocabulary: `[rows, hidden]` to `[rows, vocab]`.
+    fn speculative_output_head(&self, _rows: &Tensor) -> Result<Tensor> {
+        anyhow::bail!("{} does not lend its output head to a draft", self.family())
+    }
+
+    /// Optional unpadded `[vocab, hidden]` BF16 output head weight on the
+    /// target's device, so a Metal drafter can build a compact draft-only head.
+    fn speculative_output_bf16_weight(&self) -> Option<Tensor> {
         None
     }
 

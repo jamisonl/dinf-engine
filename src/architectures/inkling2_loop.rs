@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use candle_core::quantized::QTensor;
+use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{D, DType, Device, IndexOp, Module, Tensor};
 
 #[cfg(feature = "cuda")]
@@ -62,6 +62,9 @@ use crate::turboquant::TurboQuantConfig;
 const MAX_CHUNK_TOKENS: usize = 512;
 /// Upper bound on `heads * queries * keys` for one attention score block.
 const MAX_SCORE_ELEMENTS: usize = 1 << 24;
+/// Rows up to which quantized projections use the decode kernel's rows.
+#[cfg(target_os = "macos")]
+const DECODE_ROWS_MAX_TOKENS: usize = 8;
 /// Expert route rows per dispatch, as in the other MoE stages.
 const MAX_ROUTE_ROWS: usize = 4096;
 /// Epsilon of the unweighted norms inside the attention residuals.
@@ -110,6 +113,21 @@ pub(crate) struct VisitState {
     /// The last `l_cache - 1` inputs of the K, V, post-attention and
     /// post-MoE convolutions, each `[l_cache - 1, channels]` F32.
     conv: [Option<Tensor>; 4],
+    /// Set during a draft verification pass: what rolling back needs.
+    rollback: Option<VisitRollback>,
+}
+
+/// One visit's record of a verification pass. Rejected rows leave the KV
+/// cache from the end, and each convolution state is rebuilt from the
+/// inputs of the rows that were kept.
+#[derive(Default)]
+struct VisitRollback {
+    /// Per convolution: the state before the pass (or none), the pass's
+    /// inputs `[tokens, channels]`, and the convolution width.
+    conv: [Option<(Option<Tensor>, Tensor, usize)>; 4],
+    /// Keys a sliding visit keeps once the pass is committed; eviction
+    /// waits so that rejected rows cannot push accepted context out.
+    keep: Option<usize>,
 }
 
 impl VisitState {
@@ -117,7 +135,31 @@ impl VisitState {
         Self {
             kv: None,
             conv: [None, None, None, None],
+            rollback: None,
         }
+    }
+
+    /// Record convolution `slot`'s input for rollback, if this pass keeps one.
+    fn note_conv(&mut self, slot: usize, past: Option<Tensor>, input: &Tensor, width: usize) {
+        if let Some(rollback) = self.rollback.as_mut() {
+            rollback.conv[slot] = Some((past, input.clone(), width));
+        }
+    }
+
+    /// Drop the oldest keys of a sliding visit beyond `keep`, or defer that
+    /// to the commit of a verification pass.
+    fn evict_to(&mut self, keep: usize) -> Result<()> {
+        if let Some(rollback) = self.rollback.as_mut() {
+            rollback.keep = Some(keep);
+            return Ok(());
+        }
+        if let Some(kv) = self.kv.as_mut() {
+            let keys = live_kv(kv)?.0.dim(2)?;
+            if keys > keep {
+                kv.evict_oldest(keys - keep)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -126,6 +168,9 @@ pub struct Inkling2Cache {
     visits: Vec<VisitState>,
     /// Tokens consumed so far; the next token's absolute position.
     position: usize,
+    /// Rows of the last pass if it was a draft verification whose rollback
+    /// records are still held.
+    pending: Option<usize>,
 }
 
 impl Inkling2Cache {
@@ -133,7 +178,84 @@ impl Inkling2Cache {
         Self {
             visits: (0..visits).map(|_| VisitState::empty()).collect(),
             position: 0,
+            pending: None,
         }
+    }
+
+    /// Keep the first `committed_row + 1` rows of the verification pass
+    /// that just ran and drop the other `discarded` rows.
+    pub(crate) fn commit_speculative(
+        &mut self,
+        committed_row: usize,
+        discarded: usize,
+    ) -> Result<()> {
+        let rows = self
+            .pending
+            .take()
+            .context("Inkling 2 verification did not retain rollback state")?;
+        let kept = committed_row + 1;
+        anyhow::ensure!(
+            kept + discarded == rows && kept <= self.position,
+            "Inkling 2 rollback of {discarded} rows does not match a {rows}-row pass"
+        );
+        for visit in &mut self.visits {
+            let record = visit
+                .rollback
+                .take()
+                .context("Inkling 2 visit lost its rollback record")?;
+            if discarded > 0 {
+                if let Some(kv) = visit.kv.as_mut() {
+                    kv.discard_newest(discarded)?;
+                }
+                #[cfg(target_os = "macos")]
+                let rebuilt = if record
+                    .conv
+                    .iter()
+                    .flatten()
+                    .next()
+                    .is_some_and(|(_, input, _)| input.device().is_metal())
+                {
+                    Some(super::inkling2_metal::visit_conv_rollback(
+                        &record.conv,
+                        kept,
+                    )?)
+                } else {
+                    None
+                };
+                #[cfg(not(target_os = "macos"))]
+                let rebuilt: Option<[Option<Tensor>; 4]> = None;
+                if let Some(rebuilt) = rebuilt {
+                    for (slot, state) in rebuilt.into_iter().enumerate() {
+                        if let Some(state) = state {
+                            visit.conv[slot] = Some(state);
+                        }
+                    }
+                } else {
+                    for (slot, noted) in record.conv.into_iter().enumerate() {
+                        let Some((past, input, width)) = noted else {
+                            continue;
+                        };
+                        let history = width - 1;
+                        let input = input.narrow(0, 0, kept)?.to_dtype(DType::F32)?;
+                        let past = match past {
+                            Some(past) => past,
+                            None => {
+                                Tensor::zeros((history, input.dim(1)?), DType::F32, input.device())?
+                            }
+                        };
+                        let all = Tensor::cat(&[&past, &input], 0)?;
+                        let len = all.dim(0)?;
+                        visit.conv[slot] =
+                            Some(all.narrow(0, len - history, history)?.force_contiguous()?);
+                    }
+                }
+            }
+            if let Some(keep) = record.keep {
+                visit.evict_to(keep)?;
+            }
+        }
+        self.position -= discarded;
+        Ok(())
     }
 
     /// Share the current storage. KV appends only write unused rows and the
@@ -146,12 +268,14 @@ impl Inkling2Cache {
                 Ok(VisitState {
                     kv: visit.kv.as_ref().map(share_kv).transpose()?,
                     conv: visit.conv.clone(),
+                    rollback: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             visits,
             position: self.position,
+            pending: None,
         })
     }
 
@@ -175,12 +299,17 @@ impl Inkling2Cache {
                 for (slot, state) in conv.iter_mut().zip(&visit.conv) {
                     *slot = state.as_ref().map(copy_persistent_tensor).transpose()?;
                 }
-                Ok(VisitState { kv, conv })
+                Ok(VisitState {
+                    kv,
+                    conv,
+                    rollback: None,
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             visits,
             position: self.position,
+            pending: None,
         })
     }
 
@@ -577,6 +706,25 @@ fn depth_mix(blocks: &[Tensor], current: &Tensor, queries: &Tensor) -> Result<Te
     Ok(probabilities.matmul(&stacked)?)
 }
 
+/// `x` `[rows, in]` times `weight` `[out, in]` transposed. For a few rows on
+/// Metal, read `weight` once in the fused multi-row matvec kernel instead of
+/// launching Candle's few-row GEMM (which runs over a handful of threadgroups).
+#[cfg(target_os = "macos")]
+fn rows_times_transposed(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    let rows = x.dim(0)?;
+    if (1..=DECODE_ROWS_MAX_TOKENS).contains(&rows)
+        && let Some(y) = super::inkling2_metal::try_f32_matvec_t_rows(x, weight)?
+    {
+        return Ok(y);
+    }
+    if rows > DECODE_ROWS_MAX_TOKENS
+        && let Some(y) = super::inkling2_tensor_metal::try_rows_times_transposed(x, weight)?
+    {
+        return Ok(y);
+    }
+    Ok(x.matmul(&weight.t()?)?)
+}
+
 /// Loop message gate: `(1 - tanh(F h)) * x + tanh(G h) * m`, `h = D [rms(x); rms(m)]`.
 struct MessageGate {
     /// `[rank, 2 * hidden]`; multiplied as its transpose.
@@ -588,17 +736,34 @@ struct MessageGate {
     /// `[rank, 2 * hidden]`: forget then gain, for the fused path.
     #[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(dead_code))]
     forget_gain: Tensor,
+    #[cfg(target_os = "macos")]
+    down_f16: Option<Tensor>,
+    #[cfg(target_os = "macos")]
+    forget_gain_f16: Option<Tensor>,
     eps: f64,
 }
 
 impl MessageGate {
     fn new(down: Tensor, forget: Tensor, gain: Tensor, eps: f64) -> Result<Self> {
         let forget_gain = Tensor::cat(&[&forget, &gain], 1)?.contiguous()?;
+        #[cfg(target_os = "macos")]
+        let (down_f16, forget_gain_f16) = if down.device().is_metal() {
+            (
+                Some(down.to_dtype(DType::F16)?.contiguous()?),
+                Some(forget_gain.to_dtype(DType::F16)?.contiguous()?),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Self {
             down,
             forget,
             gain,
             forget_gain,
+            #[cfg(target_os = "macos")]
+            down_f16,
+            #[cfg(target_os = "macos")]
+            forget_gain_f16,
             eps,
         })
     }
@@ -635,8 +800,59 @@ impl MessageGate {
     ) -> Result<Tensor> {
         let (x, message) = (x.contiguous()?, message.contiguous()?);
         let (tokens, hidden) = x.dims2()?;
+        if tokens > DECODE_ROWS_MAX_TOKENS
+            && let (Some(down_h), Some(fg_h)) = (&self.down_f16, &self.forget_gain_f16)
+        {
+            let joined = super::inkling2_metal::rms_pair_half(&x, &message, self.eps as f32)?;
+            if let Some(down) =
+                super::inkling2_tensor_metal::try_f16_rows_times_transposed(&joined, down_h)?
+                && let Some(fg) =
+                    super::inkling2_tensor_metal::try_f16_rows_times_nt(&down, fg_h)?
+            {
+                let gated = super::inkling2_metal::gate_combine_norm(
+                    &fg,
+                    &x.reshape((tokens, 1, hidden))?,
+                    &message.reshape((tokens, 1, hidden))?,
+                    weight,
+                    1,
+                    eps,
+                    false,
+                    false,
+                )?;
+                return Ok(gated.reshape((tokens, hidden))?);
+            }
+        }
         let joined = super::inkling2_metal::rms_pair(&x, &message, self.eps as f32)?;
-        let forget_gain = joined.matmul(&self.down.t()?)?.matmul(&self.forget_gain)?;
+        let use_f16_mv = tokens == 1 && hidden >= 256;
+        let down_w = if use_f16_mv {
+            self.down_f16.as_ref().unwrap_or(&self.down)
+        } else {
+            &self.down
+        };
+        let fg_w = if use_f16_mv {
+            self.forget_gain_f16.as_ref().unwrap_or(&self.forget_gain)
+        } else {
+            &self.forget_gain
+        };
+        let down = if (1..=DECODE_ROWS_MAX_TOKENS).contains(&tokens)
+            && let Some(d) = super::inkling2_metal::try_f32_matvec_t_rows(&joined, down_w)?
+        {
+            d
+        } else {
+            rows_times_transposed(&joined, &self.down)?
+        };
+        let forget_gain = if (1..=DECODE_ROWS_MAX_TOKENS).contains(&tokens)
+            && let Some(fg) = super::inkling2_metal::try_f32_matvec_nt_rows(&down, fg_w)?
+        {
+            fg
+        } else if tokens > DECODE_ROWS_MAX_TOKENS
+            && let Some(fg) =
+                super::inkling2_tensor_metal::try_rows_times_nt(&down, &self.forget_gain)?
+        {
+            fg
+        } else {
+            down.matmul(&self.forget_gain)?
+        };
         let gated = super::inkling2_metal::gate_combine_norm(
             &forget_gain,
             &x.reshape((tokens, 1, hidden))?,
@@ -686,6 +902,10 @@ struct LoopWeights {
     /// The Q, K and V gates' forget and gain projections, `[3, rank, 2 * hidden]`.
     #[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(dead_code))]
     qkv_forget_gain: Tensor,
+    #[cfg(target_os = "macos")]
+    qkv_down_f16: Option<Tensor>,
+    #[cfg(target_os = "macos")]
+    qkv_forget_gain_f16: Option<Tensor>,
 }
 
 enum AttentionInput {
@@ -733,9 +953,11 @@ enum Projection {
     Candle(QMatMul),
     #[cfg(target_os = "macos")]
     Tensor(super::tensor_qmatmul_metal::MetalTensorQMatMul),
-    /// BF16 `[out, in]` on CUDA: a BF16 matrix-vector kernel for one token,
-    /// cuBLAS BF16 products (the checkpoint's compute type) for more.
-    #[cfg(feature = "cuda")]
+    /// BF16 `[out, in]`. CUDA: a BF16 matrix-vector kernel for one token,
+    /// cuBLAS BF16 products (the checkpoint's compute type) for more. Metal:
+    /// an F32 matrix-vector kernel for a few tokens, the F32 product of a
+    /// widened copy for more, so values match the F32 path.
+    #[cfg(any(feature = "cuda", target_os = "macos"))]
     Bf16(Tensor),
     /// Stacked parts of more than one quantization type, one projection per
     /// run of a type, with the outputs joined in order. Unsloth's files keep
@@ -770,22 +992,68 @@ impl Projection {
         Ok(Self::Candle(QMatMul::from_arc(weight)?))
     }
 
+    /// A projection of `part`'s rows.
+    fn from_part(part: Part, device: &Device) -> Result<Self> {
+        match part {
+            Part::Q(weight) => Self::new(weight, device),
+            #[cfg(any(feature = "cuda", target_os = "macos"))]
+            Part::Bf16(weight) => Ok(Self::Bf16(weight)),
+            #[cfg(not(any(feature = "cuda", target_os = "macos")))]
+            Part::Bf16(weight) => Ok(Self::Candle(QMatMul::from_qtensor(QTensor::quantize(
+                &weight.to_dtype(DType::F32)?,
+                candle_core::quantized::GgmlDType::F32,
+            )?)?)),
+        }
+    }
+
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         match self {
             Self::Candle(matmul) => matmul.forward(x),
+            // A few rows (a draft verification) read the weights once in
+            // decode's per-row reduction; the tensor tiles idle on so few.
+            #[cfg(target_os = "macos")]
+            Self::Tensor(matmul)
+                if x.rank() == 2 && (2..=DECODE_ROWS_MAX_TOKENS).contains(&x.dim(0)?) =>
+            {
+                matmul.forward_decode_rows(x)
+            }
             // The tensor-op path takes `[1, tokens, in]`.
             #[cfg(target_os = "macos")]
             Self::Tensor(matmul) if x.rank() == 2 => matmul.forward(&x.unsqueeze(0)?)?.squeeze(0),
             #[cfg(target_os = "macos")]
-            Self::Tensor(matmul) => matmul.forward(x),
+            Self::Tensor(matmul) => {
+                if x.rank() == 2
+                    && x.dim(0)? == 1
+                    && x.dtype() == DType::F32
+                    && let Some((w_u8, out_dim, in_dim)) = matmul.q4_0_weights()
+                    && in_dim.is_multiple_of(32)
+                {
+                    return kernels::q4_0_matvec_1(x, w_u8, out_dim, in_dim);
+                }
+                matmul.forward(x)
+            }
             #[cfg(feature = "cuda")]
             Self::Bf16(weight) => {
                 if x.dim(0)? == 1 && x.rank() == 2 {
                     return cuda::bf16_matvec(&x.contiguous()?, weight);
                 }
-                x.to_dtype(DType::BF16)?
-                    .matmul(&weight.t()?)?
-                    .to_dtype(DType::F32)
+                cuda::bf16_matmul(&x.contiguous()?, weight)
+            }
+            #[cfg(all(target_os = "macos", not(feature = "cuda")))]
+            Self::Bf16(weight) => {
+                let (out, width) = weight.dims2()?;
+                let rows = x.elem_count() / width.max(1);
+                let flat = x.reshape((rows, width))?;
+                let mut dims = x.dims().to_vec();
+                *dims.last_mut().expect("projection input has a width") = out;
+                let y = if x.device().is_metal() && rows <= kernels::BF16_MATVEC_MAX_ROWS {
+                    kernels::bf16_matvec(&flat.contiguous()?, weight)?
+                } else if let Some(y) = bf16_prefill(&flat, weight)? {
+                    y
+                } else {
+                    flat.matmul(&weight.to_dtype(DType::F32)?.t()?)?
+                };
+                y.reshape(dims)
             }
             Self::Joined(parts) => {
                 let outputs = parts
@@ -822,6 +1090,85 @@ impl Projection {
                 return cuda::bf16_matvec_many(&weights);
             }
         }
+        // BF16 prompt rows: stage every input in half first (once for a
+        // shared input), so no cast separates the products and they overlap.
+        // Single-token BF16 projections of the same width run in one dispatch.
+        #[cfg(all(target_os = "macos", not(feature = "cuda")))]
+        {
+            let single_bf16 = pairs
+                .iter()
+                .map(|(projection, x)| match projection {
+                    Self::Bf16(weight)
+                        if x.rank() == 2
+                            && x.device().is_metal()
+                            && x.dim(0).ok() == Some(1) =>
+                    {
+                        Some((*x, weight))
+                    }
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(weights) = single_bf16
+                && (2..=3).contains(&weights.len())
+                && weights
+                    .iter()
+                    .all(|(_, w)| w.dim(1).ok() == weights[0].1.dim(1).ok())
+            {
+                return kernels::bf16_matvec_many(&weights);
+            }
+            let single_q4 = pairs
+                .iter()
+                .map(|(projection, x)| match projection {
+                    Self::Tensor(matmul)
+                        if x.rank() == 2
+                            && x.device().is_metal()
+                            && x.dtype() == DType::F32
+                            && x.dim(0).ok() == Some(1) =>
+                    {
+                        matmul.q4_0_weights().map(|(w, out, ind)| (*x, w, out, ind))
+                    }
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(q4) = single_q4
+                && (2..=3).contains(&q4.len())
+                && q4[0].3.is_multiple_of(32)
+                && q4.iter().all(|(_, _, _, ind)| *ind == q4[0].3)
+            {
+                let in_dim = q4[0].3;
+                let args: Vec<_> = q4.iter().map(|&(x, w, out, _)| (x, w, out)).collect();
+                return kernels::q4_0_matvec_many(&args, in_dim);
+            }
+            use super::tensor_qmatmul_metal as tensor;
+            let prompt = |projection: &Self, x: &Tensor| {
+                matches!(projection, Self::Bf16(_))
+                    && x.rank() == 2
+                    && x.device().is_metal()
+                    && x.dim(0)
+                        .is_ok_and(|rows| rows > kernels::BF16_MATVEC_MAX_ROWS)
+                    && std::env::var_os("DINF_INKLING2_BF16_F32_PREFILL").is_none()
+            };
+            let mut staged: Vec<(candle_core::TensorId, Option<tensor::HalfRows>)> = Vec::new();
+            for (projection, x) in pairs {
+                if prompt(projection, x) && !staged.iter().any(|(id, _)| *id == x.id()) {
+                    staged.push((x.id(), tensor::bf16_prefill_half(x)?));
+                }
+            }
+            return pairs
+                .iter()
+                .map(|(projection, x)| {
+                    if let Self::Bf16(weight) = projection
+                        && prompt(projection, x)
+                        && let Some((_, Some(half))) = staged.iter().find(|(id, _)| *id == x.id())
+                        && let Some(y) = tensor::bf16_prefill_matmul_half(half, weight)?
+                    {
+                        return Ok(y);
+                    }
+                    projection.forward(x)
+                })
+                .collect();
+        }
+        #[allow(unreachable_code)]
         pairs
             .iter()
             .map(|(projection, x)| projection.forward(x))
@@ -873,6 +1220,8 @@ struct Layer {
     /// `[experts, hidden]`; multiplied as its transpose, which Metal runs
     /// as a fast row-major matrix-vector product.
     router: Tensor,
+    #[cfg(target_os = "macos")]
+    router_f16: Option<Tensor>,
     /// `[experts]`.
     router_bias: Tensor,
     experts: Experts,
@@ -883,24 +1232,29 @@ struct Layer {
 struct ChunkPositions {
     start: usize,
     tokens: usize,
-    /// `[tokens, 1, 1]` log scales of the full-attention layers.
-    log_scale: Tensor,
+    /// `[tokens, 1, 1]` log scales of the full-attention layers (`None` when all positions <= `log_floor`).
+    log_scale: Option<Tensor>,
     /// `(sliding, keys, extent)` → `(bias index, additive mask)`, each `[tokens, keys]`.
     masks: HashMap<(bool, usize, usize), (Tensor, Tensor)>,
 }
 
 impl ChunkPositions {
     fn new(start: usize, tokens: usize, dims: &Dims, device: &Device) -> Result<Self> {
-        let scales = (0..tokens)
-            .map(|t| {
-                let ratio = ((start + t + 1) as f64 / dims.log_floor).max(1.0);
-                (1.0 + dims.log_alpha * ratio.ln()) as f32
-            })
-            .collect::<Vec<_>>();
+        let log_scale = if (start + tokens) as f64 <= dims.log_floor {
+            None
+        } else {
+            let scales = (0..tokens)
+                .map(|t| {
+                    let ratio = ((start + t + 1) as f64 / dims.log_floor).max(1.0);
+                    (1.0 + dims.log_alpha * ratio.ln()) as f32
+                })
+                .collect::<Vec<_>>();
+            Some(Tensor::from_vec(scales, (tokens, 1, 1), device)?)
+        };
         Ok(Self {
             start,
             tokens,
-            log_scale: Tensor::from_vec(scales, (tokens, 1, 1), device)?,
+            log_scale,
             masks: HashMap::new(),
         })
     }
@@ -996,12 +1350,117 @@ pub(crate) fn attend_with_sinks(
         .reshape((heads, tokens, head_dim))?)
 }
 
+/// Whether the GGUF loader should hand `name` over as raw bytes on `device`
+/// instead of as a Candle tensor: expert banks the indexed kernels read in
+/// place, a Q8_0 token table, and BF16 tensors outside the expert banks,
+/// typed as BF16 (Candle would widen them to F32 through host memory). Their
+/// bytes go from the file to the GPU without a whole-tensor CPU copy. The
+/// allocator keeps freed copies that large in the process footprint, so
+/// staging every bank on the CPU first would leave most of the model's size
+/// behind after the load.
+pub(crate) fn loads_as_device_bytes(name: &str, dtype: GgmlDType, device: &Device) -> bool {
+    #[cfg(target_os = "macos")]
+    if device.is_metal() {
+        use super::indexed_moe::indexed_moe_available;
+        let expert = name.contains("_exps.");
+        // BF16 banks are narrowed to F16 on the GPU for the indexed kernels.
+        let bank_type = if dtype == GgmlDType::BF16 {
+            GgmlDType::F16
+        } else {
+            dtype
+        };
+        return (expert && name.ends_with(".weight") && indexed_moe_available(device, bank_type))
+            || (name == "token_embd.weight" && dtype == GgmlDType::Q8_0)
+            || (!expert && dtype == GgmlDType::BF16);
+    }
+    #[cfg(feature = "cuda")]
+    if device.is_cuda() {
+        return !name.contains("_exps.") && dtype == GgmlDType::BF16;
+    }
+    let _ = (name, dtype, device);
+    false
+}
+
+/// The token table.
+enum Embedding {
+    /// Gathered with `index_select`, then widened to F32.
+    Dense(Tensor),
+    /// A Q8_0 table kept packed on Metal; rows are widened on the GPU.
+    #[cfg(target_os = "macos")]
+    Q8 {
+        bytes: Tensor,
+        rows: usize,
+        hidden: usize,
+    },
+}
+
+impl Embedding {
+    fn from_raw(raw: &RawTensor, hidden: usize) -> Result<Self> {
+        if raw.bytes().dtype() == DType::BF16 {
+            // Typed BF16 rows are widened as they are read.
+            return Ok(Self::Dense(raw.bytes().clone()));
+        }
+        let &[rows, cols] = raw.shape() else {
+            anyhow::bail!("Inkling 2 token embedding has shape {:?}", raw.shape())
+        };
+        anyhow::ensure!(
+            cols == hidden,
+            "Inkling 2 token embedding shape {:?} differs from [{rows}, {hidden}]",
+            raw.shape()
+        );
+        #[cfg(target_os = "macos")]
+        if raw.dtype() == crate::deepseek4_gguf::DeepSeek4DType::Q8_0
+            && raw.bytes().device().is_metal()
+        {
+            return Ok(Self::Q8 {
+                bytes: raw.bytes().clone(),
+                rows,
+                hidden,
+            });
+        }
+        let _ = rows;
+        anyhow::bail!(
+            "Inkling 2 cannot read a raw {:?} token embedding here",
+            raw.dtype()
+        )
+    }
+
+    fn rows(&self) -> Result<usize> {
+        Ok(match self {
+            Self::Dense(table) => table.dim(0)?,
+            #[cfg(target_os = "macos")]
+            Self::Q8 { rows, .. } => *rows,
+        })
+    }
+
+    fn hidden(&self) -> Result<usize> {
+        Ok(match self {
+            Self::Dense(table) => table.dim(1)?,
+            #[cfg(target_os = "macos")]
+            Self::Q8 { hidden, .. } => *hidden,
+        })
+    }
+
+    /// F32 `[ids, hidden]`.
+    fn lookup(&self, ids: &Tensor) -> Result<Tensor> {
+        Ok(match self {
+            Self::Dense(table) => table.index_select(ids, 0)?.to_dtype(DType::F32)?,
+            #[cfg(target_os = "macos")]
+            Self::Q8 {
+                bytes,
+                rows,
+                hidden,
+            } => kernels::q8_rows(bytes, *rows, *hidden, ids)?,
+        })
+    }
+}
+
 /// Inkling 2 Mini as one solo stage.
 pub struct Inkling2LoopStage {
     dims: Dims,
     schedule: Vec<Visit>,
     loop_start: usize,
-    embedding: Tensor,
+    embedding: Embedding,
     embedding_norm: Tensor,
     layers: Vec<Layer>,
     final_query: Tensor,
@@ -1041,6 +1500,10 @@ impl Inkling2LoopStage {
         let dims = dims_from_metadata(&md, &config)?;
         #[cfg(feature = "cuda")]
         cuda::precompile(&device)?;
+        #[cfg(target_os = "macos")]
+        if let Device::Metal(metal) = &device {
+            super::inkling2_tensor_metal::precompile(metal)?;
+        }
         let mut weights = Weights {
             tensors: &mut tensors,
             raw: &mut raw_tensors,
@@ -1053,18 +1516,25 @@ impl Inkling2LoopStage {
                 .tensors
                 .get("token_embd.weight")
                 .is_some_and(|table| table.dtype() == candle_core::quantized::GgmlDType::BF16);
-        let embedding = if bf16_table {
+        let embedding = if let Some(raw) = weights.raw.remove("token_embd.weight") {
+            Embedding::from_raw(&raw, dims.hidden)?
+        } else if bf16_table {
             let table = weights.take("token_embd.weight")?;
-            Tensor::from_raw_buffer(&table.data()?, DType::BF16, table.shape().dims(), &device)?
+            Embedding::Dense(Tensor::from_raw_buffer(
+                &table.data()?,
+                DType::BF16,
+                table.shape().dims(),
+                &device,
+            )?)
         } else {
-            weights.dense("token_embd.weight")?
+            Embedding::Dense(weights.dense("token_embd.weight")?)
         };
-        let vocab_rows = embedding.dim(0)?;
+        let vocab_rows = embedding.rows()?;
         anyhow::ensure!(
-            embedding.dims() == [vocab_rows, dims.hidden]
-                && vocab_rows >= config.vocab_size_unpadded,
-            "Inkling 2 token embedding shape {:?} differs from [{vocab_rows}, {}]",
-            embedding.dims(),
+            embedding.hidden()? == dims.hidden && vocab_rows >= config.vocab_size_unpadded,
+            "Inkling 2 token embedding is [{vocab_rows}, {}], expected [>= {}, {}]",
+            embedding.hidden()?,
+            config.vocab_size_unpadded,
             dims.hidden
         );
         let embedding_norm = weights.vector("token_embd_norm.weight", dims.hidden)?;
@@ -1109,12 +1579,29 @@ impl Inkling2LoopStage {
     }
 
     /// Run every visit for one chunk. Returns the final block states followed
-    /// by the last hidden state, each `[tokens, hidden]`, for the output mix.
-    fn forward_chunk(&self, tokens: &[u32], state: &mut Inkling2Cache) -> Result<Vec<Tensor>> {
-        let count = tokens.len();
-        let ids = Tensor::from_slice(tokens, count, &self.device)?;
-        let embedded = self.embedding.index_select(&ids, 0)?.to_dtype(DType::F32)?;
-        let mut hidden = rms_norm(&embedded, &self.embedding_norm, self.dims.rms_eps)?;
+    /// by the last hidden state, each `[tokens, hidden]`, for the output mix,
+    /// and the partial-block state entering each visit listed in `capture`.
+    fn forward_chunk(
+        &self,
+        tokens: &[u32],
+        state: &mut Inkling2Cache,
+        capture: &[usize],
+    ) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+        let hidden = self.embed_tokens(tokens)?;
+        self.forward_embedded(hidden, state, capture)
+    }
+
+    /// [`Self::forward_chunk`] from input embeddings `[tokens, hidden]`:
+    /// normalized token embeddings, or image rows spliced in among them (the
+    /// reference replaces placeholder rows after the embedding norm).
+    fn forward_embedded(
+        &self,
+        mut hidden: Tensor,
+        state: &mut Inkling2Cache,
+        capture: &[usize],
+    ) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+        let mut captured = Vec::with_capacity(capture.len());
+        let count = hidden.dim(0)?;
         let mut positions = ChunkPositions::new(state.position, count, &self.dims, &self.device)?;
 
         let mut blocks = Blocks::default();
@@ -1123,6 +1610,9 @@ impl Inkling2LoopStage {
         let mut current_pass = 0;
         for (index, visit) in self.schedule.iter().enumerate() {
             let layer = &self.layers[visit.layer];
+            if capture.contains(&index) {
+                captured.push(hidden.clone());
+            }
             if visit.layer == self.loop_start {
                 if visit.pass == 0 {
                     prelude = Some((hidden.clone(), blocks.clone()));
@@ -1171,7 +1661,7 @@ impl Inkling2LoopStage {
         }
         state.position += count;
         blocks.items.push(hidden);
-        Ok(blocks.items)
+        Ok((blocks.items, captured))
     }
 
     fn layer_forward(
@@ -1259,6 +1749,12 @@ impl Inkling2LoopStage {
         }
         let moe_in = rms_norm(&moe_in, &layer.moe_norm, eps)?;
         let routed = self.moe(layer, &moe_in)?;
+        visit.note_conv(
+            3,
+            visit.conv[3].clone(),
+            &routed,
+            layer.moe_post_conv.width(),
+        );
         let routed = short_conv(&routed, &layer.moe_post_conv, None, &mut visit.conv[3])?;
         let out = (residual + routed)?;
         Ok(out)
@@ -1330,6 +1826,10 @@ impl Inkling2LoopStage {
                     &messages.narrow(1, 0, 3)?.contiguous()?,
                     &looped.qkv_down,
                     &looped.qkv_forget_gain,
+                    #[cfg(target_os = "macos")]
+                    looped.qkv_down_f16.as_ref(),
+                    #[cfg(target_os = "macos")]
+                    looped.qkv_forget_gain_f16.as_ref(),
                     eps,
                     &layer.norm_rows,
                 )?;
@@ -1343,13 +1843,8 @@ impl Inkling2LoopStage {
         } else {
             Some(hidden)
         };
-        let projected =
-            self.attention_fused(layer, &q_in, &k_in, &v_in, shared_kv, visit, positions)?;
-        let (residual, state) = kernels::post_conv(
-            kernels::PostInput::Rows(&projected),
-            visit.conv[2].as_ref(),
-            &layer.attention_post_conv.weight,
-            residual,
+        let (residual, state) = self.attention_fused_post_conv(
+            layer, &q_in, &k_in, &v_in, shared_kv, residual, visit, positions,
         )?;
         visit.conv[2] = Some(state);
 
@@ -1381,19 +1876,21 @@ impl Inkling2LoopStage {
         self.moe_fused(layer, &moe_in, &residual, visit)
     }
 
-    /// The attention branch in the fused kernels, up to its output projection.
+    /// The attention branch in the fused kernels, through its output projection
+    /// and post-convolution (+ optional residual).
     #[cfg(any(target_os = "macos", feature = "cuda"))]
     #[allow(clippy::too_many_arguments)]
-    fn attention_fused(
+    fn attention_fused_post_conv(
         &self,
         layer: &Layer,
         q_in: &Tensor,
         k_in: &Tensor,
         v_in: &Tensor,
         shared_kv: bool,
+        residual: Option<&Tensor>,
         visit: &mut VisitState,
         positions: &mut ChunkPositions,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Tensor)> {
         let dims = &self.dims;
         let tokens = q_in.dim(0)?;
         let (heads, kv_heads, head_dim) = (dims.heads, dims.kv_heads, dims.head_dim);
@@ -1445,15 +1942,67 @@ impl Inkling2LoopStage {
             }
         };
         let gate_logits = query_side.narrow(1, q_dim, q_dim)?;
-        let log_scale = (!layer.sliding).then_some(&positions.log_scale);
+        let log_scale = if layer.sliding {
+            None
+        } else {
+            positions.log_scale.as_ref()
+        };
         // Queries carry the 1/sqrt(head_dim) score scale from here on.
+        let query_columns = kernels::QuerySide {
+            q: 0,
+            rel: 2 * q_dim,
+            sink: 2 * q_dim + rel_width,
+        };
+        // A token has no more cached keys before it than its position, so
+        // Metal leaves the bias columns past that distance unwritten.
+        #[cfg(target_os = "macos")]
+        let (q, bias) = {
+            let first_position = if std::env::var_os("DINF_INKLING2_FULL_BIAS").is_some() {
+                usize::MAX
+            } else {
+                positions.start
+            };
+            let use_f16 = tokens > PROMPT_ATTENTION_MIN_TOKENS
+                && head_dim == 128
+                && fused(&self.device)
+                && super::tensor_qmatmul_metal::supports_tensor_batch_attention(&self.device)
+                    .unwrap_or(false);
+            if use_f16 {
+                kernels::query_prep_from_f16(
+                    &query_side,
+                    &query_columns,
+                    heads,
+                    head_dim,
+                    &layer.q_scale,
+                    &layer.relative_scale,
+                    log_scale,
+                    &layer.relative_basis,
+                    dims.qk_clip as f32,
+                    dims.rel_clip as f32,
+                    1.0 / (head_dim as f32).sqrt(),
+                    first_position,
+                )?
+            } else {
+                kernels::query_prep_from(
+                    &query_side,
+                    &query_columns,
+                    heads,
+                    head_dim,
+                    &layer.q_scale,
+                    &layer.relative_scale,
+                    log_scale,
+                    &layer.relative_basis,
+                    dims.qk_clip as f32,
+                    dims.rel_clip as f32,
+                    1.0 / (head_dim as f32).sqrt(),
+                    first_position,
+                )?
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
         let (q, bias) = kernels::query_prep(
             &query_side,
-            &kernels::QuerySide {
-                q: 0,
-                rel: 2 * q_dim,
-                sink: 2 * q_dim + rel_width,
-            },
+            &query_columns,
             heads,
             head_dim,
             &layer.q_scale,
@@ -1469,6 +2018,9 @@ impl Inkling2LoopStage {
             (Some(k), Some(v)) => Some((k.clone(), v.clone())),
             _ => None,
         };
+        let (k_past, v_past) = past.clone().unzip();
+        visit.note_conv(0, k_past, &k_lin, layer.k_conv.width());
+        visit.note_conv(1, v_past, &v_lin, layer.v_conv.width());
         let finish = |output: kernels::KvOutput<'_>| {
             kernels::kv_finish(
                 &k_lin,
@@ -1483,6 +2035,14 @@ impl Inkling2LoopStage {
                 output,
             )
         };
+        // Metal starts a visit's cache empty, so the first chunk's rows are
+        // written in place too, not cast and copied in.
+        #[cfg(target_os = "macos")]
+        if visit.kv.is_none() {
+            visit.kv = Some(KvCache::PreallocatedF16(
+                super::PreallocatedKvCache::empty_f16(kv_heads, head_dim, tokens, &self.device)?,
+            ));
+        }
         // Once a visit has a cache, the kernel writes its f16 rows in place.
         let (finished, k_all, v_all) = match visit.kv.as_mut() {
             Some(KvCache::PreallocatedF16(cache)) => {
@@ -1530,18 +2090,61 @@ impl Inkling2LoopStage {
                 (attended * candle_nn::ops::sigmoid(&gate_logits)?)?
             }
         };
-        let projected = layer.output.forward(&gated)?;
+        let out_and_state = (|| -> Result<(Tensor, Tensor)> {
+            #[cfg(target_os = "macos")]
+            if tokens == 1 && visit.rollback.is_none() && gated.dtype() == DType::F32 {
+                match &layer.output {
+                    Projection::Tensor(matmul) => {
+                        if let Some((w_u8, out_dim, in_dim)) = matmul.q4_0_weights()
+                            && in_dim.is_multiple_of(32)
+                        {
+                            return Ok(kernels::q4_0_matvec_post_conv_1(
+                                &gated,
+                                w_u8,
+                                out_dim,
+                                in_dim,
+                                visit.conv[2].as_ref(),
+                                &layer.attention_post_conv.weight,
+                                residual,
+                            )?);
+                        }
+                    }
+                    Projection::Bf16(weight)
+                        if weight.device().is_metal()
+                            && weight.is_contiguous()
+                            && weight.dim(1)?.is_multiple_of(4) =>
+                    {
+                        return Ok(kernels::bf16_matvec_post_conv_1(
+                            &gated,
+                            weight,
+                            visit.conv[2].as_ref(),
+                            &layer.attention_post_conv.weight,
+                            residual,
+                        )?);
+                    }
+                    _ => {}
+                }
+            }
+            let projected = layer.output.forward(&gated)?;
+            visit.note_conv(
+                2,
+                visit.conv[2].clone(),
+                &projected,
+                layer.attention_post_conv.width(),
+            );
+            Ok(kernels::post_conv(
+                kernels::PostInput::Rows(&projected),
+                visit.conv[2].as_ref(),
+                &layer.attention_post_conv.weight,
+                residual,
+            )?)
+        })()?;
 
         if layer.sliding {
             // Later queries can only see the last `window - 1` keys.
-            let keep = dims.window - 1;
-            if keys > keep
-                && let Some(kv) = visit.kv.as_mut()
-            {
-                kv.evict_oldest(keys - keep)?;
-            }
+            visit.evict_to(dims.window - 1)?;
         }
-        Ok(projected)
+        Ok(out_and_state)
     }
 
     /// The MoE branch on Metal plus `residual`.
@@ -1557,54 +2160,169 @@ impl Inkling2LoopStage {
         let dims = &self.dims;
         let (tokens, hidden) = x.dims2()?;
         let finish = |input: metal::PostInput<'_>, visit: &mut VisitState| -> Result<Tensor> {
-            let (out, state) = metal::post_conv(
-                input,
-                visit.conv[3].as_ref(),
-                &layer.moe_post_conv.weight,
-                Some(residual),
-            )?;
+            let (out, state) = match (&input, visit.rollback.is_some()) {
+                (metal::PostInput::Rows(rows), true) => {
+                    visit.note_conv(3, visit.conv[3].clone(), rows, layer.moe_post_conv.width());
+                    metal::post_conv(
+                        input,
+                        visit.conv[3].as_ref(),
+                        &layer.moe_post_conv.weight,
+                        Some(residual),
+                    )?
+                }
+                (metal::PostInput::Routes { .. }, true) => {
+                    let (out, state, raw) = metal::post_conv_with_raw(
+                        input,
+                        visit.conv[3].as_ref(),
+                        &layer.moe_post_conv.weight,
+                        Some(residual),
+                    )?;
+                    visit.note_conv(3, visit.conv[3].clone(), &raw, layer.moe_post_conv.width());
+                    (out, state)
+                }
+                (_, false) => metal::post_conv(
+                    input,
+                    visit.conv[3].as_ref(),
+                    &layer.moe_post_conv.weight,
+                    Some(residual),
+                )?,
+            };
             visit.conv[3] = Some(state);
             Ok(out)
         };
-        match &layer.experts {
-            Experts::Indexed(experts) if tokens * dims.active_experts <= MAX_ROUTE_ROWS => {
-                let logits = x.matmul(&layer.router.t()?)?;
-                // Unique in-range IDs: the expert kernels skip their sanitize pass.
-                let (ids, weights) = metal::sigmoid_route(
-                    &logits,
-                    &layer.router_bias,
-                    dims.active_experts,
-                    dims.expert_scale as f32,
-                )?;
-                let input = x.reshape((tokens, 1, hidden))?;
+        let on_gpu = match &layer.experts {
+            Experts::Indexed(_) => true,
+            Experts::Raw(banks) => {
+                banks.gate_up.runs_on(&self.device) && banks.down.runs_on(&self.device)
+            }
+            Experts::PerExpert { .. } => false,
+        };
+        if !on_gpu || tokens * dims.active_experts > MAX_ROUTE_ROWS {
+            let routed = self.moe(layer, x)?;
+            return finish(metal::PostInput::Rows(&routed), visit);
+        }
+        let (x_f16, logits) = if tokens > POST_CONV_ROUTE_SUM_MAX_TOKENS
+            && let Some(router_h) = &layer.router_f16
+        {
+            let x_h = x.to_dtype(DType::F16)?.contiguous()?;
+            if let Some(l) =
+                super::inkling2_tensor_metal::try_f16_rows_times_transposed_f32(&x_h, router_h)?
+            {
+                (Some(x_h), l)
+            } else {
+                (Some(x_h), rows_times_transposed(x, &layer.router)?)
+            }
+        } else if tokens == 1
+            && hidden >= 256
+            && let Some(router_h) = &layer.router_f16
+            && let Some(l) = metal::try_f32_matvec_t_rows(x, router_h)?
+        {
+            (None, l)
+        } else {
+            (None, rows_times_transposed(x, &layer.router)?)
+        };
+        // Unique in-range IDs: the expert kernels skip their sanitize pass.
+        let (ids, weights) = metal::sigmoid_route(
+            &logits,
+            &layer.router_bias,
+            dims.active_experts,
+            dims.expert_scale as f32,
+        )?;
+        // Prompts over raw banks: every step from the gather to the route
+        // sum in the sorted-route kernels.
+        if tokens > POST_CONV_ROUTE_SUM_MAX_TOKENS
+            && let Experts::Raw(banks) = &layer.experts
+            && let Some(summed) = banks.gate_up.prompt_moe_with_half(
+                &banks.down,
+                x,
+                x_f16.as_ref(),
+                &ids,
+                &weights,
+                dims.situ_beta as f32,
+                dims.situ_linear_beta as f32,
+            )?
+        {
+            return finish(metal::PostInput::Rows(&summed), visit);
+        }
+        let input = x.reshape((tokens, 1, hidden))?;
+        let activate = |gate_up: &Tensor| -> Result<Tensor> {
+            Ok(metal::situ(
+                &gate_up.contiguous()?,
+                dims.situ_beta as f32,
+                dims.situ_linear_beta as f32,
+            )?)
+        };
+        // The expert activations stay alive until the post convolution has
+        // allocated its state. Freed earlier, Candle's pool can lend one of
+        // their large buffers to that small tensor, which then holds it for
+        // the whole request (a 1K-token prompt peaked 5 GB higher).
+        let (routed, _activations) = match &layer.experts {
+            Experts::Indexed(experts) => {
                 let gate_up = experts
                     .gate_up
                     .forward_metal_sanitized(&input, &ids, false)?;
-                let activated = metal::situ(
-                    &gate_up.contiguous()?,
-                    dims.situ_beta as f32,
-                    dims.situ_linear_beta as f32,
-                )?;
+                let activated = activate(&gate_up)?;
                 let routed = experts
                     .down
                     .forward_metal_sanitized(&activated, &ids, false)?;
-                if tokens <= POST_CONV_ROUTE_SUM_MAX_TOKENS {
-                    finish(
-                        metal::PostInput::Routes {
-                            routed: &routed,
-                            weights: &weights,
-                        },
-                        visit,
-                    )
-                } else {
-                    let summed = super::indexed_moe::weighted_route_sum(&routed, &weights)?;
-                    finish(metal::PostInput::Rows(&summed), visit)
+                (routed, vec![gate_up, activated])
+            }
+            Experts::Raw(banks) => {
+                // A few tokens: SiTU runs in the gate/up kernel, and gate_up +
+                // down share one grouped route plan on Metal.
+                let mut held = Vec::new();
+                let plan = banks.gate_up.group_routes(&ids)?;
+                let activated = match banks.gate_up.forward_situ_with_plan(
+                    &input,
+                    &ids,
+                    plan.as_ref(),
+                    dims.situ_beta as f32,
+                    dims.situ_linear_beta as f32,
+                )? {
+                    Some(activated) => activated,
+                    None => {
+                        let gate_up =
+                            banks
+                                .gate_up
+                                .forward_with_plan(&input, &ids, plan.as_ref())?;
+                        let activated = activate(&gate_up)?;
+                        held.push(gate_up);
+                        activated
+                    }
+                };
+                if tokens == 1
+                    && visit.rollback.is_none()
+                    && let Some((out, state)) = banks.down.forward_down_post_conv_1(
+                        &activated,
+                        &ids,
+                        &weights,
+                        visit.conv[3].as_ref(),
+                        &layer.moe_post_conv.weight,
+                        residual,
+                    )?
+                {
+                    visit.conv[3] = Some(state);
+                    return Ok(out);
                 }
+                let routed = banks
+                    .down
+                    .forward_with_plan(&activated, &ids, plan.as_ref())?;
+                held.push(activated);
+                (routed, held)
             }
-            _ => {
-                let routed = self.moe(layer, x)?;
-                finish(metal::PostInput::Rows(&routed), visit)
-            }
+            Experts::PerExpert { .. } => unreachable!("GPU banks were matched above"),
+        };
+        if tokens <= POST_CONV_ROUTE_SUM_MAX_TOKENS {
+            finish(
+                metal::PostInput::Routes {
+                    routed: &routed,
+                    weights: &weights,
+                },
+                visit,
+            )
+        } else {
+            let summed = super::indexed_moe::weighted_route_sum(&routed, &weights)?;
+            finish(metal::PostInput::Rows(&summed), visit)
         }
     }
 
@@ -1620,6 +2338,13 @@ impl Inkling2LoopStage {
         let dims = &self.dims;
         let (tokens, hidden) = x.dims2()?;
         let finish = |input: cuda::PostInput<'_>, visit: &mut VisitState| -> Result<Tensor> {
+            if visit.rollback.is_some() {
+                let rows = match &input {
+                    cuda::PostInput::Rows(rows) => (*rows).clone(),
+                    cuda::PostInput::Routes { routed, weights } => route_sum(routed, weights)?,
+                };
+                visit.note_conv(3, visit.conv[3].clone(), &rows, layer.moe_post_conv.width());
+            }
             let (out, state) = cuda::post_conv(
                 input,
                 visit.conv[3].as_ref(),
@@ -1646,8 +2371,25 @@ impl Inkling2LoopStage {
         };
         let routed = match &layer.experts {
             Experts::Raw(banks) => {
-                let gate_up = banks.gate_up.forward(&input, &ids)?;
-                banks.down.forward(&activate(&gate_up)?, &ids)?
+                let (beta, linear_beta) = (dims.situ_beta as f32, dims.situ_linear_beta as f32);
+                // One token: SiTU runs in the gate/up kernel; prompts apply it
+                // as the down product gathers its inputs.
+                if let Some(activated) =
+                    banks
+                        .gate_up
+                        .forward_situ(&input, &ids, beta, linear_beta)?
+                {
+                    banks.down.forward(&activated, &ids)?
+                } else {
+                    let gate_up = banks.gate_up.forward(&input, &ids)?;
+                    match banks
+                        .down
+                        .forward_after_situ(&gate_up, &ids, beta, linear_beta)?
+                    {
+                        Some(routed) => routed,
+                        None => banks.down.forward(&activate(&gate_up)?, &ids)?,
+                    }
+                }
             }
             Experts::Indexed(experts) => {
                 let gate_up = experts.gate_up.forward(&input, &ids)?;
@@ -1693,7 +2435,11 @@ impl Inkling2LoopStage {
         let gate_logits = query_side.narrow(1, q_dim, q_dim)?;
         let sinks = slice(&query_side, 2 * q_dim + rel_width, heads)?;
 
-        let log_scale = (!layer.sliding).then_some(&positions.log_scale);
+        let log_scale = if layer.sliding {
+            None
+        } else {
+            positions.log_scale.as_ref()
+        };
         // Queries carry the 1/sqrt(head_dim) score scale from here on.
         let q = scaled_clip(
             &query_side.narrow(1, 0, q_dim)?,
@@ -1741,6 +2487,8 @@ impl Inkling2LoopStage {
                 )
             }
         };
+        visit.note_conv(0, visit.conv[0].clone(), &k_lin, layer.k_conv.width());
+        visit.note_conv(1, visit.conv[1].clone(), &v_lin, layer.v_conv.width());
         let k = short_conv(
             &k_lin,
             &layer.k_conv,
@@ -1792,6 +2540,12 @@ impl Inkling2LoopStage {
             }
         };
         let projected = layer.output.forward(&gated)?;
+        visit.note_conv(
+            2,
+            visit.conv[2].clone(),
+            &projected,
+            layer.attention_post_conv.width(),
+        );
         let out = short_conv(
             &projected,
             &layer.attention_post_conv,
@@ -1801,12 +2555,7 @@ impl Inkling2LoopStage {
 
         if layer.sliding {
             // Later queries can only see the last `window - 1` keys.
-            let keep = dims.window - 1;
-            if keys > keep
-                && let Some(kv) = visit.kv.as_mut()
-            {
-                kv.evict_oldest(keys - keep)?;
-            }
+            visit.evict_to(dims.window - 1)?;
         }
         Ok(out)
     }
@@ -1847,25 +2596,48 @@ impl Inkling2LoopStage {
                 return Ok(None);
             }
             let first_key = positions.start + tokens - keys;
-            if tokens > PROMPT_ATTENTION_MIN_TOKENS
-                && let Some(attended) = super::inkling2_flash_metal::try_attention(
-                    &q.to_dtype(DType::F16)?,
+            if tokens > PROMPT_ATTENTION_MIN_TOKENS {
+                let q_f16 = if q.dtype() == DType::F16 {
+                    q.clone()
+                } else {
+                    q.to_dtype(DType::F16)?
+                };
+                if let Some(attended) = super::inkling2_flash_metal::try_attention(
+                    &q_f16,
                     k_all,
                     v_all,
                     bias,
                     layer.relative_extent,
                     layer.sliding.then_some(dims.window),
                     positions.start - first_key,
-                )?
-            {
-                return Ok(Some(super::inkling2_metal::gate_transpose(
-                    &attended,
-                    gate_logits,
-                )?));
+                )? {
+                    if matches!(layer.output, Projection::Bf16(_))
+                        && std::env::var_os("DINF_INKLING2_BF16_F32_PREFILL").is_none()
+                    {
+                        return Ok(Some(super::inkling2_metal::gate_transpose_f16(
+                            &attended,
+                            gate_logits,
+                        )?));
+                    }
+                    return Ok(Some(super::inkling2_metal::gate_transpose(
+                        &attended,
+                        gate_logits,
+                    )?));
+                }
             }
+            let q_f32 = if q.dtype() == DType::F32 {
+                q.clone()
+            } else {
+                q.to_dtype(DType::F32)?
+            };
+            let bias_f32 = if bias.dtype() == DType::F32 {
+                bias.clone()
+            } else {
+                bias.to_dtype(DType::F32)?
+            };
             let attended = super::inkling2_metal::attention(
-                q,
-                bias,
+                &q_f32,
+                &bias_f32,
                 k_all,
                 v_all,
                 dims.head_dim,
@@ -2190,6 +2962,7 @@ impl Inkling2LoopStage {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_inner(
         &self,
         input: StageInput,
@@ -2197,30 +2970,71 @@ impl Inkling2LoopStage {
         seq_len: usize,
         start_pos: usize,
         want_logits: bool,
-    ) -> Result<StageOutput> {
-        let tokens = match input {
-            StageInput::Tokens(tokens) => tokens,
-            StageInput::Activations { .. } => {
-                anyhow::bail!("Inkling 2 takes token IDs; embedding inputs are not supported yet")
+        features: &[usize],
+        all_logits: bool,
+    ) -> Result<(StageOutput, Vec<Tensor>)> {
+        // Input embeddings come from a multimodal prompt: token rows from
+        // `embed_tokens`, already normalized, and image rows from the vision
+        // projector.
+        let embedded = match input {
+            StageInput::Tokens(tokens) => {
+                anyhow::ensure!(
+                    !tokens.is_empty() && tokens.len() == seq_len,
+                    "Inkling 2 received {} tokens for a {seq_len}-token pass",
+                    tokens.len()
+                );
+                anyhow::ensure!(
+                    tokens
+                        .iter()
+                        .all(|&token| (token as usize) < self.vocab_size),
+                    "Inkling 2 token ID is outside the vocabulary"
+                );
+                Err(tokens)
+            }
+            StageInput::Activations {
+                tensor,
+                bidirectional_spans,
+                positions,
+            } => {
+                anyhow::ensure!(
+                    bidirectional_spans.is_empty() && positions.is_none(),
+                    "Inkling 2 input embeddings take plain causal positions"
+                );
+                let tensor = match tensor.rank() {
+                    3 if tensor.dim(0)? == 1 => tensor.squeeze(0)?,
+                    2 => tensor,
+                    _ => anyhow::bail!("Inkling 2 input embeddings must be [tokens, hidden]"),
+                };
+                anyhow::ensure!(
+                    tensor.dims() == [seq_len, self.dims.hidden] && seq_len > 0,
+                    "Inkling 2 input embeddings {:?} differ from [{seq_len}, {}]",
+                    tensor.dims(),
+                    self.dims.hidden
+                );
+                Ok(tensor
+                    .to_device(&self.device)?
+                    .to_dtype(DType::F32)?
+                    .contiguous()?)
             }
         };
+        let visits = self.schedule.len();
         anyhow::ensure!(
-            !tokens.is_empty() && tokens.len() == seq_len,
-            "Inkling 2 received {} tokens for a {seq_len}-token pass",
-            tokens.len()
+            features.iter().all(|&id| id <= visits),
+            "Inkling 2 draft features name visits past {visits}"
         );
+        // Every row's logits are a draft verification: it keeps what a
+        // rollback of its rejected rows needs.
+        let verify = all_logits;
         anyhow::ensure!(
-            tokens
-                .iter()
-                .all(|&token| (token as usize) < self.vocab_size),
-            "Inkling 2 token ID is outside the vocabulary"
+            !verify || (want_logits && seq_len <= MAX_CHUNK_TOKENS),
+            "Inkling 2 verifies at most {MAX_CHUNK_TOKENS} rows in one pass"
         );
         let slot = cache
             .first_mut()
             .context("Inkling 2 needs one cache slot")?;
         // Work on a checkpoint so an error leaves the request state untouched.
         let mut state = match slot.as_ref() {
-            None => Inkling2Cache::new(self.schedule.len()),
+            None => Inkling2Cache::new(visits),
             Some(LayerCache::Inkling2(existing)) => existing.checkpoint()?,
             Some(_) => anyhow::bail!("Inkling 2 cache slot holds another model's state"),
         };
@@ -2229,46 +3043,167 @@ impl Inkling2LoopStage {
             "Inkling 2 cache holds {} tokens but the pass starts at {start_pos}",
             state.position
         );
+        if verify {
+            for visit in &mut state.visits {
+                visit.rollback = Some(VisitRollback::default());
+            }
+            state.pending = Some(seq_len);
+        }
 
+        let inner = features
+            .iter()
+            .copied()
+            .filter(|&id| id < visits)
+            .collect::<Vec<_>>();
+        let final_wanted = features.contains(&visits);
+        let mut captured = vec![Vec::new(); inner.len()];
+        let mut final_states = Vec::new();
         let mut last = None;
-        for chunk in tokens.chunks(MAX_CHUNK_TOKENS) {
-            last = Some(self.forward_chunk(chunk, &mut state)?);
+        let mut keep = |states: Vec<Tensor>, chunk_features: Vec<Tensor>| -> Result<()> {
+            for (rows, feature) in captured.iter_mut().zip(chunk_features) {
+                rows.push(feature);
+            }
+            if final_wanted || all_logits {
+                let (current, finished) = states.split_last().expect("hidden state");
+                let finished = Blocks {
+                    items: finished.to_vec(),
+                };
+                final_states.push(finished.mix_normed(
+                    current,
+                    &self.final_query,
+                    &self.output_norm,
+                    self.dims.rms_eps,
+                )?);
+            }
+            last = Some(states);
+            Ok(())
+        };
+        match &embedded {
+            Err(tokens) => {
+                for chunk in tokens.chunks(MAX_CHUNK_TOKENS) {
+                    let (states, features) = self.forward_chunk(chunk, &mut state, &inner)?;
+                    keep(states, features)?;
+                }
+            }
+            Ok(rows) => {
+                for start in (0..seq_len).step_by(MAX_CHUNK_TOKENS) {
+                    let len = MAX_CHUNK_TOKENS.min(seq_len - start);
+                    let chunk = rows.narrow(0, start, len)?.contiguous()?;
+                    let (states, features) = self.forward_embedded(chunk, &mut state, &inner)?;
+                    keep(states, features)?;
+                }
+            }
         }
         let states = last.context("Inkling 2 pass had no tokens")?;
         *slot = Some(LayerCache::Inkling2(Box::new(state)));
 
-        let final_rows = states
-            .iter()
-            .map(|state| {
-                let rows = state.dim(0)?;
-                Ok(state.narrow(0, rows - 1, 1)?.contiguous()?)
+        let cat = |rows: &[Tensor]| -> Result<Tensor> {
+            Ok(match rows {
+                [one] => one.clone(),
+                rows => Tensor::cat(rows, 0)?,
             })
-            .collect::<Result<Vec<_>>>()?;
-        let (current, finished) = final_rows.split_last().expect("hidden state");
-        if !want_logits {
-            return Ok(StageOutput::Activations(current.clone()));
-        }
-        let finished = Blocks {
-            items: finished.to_vec(),
         };
-        let normed = finished.mix_normed(
-            current,
-            &self.final_query,
-            &self.output_norm,
-            self.dims.rms_eps,
-        )?;
-        let logits = self
-            .output
-            .forward(&normed)?
-            .narrow(1, 0, self.vocab_size)?
-            .squeeze(0)?;
-        let logits = if self.logit_softcap > 0.0 {
+        let final_normed = if final_states.is_empty() {
+            None
+        } else {
+            Some(cat(&final_states)?)
+        };
+        let mut outputs = Vec::with_capacity(features.len());
+        let mut inner_rows = captured.into_iter();
+        for &id in features {
+            outputs.push(if id == visits {
+                final_normed.clone().context("final state was not kept")?
+            } else {
+                cat(&inner_rows.next().context("feature rows are missing")?)?
+            });
+        }
+
+        let normed = match (&final_normed, all_logits) {
+            (Some(all), true) => all.clone(),
+            (Some(all), false) => all.narrow(0, all.dim(0)? - 1, 1)?,
+            (None, _) => {
+                let final_rows = states
+                    .iter()
+                    .map(|state| {
+                        let rows = state.dim(0)?;
+                        Ok(state.narrow(0, rows - 1, 1)?.contiguous()?)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let (current, finished) = final_rows.split_last().expect("hidden state");
+                if !want_logits {
+                    return Ok((StageOutput::Activations(current.clone()), outputs));
+                }
+                let finished = Blocks {
+                    items: finished.to_vec(),
+                };
+                finished.mix_normed(
+                    current,
+                    &self.final_query,
+                    &self.output_norm,
+                    self.dims.rms_eps,
+                )?
+            }
+        };
+        if !want_logits {
+            let rows = normed.dim(0)?;
+            return Ok((
+                StageOutput::Activations(normed.narrow(0, rows - 1, 1)?),
+                outputs,
+            ));
+        }
+        let logits = self.head_logits(&normed)?;
+        let logits = if all_logits {
+            logits
+        } else {
+            logits.squeeze(0)?
+        };
+        Ok((StageOutput::Logits(logits.contiguous()?), outputs))
+    }
+
+    /// Softcapped logits over the unpadded vocabulary for `[rows, hidden]`
+    /// normalized states.
+    fn head_logits(&self, normed: &Tensor) -> Result<Tensor> {
+        #[cfg(target_os = "macos")]
+        if let Projection::Bf16(weight) = &self.output
+            && normed.device().is_metal()
+            && normed.rank() == 2
+            && (1..=kernels::BF16_MATVEC_MAX_ROWS).contains(&normed.dim(0)?)
+        {
+            return Ok(kernels::bf16_matvec_with_softcap(
+                normed,
+                weight,
+                Some(self.vocab_size),
+                self.logit_softcap as f32,
+            )?);
+        }
+        #[cfg(target_os = "macos")]
+        if let Projection::Tensor(matmul) = &self.output
+            && normed.device().is_metal()
+            && normed.rank() == 2
+            && normed.dim(0)? == 1
+            && normed.dtype() == DType::F32
+            && let Some((w_u8, out_dim, in_dim)) = matmul.q8_0_weights()
+            && in_dim.is_multiple_of(32)
+        {
+            return Ok(kernels::q8_0_matvec_with_softcap(
+                normed,
+                w_u8,
+                out_dim,
+                in_dim,
+                Some(self.vocab_size),
+                self.logit_softcap as f32,
+            )?);
+        }
+        let logits = self.output.forward(normed)?.narrow(1, 0, self.vocab_size)?;
+        #[cfg(target_os = "macos")]
+        if self.logit_softcap > 0.0 && logits.device().is_metal() && logits.dtype() == DType::F32 {
+            return Ok(kernels::softcap_f32(&logits, self.logit_softcap as f32)?);
+        }
+        Ok(if self.logit_softcap > 0.0 {
             softcap(&logits, self.logit_softcap)?
         } else {
             logits
-        };
-        let logits = logits.contiguous()?;
-        Ok(StageOutput::Logits(logits))
+        })
     }
 }
 
@@ -2295,7 +3230,8 @@ impl ModelArchitecture for Inkling2LoopStage {
         seq_len: usize,
         start_pos: usize,
     ) -> Result<StageOutput> {
-        self.forward_inner(input, cache, seq_len, start_pos, true)
+        self.forward_inner(input, cache, seq_len, start_pos, true, &[], false)
+            .map(|(output, _)| output)
     }
 
     fn forward_prefill_cache_only(
@@ -2305,12 +3241,70 @@ impl ModelArchitecture for Inkling2LoopStage {
         seq_len: usize,
         start_pos: usize,
     ) -> Result<StageOutput> {
-        self.forward_inner(input, cache, seq_len, start_pos, false)
+        self.forward_inner(input, cache, seq_len, start_pos, false, &[], false)
+            .map(|(output, _)| output)
     }
 
+    /// `layer_ids` are visit indices; the visit count names the final
+    /// normalized state. Every row's logits mean a draft verification,
+    /// which keeps rollback state until the commit.
+    fn forward_with_layer_inputs(
+        &self,
+        input: StageInput,
+        cache: &mut [Option<LayerCache>],
+        seq_len: usize,
+        start_pos: usize,
+        layer_ids: &[usize],
+        all_logits: bool,
+    ) -> Result<(StageOutput, Vec<Tensor>)> {
+        self.forward_inner(
+            input, cache, seq_len, start_pos, true, layer_ids, all_logits,
+        )
+    }
+
+    fn speculative_feature_limit(&self) -> usize {
+        self.schedule.len() + 1
+    }
+
+    fn speculative_embed_normed(&self, tokens: &[u32]) -> Result<Tensor> {
+        self.embed_tokens(tokens)
+    }
+
+    fn speculative_output_head(&self, rows: &Tensor) -> Result<Tensor> {
+        Ok(self.output.forward(rows)?.narrow(1, 0, self.vocab_size)?)
+    }
+
+    fn speculative_output_bf16_weight(&self) -> Option<Tensor> {
+        #[cfg(target_os = "macos")]
+        if let Projection::Bf16(weight) = &self.output
+            && weight.device().is_metal()
+        {
+            return weight.narrow(0, 0, self.vocab_size).ok();
+        }
+        None
+    }
+
+    /// Normalized token embeddings, as the reference's embedding module
+    /// returns them; image rows replace placeholders after this norm.
     fn embed_tokens(&self, tokens: &[u32]) -> Result<Tensor> {
+        #[cfg(target_os = "macos")]
+        if tokens.len() == 1
+            && let Embedding::Q8 {
+                bytes,
+                rows,
+                hidden,
+            } = &self.embedding
+            && bytes.device().is_metal()
+        {
+            let embedded = kernels::q8_embed_1(bytes, *rows, *hidden, tokens[0])?;
+            return rms_norm(&embedded, &self.embedding_norm, self.dims.rms_eps);
+        }
         let ids = Tensor::from_slice(tokens, tokens.len(), &self.device)?;
-        Ok(self.embedding.index_select(&ids, 0)?.to_dtype(DType::F32)?)
+        rms_norm(
+            &self.embedding.lookup(&ids)?,
+            &self.embedding_norm,
+            self.dims.rms_eps,
+        )
     }
 
     fn family(&self) -> &str {
@@ -2372,6 +3366,41 @@ fn dims_from_metadata(md: &GgufMetadata, config: &Inkling2LoopMetadata) -> Resul
     })
 }
 
+/// BF16 prompt rows on the Metal 4 matrix units (activations staged in
+/// half), unless `DINF_INKLING2_BF16_F32_PREFILL` asks for the F32 product.
+#[cfg(all(target_os = "macos", not(feature = "cuda")))]
+fn bf16_prefill(x: &Tensor, weight: &Tensor) -> candle_core::Result<Option<Tensor>> {
+    if std::env::var_os("DINF_INKLING2_BF16_F32_PREFILL").is_some() {
+        return Ok(None);
+    }
+    super::tensor_qmatmul_metal::bf16_prefill_matmul(x, weight)
+}
+
+/// A projection's weight rows: a Candle tensor in a GGML type, or BF16
+/// rows the Metal loader handed over typed.
+#[derive(Clone)]
+enum Part {
+    Q(Arc<QTensor>),
+    Bf16(Tensor),
+}
+
+impl Part {
+    fn dims(&self) -> &[usize] {
+        match self {
+            Self::Q(tensor) => tensor.shape().dims(),
+            Self::Bf16(tensor) => tensor.dims(),
+        }
+    }
+
+    /// The GGML type, or `None` for typed BF16 rows.
+    fn ggml_type(&self) -> Option<GgmlDType> {
+        match self {
+            Self::Q(tensor) => Some(tensor.dtype()),
+            Self::Bf16(_) => None,
+        }
+    }
+}
+
 struct Weights<'a> {
     tensors: &'a mut HashMap<String, Arc<QTensor>>,
     /// Tensors in GGUF types Candle lacks (NVFP4 and IQ4_NL expert banks).
@@ -2387,15 +3416,26 @@ impl Weights<'_> {
     }
 
     fn has(&self, name: &str) -> bool {
-        self.tensors.contains_key(name)
+        self.tensors.contains_key(name) || self.raw.contains_key(name)
+    }
+
+    /// `name` as a Candle tensor, or as typed BF16 rows from the Metal loader.
+    fn take_part(&mut self, name: &str) -> Result<Part> {
+        if let Some(raw) = self.raw.get(name)
+            && raw.bytes().dtype() == DType::BF16
+        {
+            let raw = self.raw.remove(name).expect("present");
+            return Ok(Part::Bf16(raw.bytes().clone()));
+        }
+        Ok(Part::Q(self.take(name)?))
     }
 
     fn dense(&mut self, name: &str) -> Result<Tensor> {
-        Ok(self
-            .take(name)?
-            .dequantize(self.device)?
-            .to_dtype(DType::F32)?
-            .contiguous()?)
+        let values = match self.take_part(name)? {
+            Part::Q(tensor) => tensor.dequantize(self.device)?,
+            Part::Bf16(tensor) => tensor,
+        };
+        Ok(values.to_dtype(DType::F32)?.contiguous()?)
     }
 
     fn shaped(&mut self, name: &str, shape: &[usize]) -> Result<Tensor> {
@@ -2412,31 +3452,31 @@ impl Weights<'_> {
         self.shaped(name, &[len])
     }
 
-    fn rows(&mut self, name: &str, rows: usize, cols: usize) -> Result<Arc<QTensor>> {
-        let tensor = self.take(name)?;
+    fn rows(&mut self, name: &str, rows: usize, cols: usize) -> Result<Part> {
+        let part = self.take_part(name)?;
         anyhow::ensure!(
-            tensor.shape().dims() == [rows, cols],
+            part.dims() == [rows, cols],
             "Inkling 2 tensor {name} has shape {:?}, expected [{rows}, {cols}]",
-            tensor.shape().dims()
+            part.dims()
         );
-        Ok(tensor)
+        Ok(part)
     }
 
     /// One projection whose output rows are `parts` in order. Each output row
     /// is computed independently, so the results equal separate products.
     /// Parts of one quantization type share one matrix; a stack of several
     /// types is [`Projection::Joined`].
-    fn stacked(&mut self, parts: &[Arc<QTensor>]) -> Result<Projection> {
+    fn stacked(&mut self, parts: &[Part]) -> Result<Projection> {
         let first = parts
             .first()
             .context("Inkling 2 stacks at least one projection")?;
-        let cols = first.shape().dims()[1];
+        let cols = first.dims()[1];
         anyhow::ensure!(
-            parts.iter().all(|part| part.shape().dims()[1] == cols),
+            parts.iter().all(|part| part.dims()[1] == cols),
             "Inkling 2 stacked projections differ in width"
         );
         let mut runs = parts
-            .chunk_by(|a, b| a.dtype() == b.dtype())
+            .chunk_by(|a, b| a.ggml_type() == b.ggml_type())
             .map(|run| self.stack_run(run, cols))
             .collect::<Result<Vec<_>>>()?;
         Ok(if runs.len() == 1 {
@@ -2447,13 +3487,30 @@ impl Weights<'_> {
     }
 
     /// One matrix of `run`'s rows; every part has one quantization type.
-    fn stack_run(&self, run: &[Arc<QTensor>], cols: usize) -> Result<Projection> {
+    fn stack_run(&self, run: &[Part], cols: usize) -> Result<Projection> {
         if let [only] = run {
-            return Projection::new(Arc::clone(only), self.device);
+            return Projection::from_part(only.clone(), self.device);
         }
+        if run[0].ggml_type().is_none() {
+            let rows = run
+                .iter()
+                .map(|part| match part {
+                    Part::Bf16(tensor) => Ok(tensor),
+                    Part::Q(_) => anyhow::bail!("Inkling 2 BF16 run holds a GGML tensor"),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Projection::from_part(Part::Bf16(Tensor::cat(&rows, 0)?), self.device);
+        }
+        let run = run
+            .iter()
+            .map(|part| match part {
+                Part::Q(tensor) => Ok(Arc::clone(tensor)),
+                Part::Bf16(_) => anyhow::bail!("Inkling 2 GGML run holds BF16 rows"),
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut bytes = Vec::new();
         let mut rows = 0;
-        for part in run {
+        for part in &run {
             bytes.extend_from_slice(&part.data()?);
             rows += part.shape().dims()[0];
         }
@@ -2469,13 +3526,8 @@ impl Weights<'_> {
     }
 
     fn qmatmul(&mut self, name: &str, rows: usize, cols: usize) -> Result<Projection> {
-        let tensor = self.take(name)?;
-        anyhow::ensure!(
-            tensor.shape().dims() == [rows, cols],
-            "Inkling 2 tensor {name} has shape {:?}, expected [{rows}, {cols}]",
-            tensor.shape().dims()
-        );
-        Projection::new(tensor, self.device)
+        let part = self.rows(name, rows, cols)?;
+        Projection::from_part(part, self.device)
     }
 }
 
@@ -2563,11 +3615,11 @@ fn build_layer(
     let v = weights.rows(&p("attn_v.weight"), kv_dim, hidden)?;
     let key_value = if sliding {
         KeyValueProjections::Sliding {
-            kv: weights.stacked(&[Arc::clone(&k), Arc::clone(&v)])?,
+            kv: weights.stacked(&[k.clone(), v.clone()])?,
             separate: if looped_layer {
                 Some((
-                    Projection::new(k, weights.device)?,
-                    Projection::new(v, weights.device)?,
+                    Projection::from_part(k, weights.device)?,
+                    Projection::from_part(v, weights.device)?,
                 ))
             } else {
                 None
@@ -2604,6 +3656,19 @@ fn build_layer(
         weights.raw.remove(&gate_up_name),
         weights.raw.remove(&down_name),
     ) {
+        // Candle-type banks the loader left on the GPU as bytes.
+        #[cfg(target_os = "macos")]
+        (Some(gate_up), Some(down))
+            if gate_up.dtype().candle_dtype().is_some()
+                && down.dtype().candle_dtype().is_some() =>
+        {
+            anyhow::ensure!(
+                gate_up_scales.is_none() && down_scales.is_none(),
+                "Inkling 2 layer {layer} has per-expert scales on Candle-type experts"
+            );
+            device_experts(&gate_up, &down, experts, dims)
+                .with_context(|| format!("Inkling 2 layer {layer} experts"))?
+        }
         (Some(gate_up), Some(down)) => {
             let ffn = dims.expert_ffn;
             // MXFP8 banks carry their block scales in `.mx_scale`.
@@ -2677,11 +3742,24 @@ fn build_layer(
             ],
             0,
         )?;
+        #[cfg(target_os = "macos")]
+        let (qkv_down_f16, qkv_forget_gain_f16) = if qkv_down.device().is_metal() {
+            (
+                Some(qkv_down.to_dtype(DType::F16)?.contiguous()?),
+                Some(qkv_forget_gain.to_dtype(DType::F16)?.contiguous()?),
+            )
+        } else {
+            (None, None)
+        };
         Some(LoopWeights {
             message_query: weights.shaped(&p("loop_msg_query.weight"), &[4, hidden])?,
             gates,
             qkv_down,
             qkv_forget_gain,
+            #[cfg(target_os = "macos")]
+            qkv_down_f16,
+            #[cfg(target_os = "macos")]
+            qkv_forget_gain_f16,
         })
     } else {
         None
@@ -2711,6 +3789,12 @@ fn build_layer(
             .vector(&p("ffn_res_query.weight"), hidden)?
             .reshape((1, hidden))?,
         moe_norm: weights.vector(&p("ffn_norm.weight"), hidden)?,
+        #[cfg(target_os = "macos")]
+        router_f16: if router.device().is_metal() {
+            Some(router.to_dtype(DType::F16)?.contiguous()?)
+        } else {
+            None
+        },
         router,
         router_bias,
         experts,
@@ -2822,8 +3906,54 @@ fn build_experts(
     })
 }
 
+/// Indexed experts over banks already on the Metal device as GGUF bytes.
+#[cfg(target_os = "macos")]
+fn device_experts(
+    gate_up: &RawTensor,
+    down: &RawTensor,
+    experts: usize,
+    dims: &Dims,
+) -> Result<Experts> {
+    use super::indexed_moe::IndexedMoeMatMul;
+    let (hidden, ffn) = (dims.hidden, dims.expert_ffn);
+    anyhow::ensure!(
+        gate_up.shape() == [experts, 2 * ffn, hidden] && down.shape() == [experts, hidden, ffn],
+        "Inkling 2 expert shapes {:?} / {:?} differ from [{experts}, {}, {hidden}] / [{experts}, {hidden}, {ffn}]",
+        gate_up.shape(),
+        down.shape(),
+        2 * ffn
+    );
+    // The loader leaves only banks the indexed kernels read (32-wide rows).
+    anyhow::ensure!(
+        hidden.is_multiple_of(32) && ffn.is_multiple_of(32),
+        "Inkling 2 expert rows are not 32-wide"
+    );
+    let bank = |raw: &RawTensor, out_dim: usize, in_dim: usize| -> Result<IndexedMoeMatMul> {
+        // Typed BF16 banks run as F16, as the host path narrows them.
+        if raw.bytes().dtype() == DType::BF16 {
+            let bytes = super::raw_experts_metal::bf16_bank_as_f16_bytes(raw.bytes())?;
+            return IndexedMoeMatMul::from_metal_bytes(
+                &bytes,
+                GgmlDType::F16,
+                experts,
+                out_dim,
+                in_dim,
+            );
+        }
+        let dtype = raw
+            .dtype()
+            .candle_dtype()
+            .context("Inkling 2 device expert bank has no Candle type")?;
+        IndexedMoeMatMul::from_metal_bytes(raw.bytes(), dtype, experts, out_dim, in_dim)
+    };
+    Ok(Experts::Indexed(Box::new(IndexedExperts {
+        gate_up: bank(gate_up, 2 * ffn, hidden)?,
+        down: bank(down, hidden, ffn)?,
+    })))
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn cpu_tensor(values: &[f32], shape: &[usize]) -> Tensor {
@@ -2832,7 +3962,7 @@ mod tests {
 
     /// A six-layer synthetic model: blocks of two, core layers 2..4 looped
     /// three times, a four-token window, and log scaling from position 4.
-    fn tiny_stage() -> Result<Inkling2LoopStage> {
+    pub(crate) fn tiny_stage() -> Result<Inkling2LoopStage> {
         tiny_stage_with(&Device::Cpu, 16, 4, 2, 8)
     }
 
@@ -2844,19 +3974,41 @@ mod tests {
         kv_heads: usize,
         head_dim: usize,
     ) -> Result<Inkling2LoopStage> {
-        tiny_stage_full(device, hidden, heads, kv_heads, head_dim, false)
+        tiny_stage_full(device, hidden, heads, kv_heads, head_dim, Banks::F32)
     }
 
-    /// [`tiny_stage_with`], optionally with NVFP4 expert banks and per-expert
-    /// scales, which need `hidden` and the experts' width to be multiples of 64.
+    /// How the synthetic model stores its expert banks.
+    #[derive(Clone, Copy, PartialEq)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    enum Banks {
+        F32,
+        /// NVFP4 banks with per-expert scales; `hidden` and the experts'
+        /// width must be multiples of 64.
+        Nvfp4,
+        /// Q8_0 banks and token table, as Candle tensors (`device_bytes`
+        /// false: experts on the CPU, as the plain loader places them) or as
+        /// raw bytes on the device, as the loader hands them over on Metal.
+        Q8 {
+            device_bytes: bool,
+        },
+        /// BF16 banks, projections, output head and token table, as Candle
+        /// tensors (experts on the CPU) or typed BF16 on the device, as the
+        /// Metal loader hands them over.
+        Bf16 {
+            device_bytes: bool,
+        },
+    }
+
+    /// [`tiny_stage_with`] with the given expert banks.
     fn tiny_stage_full(
         device: &Device,
         hidden: usize,
         heads: usize,
         kv_heads: usize,
         head_dim: usize,
-        nvfp4: bool,
+        banks: Banks,
     ) -> Result<Inkling2LoopStage> {
+        let nvfp4 = banks == Banks::Nvfp4;
         use crate::gguf_loader::{LayerRange, parse_gguf_metadata};
         use candle_core::quantized::{GgmlDType, gguf_file::Value};
 
@@ -2984,7 +4136,7 @@ mod tests {
             add(b("ffn_gate_inp.weight"), &[experts, hidden], 1.0);
             add(b("exp_probs_b.bias"), &[experts], 0.1);
             if nvfp4 {
-                let raw_device = if device.is_cuda() {
+                let raw_device = if device.is_cuda() || device.is_metal() {
                     device
                 } else {
                     &Device::Cpu
@@ -3035,6 +4187,91 @@ mod tests {
                         &[hidden, rank],
                         fan(rank),
                     );
+                }
+            }
+        }
+        if let Banks::Q8 { device_bytes } = banks {
+            let names = tensors
+                .keys()
+                .filter(|name| {
+                    (name.contains("_exps.") && name.ends_with(".weight"))
+                        || *name == "token_embd.weight"
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for name in names {
+                let values = tensors.remove(&name).unwrap().dequantize(&Device::Cpu)?;
+                let q8 = QTensor::quantize(&values, GgmlDType::Q8_0)?;
+                let dims = values.dims().to_vec();
+                if device_bytes {
+                    assert!(loads_as_device_bytes(&name, GgmlDType::Q8_0, device));
+                    let bytes = q8.data()?.into_owned();
+                    let len = bytes.len();
+                    let raw = RawTensor::new(
+                        dims,
+                        crate::deepseek4_gguf::DeepSeek4DType::Q8_0,
+                        Tensor::from_vec(bytes, len, device)?,
+                    )?;
+                    raw_tensors.insert(name, Arc::new(raw));
+                } else {
+                    let placed = if name.contains("_exps.") {
+                        q8
+                    } else {
+                        candle_core::quantized::ggml_file::qtensor_from_ggml(
+                            GgmlDType::Q8_0,
+                            &q8.data()?,
+                            dims,
+                            device,
+                        )?
+                    };
+                    tensors.insert(name, Arc::new(placed));
+                }
+            }
+        }
+        if let Banks::Bf16 { device_bytes } = banks {
+            const BF16_TENSORS: [&str; 9] = [
+                "attn_q.weight",
+                "attn_gate.weight",
+                "attn_rel.weight",
+                "attn_sink_proj.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_k_conv_proj.weight",
+                "attn_v_conv_proj.weight",
+                "attn_output.weight",
+            ];
+            let names = tensors
+                .keys()
+                .filter(|name| {
+                    (name.contains("_exps.") && name.ends_with(".weight"))
+                        || *name == "token_embd.weight"
+                        || *name == "output.weight"
+                        || BF16_TENSORS.iter().any(|suffix| name.ends_with(suffix))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for name in names {
+                let values = tensors.remove(&name).unwrap().dequantize(&Device::Cpu)?;
+                let dims = values.dims().to_vec();
+                if device_bytes {
+                    assert!(loads_as_device_bytes(&name, GgmlDType::BF16, device));
+                    let raw =
+                        RawTensor::bf16(dims, values.to_dtype(DType::BF16)?.to_device(device)?)?;
+                    raw_tensors.insert(name, Arc::new(raw));
+                } else {
+                    let place = if name.contains("_exps.") {
+                        &Device::Cpu
+                    } else {
+                        device
+                    };
+                    let bf16 = QTensor::quantize(&values, GgmlDType::BF16)?;
+                    let placed = candle_core::quantized::ggml_file::qtensor_from_ggml(
+                        GgmlDType::BF16,
+                        &bf16.data()?,
+                        dims,
+                        place,
+                    )?;
+                    tensors.insert(name, Arc::new(placed));
                 }
             }
         }
@@ -3102,6 +4339,134 @@ mod tests {
         Ok(())
     }
 
+    /// Q8_0 experts and token table handed over as raw bytes on the GPU run
+    /// exactly as the same weights loaded as Candle tensors.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn device_byte_banks_match_candle_banks() -> Result<()> {
+        let Some(metal) = metal_device() else {
+            return Ok(());
+        };
+        let candle = tiny_stage_full(
+            &metal,
+            64,
+            2,
+            1,
+            128,
+            Banks::Q8 {
+                device_bytes: false,
+            },
+        )?;
+        let bytes = tiny_stage_full(&metal, 64, 2, 1, 128, Banks::Q8 { device_bytes: true })?;
+        assert!(matches!(candle.embedding, Embedding::Dense(_)));
+        assert!(matches!(bytes.embedding, Embedding::Q8 { .. }));
+        let tokens = (0..13u32).map(|i| (i * 7 + 3) % 30).collect::<Vec<_>>();
+        for chunks in [&[13usize][..], &[5, 4, 4][..], &[1; 13][..]] {
+            let expected = run_chunks(&candle, &tokens, chunks)?;
+            let actual = run_chunks(&bytes, &tokens, chunks)?;
+            assert!(
+                expected
+                    .iter()
+                    .zip(&actual)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "chunks {chunks:?}: device-byte banks changed the logits"
+            );
+        }
+        // The packed table's rows widen exactly, as the CPU dequantizes them.
+        let table = QTensor::quantize(
+            &Tensor::from_vec(
+                (0..5 * 64).map(|i| (i as f32 * 0.37).sin() * 3.0).collect(),
+                (5, 64),
+                &Device::Cpu,
+            )?,
+            GgmlDType::Q8_0,
+        )?;
+        let bytes = table.data()?.into_owned();
+        let len = bytes.len();
+        let ids = Tensor::new(&[4u32, 0, 4, 2], &metal)?;
+        let rows = kernels::q8_rows(&Tensor::from_vec(bytes, len, &metal)?, 5, 64, &ids)?;
+        let expected = table
+            .dequantize(&Device::Cpu)?
+            .index_select(&Tensor::new(&[4u32, 0, 4, 2], &Device::Cpu)?, 0)?;
+        assert_eq!(rows.to_vec2::<f32>()?, expected.to_vec2::<f32>()?);
+        Ok(())
+    }
+
+    /// NVFP4 expert banks with per-expert scales in the Metal kernels
+    /// against the plain CPU path, in one pass and in chunks.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fused_stage_with_nvfp4_banks_matches_plain_stage() -> Result<()> {
+        let Some(metal) = metal_device() else {
+            return Ok(());
+        };
+        let cpu = tiny_stage_full(&Device::Cpu, 64, 2, 1, 128, Banks::Nvfp4)?;
+        let gpu = tiny_stage_full(&metal, 64, 2, 1, 128, Banks::Nvfp4)?;
+        assert!(gpu.layers.iter().all(|layer| match &layer.experts {
+            Experts::Raw(banks) => banks.gate_up.runs_on(&metal) && banks.down.runs_on(&metal),
+            _ => false,
+        }));
+        for (length, chunks) in [
+            (13usize, vec![13usize]),
+            (13, vec![5, 4, 4]),
+            (13, vec![1; 13]),
+            (40, vec![40]),
+            (40, vec![24, 16]),
+        ] {
+            let tokens = (0..length as u32)
+                .map(|i| (i * 7 + 3) % 30)
+                .collect::<Vec<_>>();
+            let expected = run_chunks(&cpu, &tokens, &[length])?;
+            let actual = run_chunks(&gpu, &tokens, &chunks)?;
+            let error = expected
+                .iter()
+                .zip(&actual)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            // Keys and values are f16 in the cache.
+            assert!(
+                error < 5e-3,
+                "{length} tokens in {chunks:?}: max logit difference {error}"
+            );
+        }
+        Ok(())
+    }
+
+    /// BF16 weights typed on the GPU (experts narrowed to F16 there) run as
+    /// the same weights loaded as Candle tensors with experts on the CPU.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn device_bf16_weights_match_candle_bf16_weights() -> Result<()> {
+        let Some(metal) = metal_device() else {
+            return Ok(());
+        };
+        let candle = Banks::Bf16 {
+            device_bytes: false,
+        };
+        let typed = Banks::Bf16 { device_bytes: true };
+        let candle = tiny_stage_full(&metal, 64, 2, 1, 128, candle)?;
+        let typed = tiny_stage_full(&metal, 64, 2, 1, 128, typed)?;
+        assert!(matches!(&typed.output, Projection::Bf16(_)));
+        assert!(matches!(&typed.layers[0].experts, Experts::Indexed(_)));
+        let tokens = (0..13u32).map(|i| (i * 7 + 3) % 30).collect::<Vec<_>>();
+        for chunks in [&[13usize][..], &[5, 4, 4][..], &[1; 13][..]] {
+            let expected = run_chunks(&candle, &tokens, chunks)?;
+            let actual = run_chunks(&typed, &tokens, chunks)?;
+            let error = expected
+                .iter()
+                .zip(&actual)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            // Few-row BF16 projections sum in another order than the F32
+            // product; everything else is the same arithmetic.
+            assert!(
+                error < 1e-3,
+                "chunks {chunks:?}: max logit difference {error}"
+            );
+        }
+        Ok(())
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn fused_stage_is_deterministic() -> Result<()> {
@@ -3148,6 +4513,40 @@ mod tests {
                 "chunks {chunks:?}: max logit difference {diff}"
             );
         }
+        Ok(())
+    }
+
+    /// A prompt given as embeddings (the multimodal path) runs as its tokens
+    /// do, and replacing rows changes the logits.
+    #[test]
+    fn embedded_rows_match_tokens() -> Result<()> {
+        let stage = tiny_stage()?;
+        let tokens = (0..13u32).map(|i| (i * 7 + 3) % 30).collect::<Vec<_>>();
+        let whole = run_chunks(&stage, &tokens, &[13])?;
+        let run = |rows: Tensor| -> Result<Vec<f32>> {
+            let mut cache: Vec<Option<LayerCache>> =
+                (0..stage.layer_count()).map(|_| None).collect();
+            let input = StageInput::Activations {
+                tensor: rows,
+                bidirectional_spans: Vec::new(),
+                positions: None,
+            };
+            match stage.forward(input, &mut cache, 13, 0)? {
+                StageOutput::Logits(logits) => Ok(logits.to_vec1::<f32>()?),
+                StageOutput::Activations(_) => anyhow::bail!("expected logits"),
+            }
+        };
+        let rows = stage.embed_tokens(&tokens)?;
+        let embedded = run(rows.clone())?;
+        let diff = whole
+            .iter()
+            .zip(&embedded)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(diff < 1e-5, "max logit difference {diff}");
+        let image = Tensor::ones((4, rows.dim(1)?), DType::F32, rows.device())?;
+        let spliced = Tensor::cat(&[rows.narrow(0, 0, 3)?, image, rows.narrow(0, 7, 6)?], 0)?;
+        assert_ne!(run(spliced)?, whole);
         Ok(())
     }
 
@@ -3414,6 +4813,44 @@ mod tests {
                 max_difference(&bias, &bias_gpu) < 1e-4,
                 "bias {tokens} {extent}"
             );
+            // With `first` keys before the chunk, token t's row is the same
+            // up to distance first + t and at the sink.
+            for first in [0usize, 3, extent] {
+                let (q_from, bias_from) = metal::query_prep_from(
+                    &on(&rows),
+                    &columns,
+                    heads,
+                    dim,
+                    &on(&q_scale),
+                    &on(&rel_scale),
+                    log_scaled.then_some(&tau_gpu),
+                    &on(&basis),
+                    2.0,
+                    1.5,
+                    0.5,
+                    first,
+                )?;
+                assert!(
+                    max_difference(&q, &q_from) < 1e-5,
+                    "queries {tokens} from {first}"
+                );
+                let width = extent + 2;
+                let expected = bias.flatten_all()?.to_vec1::<f32>()?;
+                let got = bias_from
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                for (row, (want, have)) in expected.chunks(width).zip(got.chunks(width)).enumerate()
+                {
+                    let visible = (first + row / heads).min(extent);
+                    for column in (0..=visible).chain([extent + 1]) {
+                        assert!(
+                            (want[column] - have[column]).abs() < 1e-4,
+                            "bias {tokens} {extent} from {first}: row {row} column {column}"
+                        );
+                    }
+                }
+            }
         }
 
         // Post convolution plus the residual, from rows or from the weighted
@@ -3496,6 +4933,8 @@ mod tests {
                 &on(&messages),
                 &on(&down),
                 &on(&forget_gain),
+                None,
+                None,
                 1e-6,
                 &on(&norm),
             )?;
@@ -3838,6 +5277,35 @@ mod tests {
         Ok(())
     }
 
+    /// The BF16 projection on Metal against the F32 product: the exact
+    /// matrix-vector kernel up to eight rows, the Metal 4 tile kernel (half
+    /// activations) for prompts, of any row count.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_bf16_projection_matches_f32() -> Result<()> {
+        let Some(metal) = metal_device() else {
+            return Ok(());
+        };
+        let (out, cols) = (70usize, 2304usize);
+        let weight = random(&[out, cols], 90, 0.05).to_dtype(DType::BF16)?;
+        let reference = weight.to_dtype(DType::F32)?;
+        let projection = Projection::Bf16(weight.to_device(&metal)?);
+        for rows in [1usize, 8, 9, 37, 130] {
+            let x = random(&[rows, cols], 91 + rows as u32, 1.0);
+            let expected = x.matmul(&reference.t()?)?;
+            let got = projection.forward(&x.to_device(&metal)?)?;
+            let scale = expected.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+            // Prompts stage activations in half, as the Q8_0 prompts do.
+            let tolerance = if rows <= 8 { 1e-4 } else { 2e-3 } * scale;
+            let error = max_difference(&expected, &got);
+            assert!(
+                error < tolerance,
+                "{rows} rows: error {error} (scale {scale})"
+            );
+        }
+        Ok(())
+    }
+
     /// The BF16 projection's one-token kernel and prompt product against F32.
     #[cfg(feature = "cuda")]
     #[test]
@@ -3900,8 +5368,8 @@ mod tests {
             let x = random(&[tokens, cols], 91, 1.0);
             let expected = x.matmul(&reference.t()?)?;
             let got = projection.forward(&x.to_device(&gpu)?)?;
-            // Prompts round their inputs and outputs to BF16, as the
-            // checkpoint computes them.
+            // Prompts round their inputs to BF16, as the checkpoint
+            // computes them.
             let tolerance = if tokens == 1 { 1e-4 } else { 3e-2 };
             assert!(
                 max_difference(&expected, &got) < tolerance,
@@ -4014,8 +5482,9 @@ mod tests {
             return Ok(());
         };
         for (nvfp4, tolerance) in [(false, 5e-3f32), (true, 2e-2)] {
-            let cpu = tiny_stage_full(&Device::Cpu, 64, 2, 1, 128, nvfp4)?;
-            let accelerated = tiny_stage_full(&gpu, 64, 2, 1, 128, nvfp4)?;
+            let banks = if nvfp4 { Banks::Nvfp4 } else { Banks::F32 };
+            let cpu = tiny_stage_full(&Device::Cpu, 64, 2, 1, 128, banks)?;
+            let accelerated = tiny_stage_full(&gpu, 64, 2, 1, 128, banks)?;
             for (length, chunks) in [
                 (13usize, vec![13usize]),
                 (13, vec![5, 4, 4]),
@@ -4041,6 +5510,153 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Feed `passes` through `stage`: `(tokens, kept)` runs a draft
+    /// verification of `tokens` and keeps the first `kept` rows, `(tokens,
+    /// None)` an ordinary pass. Returns each pass's logits, `[rows, vocab]`
+    /// for verifications, and the cache.
+    fn run_passes(
+        stage: &Inkling2LoopStage,
+        passes: &[(Vec<u32>, Option<usize>)],
+    ) -> Result<(Vec<Tensor>, Vec<Option<LayerCache>>)> {
+        let mut cache: Vec<Option<LayerCache>> = (0..stage.layer_count()).map(|_| None).collect();
+        let mut start = 0;
+        let mut outputs = Vec::new();
+        for (tokens, kept) in passes {
+            let len = tokens.len();
+            let input = StageInput::Tokens(tokens.clone());
+            let (output, _) = stage.forward_with_layer_inputs(
+                input,
+                &mut cache,
+                len,
+                start,
+                &[],
+                kept.is_some(),
+            )?;
+            let StageOutput::Logits(logits) = output else {
+                anyhow::bail!("expected logits");
+            };
+            outputs.push(logits);
+            match kept {
+                Some(kept) => {
+                    let slot = cache[0].as_mut().context("cache slot is empty")?;
+                    super::super::commit_speculative_layer_cache(slot, kept - 1, len - kept)?;
+                    start += kept;
+                }
+                None => start += len,
+            }
+        }
+        Ok((outputs, cache))
+    }
+
+    fn max_abs_difference(a: &Tensor, b: &Tensor) -> Result<f32> {
+        Ok((a.to_dtype(DType::F32)? - b.to_dtype(DType::F32)?)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?)
+    }
+
+    /// A verification that keeps `kept` of its rows leaves the state that
+    /// running only those rows leaves, past the sliding window and across
+    /// two verifications: the rows' logits and every later token's match.
+    fn check_verify_rollback(stage: &Inkling2LoopStage, tolerance: f32) -> Result<()> {
+        let prompt = (0..9u32).map(|i| (i * 7 + 3) % 30).collect::<Vec<_>>();
+        let block = vec![5u32, 17, 2, 29, 11];
+        let second = vec![8u32, 21, 4];
+        for kept in 1..=block.len() {
+            for kept_second in [1, second.len()] {
+                let (verified, _) = run_passes(
+                    stage,
+                    &[
+                        (prompt.clone(), None),
+                        (block.clone(), Some(kept)),
+                        (second.clone(), Some(kept_second)),
+                        (vec![13, 6], None),
+                    ],
+                )?;
+                let (reference, _) = run_passes(
+                    stage,
+                    &[
+                        (prompt.clone(), None),
+                        (block[..kept].to_vec(), Some(kept)),
+                        (second[..kept_second].to_vec(), Some(kept_second)),
+                        (vec![13, 6], None),
+                    ],
+                )?;
+                for (pass, rows) in [(1usize, kept), (2, kept_second)] {
+                    let error =
+                        max_abs_difference(&verified[pass].narrow(0, 0, rows)?, &reference[pass])?;
+                    assert!(
+                        error <= tolerance,
+                        "kept {kept}/{kept_second}: pass {pass} rows differ by {error}"
+                    );
+                }
+                let error = max_abs_difference(&verified[3], &reference[3])?;
+                assert!(
+                    error <= tolerance,
+                    "kept {kept}/{kept_second}: next logits differ by {error}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn verify_rollback_matches_shorter_pass() -> Result<()> {
+        check_verify_rollback(&tiny_stage()?, 1e-4)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fused_verify_rollback_matches_shorter_pass() -> Result<()> {
+        let Some(metal) = metal_device() else {
+            return Ok(());
+        };
+        check_verify_rollback(&tiny_stage_with(&metal, 64, 2, 1, 128)?, 5e-3)
+    }
+
+    /// Committing a verification without retained state fails and leaves
+    /// the cache usable; features name visit inputs and the final state.
+    #[test]
+    fn verify_features_and_commit_guards() -> Result<()> {
+        let stage = tiny_stage()?;
+        let tokens = vec![3u32, 9, 14, 1];
+        let visits = stage.schedule.len();
+        let mut cache: Vec<Option<LayerCache>> = (0..stage.layer_count()).map(|_| None).collect();
+        let (output, features) = stage.forward_with_layer_inputs(
+            StageInput::Tokens(tokens.clone()),
+            &mut cache,
+            tokens.len(),
+            0,
+            &[1, visits - 1, visits],
+            false,
+        )?;
+        assert!(matches!(output, StageOutput::Logits(ref l) if l.dims() == [30]));
+        assert_eq!(features.len(), 3);
+        for feature in &features {
+            assert_eq!(feature.dims(), [tokens.len(), stage.dims.hidden]);
+        }
+        // The final state is normalized: its rows have unit RMS before the
+        // norm weight, and it differs from the last visit's input.
+        assert!(max_abs_difference(&features[1], &features[2])? > 1e-3);
+        let slot = cache[0].as_mut().unwrap();
+        assert!(super::super::commit_speculative_layer_cache(slot, 0, 3).is_err());
+        assert!(
+            stage
+                .forward_with_layer_inputs(
+                    StageInput::Tokens(vec![1]),
+                    &mut cache,
+                    1,
+                    tokens.len(),
+                    &[visits + 1],
+                    false,
+                )
+                .is_err()
+        );
+        stage.forward(StageInput::Tokens(vec![1]), &mut cache, 1, tokens.len())?;
         Ok(())
     }
 

@@ -408,7 +408,7 @@ fn route_plan_elements(num_experts: usize, batch: usize) -> Result<usize> {
 // every output tile. This wrapper follows llama.cpp's newer two-pass layout:
 // compact routes once, then feed the compact map into Candle's quantized MM
 // implementation. The quantization formats and math remain Candle's.
-const COMPACT_INDEXED_MOE_MSL: &str = r#"
+pub(super) const COMPACT_INDEXED_MOE_MSL: &str = r#"
 kernel void dinf_compact_moe_routes(
     device const uint *ids [[buffer(0)]],
     device uint *counts [[buffer(1)]],
@@ -576,7 +576,7 @@ kernel dinf_compact_mm_id_t
 
 // Metal 4 tensor matmul geometry follows llama.cpp's current MUL_MAT_ID
 // implementation while retaining dinf's compact route map and output layout.
-const METAL4_INDEXED_Q4_MSL: &str = r#"
+pub(super) const METAL4_INDEXED_Q4_MSL: &str = r#"
 #include <metal_stdlib>
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -803,8 +803,104 @@ void dequantize_q4_1(device const block_q4_1 *xb, short il, thread half4x4 &reg)
     reg = half4x4(values);
 }
 
+// Raw expert formats, laid out as in raw_experts.rs. NVFP4: four UE4M3
+// scales, then 32 bytes where byte j of 16-value group g holds weights j
+// (low nibble) and j + 8 (high). MXFP8 in memory: the UE8M0 scale, three
+// padding bytes, 32 E4M3 values. E2M1 and E4M3 decode by placing their bits
+// in a half (as MLX does): the value times 2^-14 or 2^-8.
+typedef struct { uchar scales[4]; uchar qs[32]; } block_nvfp4_raw;
+typedef struct { uchar scale; uchar pad[3]; uchar qs[32]; } block_mxfp8_raw;
+typedef struct { half d; uint8_t qs[16]; } block_iq4_nl_raw;
+
+constant float raw_iq4nl_values[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                       1, 13, 25, 38, 53, 69, 89, 113};
+
+inline float raw_pow2(int e) { return as_type<float>(uint(e + 127) << 23); }
+
+// ggml's UE4M3 scale, halved; 0 and 0x7f read as zero.
+inline float raw_ue4m3(uchar x) {
+    if (x == 0 || x == 0x7f) {
+        return 0.0f;
+    }
+    const int e = (x >> 3) & 15;
+    const float m = float(x & 7);
+    return e == 0 ? m * raw_pow2(-10) : (8.0f + m) * raw_pow2(e - 11);
+}
+
+inline half raw_fp4_half(uint n) {
+    const half c = as_type<half>(ushort((n & 7) << 9));
+    return (n & 8) ? -c : c;
+}
+
+inline float4 raw_fp4_lo(uint w) {
+    return float4(raw_fp4_half(w), raw_fp4_half(w >> 8), raw_fp4_half(w >> 16), raw_fp4_half(w >> 24));
+}
+
+inline float4 raw_fp4_hi(uint w) {
+    return float4(raw_fp4_half(w >> 4), raw_fp4_half(w >> 12), raw_fp4_half(w >> 20), raw_fp4_half(w >> 28));
+}
+
+inline half raw_e4m3_half(uint b) {
+    return as_type<half>(ushort(((b & 0x80) << 8) | ((b & 0x7f) << 7)));
+}
+
+inline float4 raw_e4m3_4(uint w) {
+    return float4(raw_e4m3_half(w), raw_e4m3_half(w >> 8), raw_e4m3_half(w >> 16), raw_e4m3_half(w >> 24));
+}
+
+// Group il of an NVFP4 block; the products are exact in half.
+void dequantize_nvfp4_raw(device const block_nvfp4_raw *xb, short il, thread half4x4 &reg) {
+    // raw_ue4m3 is the halved scale; 2^15 undoes it and the decode's 2^-14.
+    const float s = raw_ue4m3(xb->scales[il]) * 32768.0f;
+    device const uint *q = (device const uint *)(xb->qs + 8 * il);
+    const uint w0 = q[0];
+    const uint w1 = q[1];
+    reg[0] = half4(raw_fp4_lo(w0) * s);
+    reg[1] = half4(raw_fp4_lo(w1) * s);
+    reg[2] = half4(raw_fp4_hi(w0) * s);
+    reg[3] = half4(raw_fp4_hi(w1) * s);
+}
+
+void dequantize_mxfp8_raw(device const block_mxfp8_raw *xb, short il, thread half4x4 &reg) {
+    const float s = as_type<float>(uint(xb->scale) << 23) * 256.0f;
+    device const uint *q = (device const uint *)(xb->qs + 16 * il);
+    FOR_UNROLL (short w = 0; w < 4; ++w) {
+        reg[w] = half4(raw_e4m3_4(q[w]) * s);
+    }
+}
+
+// Group 0 is the low nibbles of the 16 bytes, group 1 the high ones.
+void dequantize_iq4_nl_raw(device const block_iq4_nl_raw *xb, short il, thread half4x4 &reg) {
+    const float d = xb->d;
+    FOR_UNROLL (short i = 0; i < 16; ++i) {
+        const uchar q = xb->qs[i];
+        reg[i / 4][i % 4] = half(raw_iq4nl_values[il ? (q >> 4) : (q & 15)] * d);
+    }
+}
+
+#ifdef DINF_EXPERT_SCALES
+#define DINF_EXPERT_SCALE_ARG , device const float *expert_scales [[buffer(16)]]
+#define DINF_EXPERT_SCALE(e) expert_scales[e]
+#else
+#define DINF_EXPERT_SCALE_ARG
+#define DINF_EXPERT_SCALE(e) 1.0f
+#endif
+
 #ifdef DINF_F16_WEIGHTS
 #define DINF_KERNEL_NAME dinf_metal4_indexed_f16
+#elif defined(DINF_NVFP4)
+#define DINF_BLOCK_TYPE block_nvfp4_raw
+#define DINF_DEQUANTIZE dequantize_nvfp4_raw
+#define DINF_NL 4
+#define DINF_KERNEL_NAME dinf_metal4_indexed_nvfp4
+#elif defined(DINF_MXFP8)
+#define DINF_BLOCK_TYPE block_mxfp8_raw
+#define DINF_DEQUANTIZE dequantize_mxfp8_raw
+#define DINF_KERNEL_NAME dinf_metal4_indexed_mxfp8
+#elif defined(DINF_IQ4_NL)
+#define DINF_BLOCK_TYPE block_iq4_nl_raw
+#define DINF_DEQUANTIZE dequantize_iq4_nl_raw
+#define DINF_KERNEL_NAME dinf_metal4_indexed_iq4_nl
 #elif defined(DINF_Q8_0)
 #define DINF_BLOCK_TYPE block_q8_0
 #define DINF_DEQUANTIZE dequantize_q8_0
@@ -902,7 +998,8 @@ kernel void DINF_KERNEL_NAME(
     constant uint &relu_squared [[buffer(12)]],
     device const uint *tile_count [[buffer(13)]],
     device const uint2 *tile_map [[buffer(14)]],
-    constant uint &use_tile_queue [[buffer(15)]],
+    constant uint &use_tile_queue [[buffer(15)]]
+    DINF_EXPERT_SCALE_ARG,
     threadgroup uchar *shared_memory [[threadgroup(0)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
@@ -1065,7 +1162,8 @@ kernel void DINF_KERNEL_NAME(
         }
         output[flat_route * ff + gate_start + row] = activated * up;
 #else
-        output[flat_route * out_dim + row_start + row] = result_data[route * tile_rows + row];
+        output[flat_route * out_dim + row_start + row] =
+            result_data[route * tile_rows + row] * DINF_EXPERT_SCALE(expert);
 #endif
     }
 }
@@ -1379,7 +1477,7 @@ type Metal4IndexedQ4PipelineCache = Mutex<HashMap<Metal4IndexedQ4PipelineKey, Co
 static METAL4_INDEXED_Q4_PIPELINES: OnceLock<Metal4IndexedQ4PipelineCache> = OnceLock::new();
 static METAL4_INDEXED_Q4_LOGGED: OnceLock<()> = OnceLock::new();
 
-fn supports_metal4_indexed_moe(device: &candle_core::MetalDevice) -> bool {
+pub(super) fn supports_metal4_indexed_moe(device: &candle_core::MetalDevice) -> bool {
     device
         .metal_device()
         .as_ref()
@@ -1593,7 +1691,7 @@ fn compact_moe_library(device: &candle_core::MetalDevice) -> Result<Library> {
     Ok(library)
 }
 
-fn compact_moe_pipeline(
+pub(super) fn compact_moe_pipeline(
     device: &candle_core::MetalDevice,
     name: &'static str,
 ) -> Result<ComputePipeline> {
@@ -1613,7 +1711,7 @@ fn compact_moe_pipeline(
     Ok(pipeline)
 }
 
-fn dispatch_compact_routes(
+pub(super) fn dispatch_compact_routes(
     device: &candle_core::MetalDevice,
     encoder: &candle_metal_kernels::metal::ComputeCommandEncoder,
     num_experts: usize,
@@ -2422,11 +2520,32 @@ impl MetalIndexedMoeMatMul {
             )
         }
         compact_mm_kernel_name(packed.dtype())?;
-        if !in_dim.is_multiple_of(packed.dtype().block_size()) {
-            candle_core::bail!("packed expert input dimension is not quantization aligned")
+        let raw = packed.data()?.into_owned();
+        let raw_len = raw.len();
+        let weights = Tensor::from_vec(raw, raw_len, device)?;
+        Self::from_bytes(weights, packed.dtype(), num_experts, out_dim, in_dim)
+    }
+
+    /// Use packed expert rows already on the Metal device (contiguous U8,
+    /// GGUF layout) in place, without copying them.
+    pub(super) fn from_bytes(
+        weights: Tensor,
+        dtype: GgmlDType,
+        num_experts: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<Self> {
+        let device = weights.device().clone();
+        if !device.is_metal() || weights.dtype() != DType::U8 || !weights.is_contiguous() {
+            candle_core::bail!("indexed MoE Metal weights must be contiguous bytes on Metal")
         }
-        if num_experts == 0 || out_dim == 0 || in_dim == 0 {
-            candle_core::bail!("packed expert dimensions must be positive")
+        compact_mm_kernel_name(dtype)?;
+        if num_experts == 0
+            || out_dim == 0
+            || in_dim == 0
+            || !in_dim.is_multiple_of(dtype.block_size())
+        {
+            candle_core::bail!("packed expert dimensions must be positive and quantization aligned")
         }
         if num_experts > u32::MAX as usize
             || out_dim > u32::MAX as usize
@@ -2434,43 +2553,40 @@ impl MetalIndexedMoeMatMul {
         {
             candle_core::bail!("packed expert dimensions exceed Metal u32 kernel limits")
         }
-        let raw = packed.data()?.into_owned();
-        let raw_len = raw.len();
-        let row_blocks = in_dim / packed.dtype().block_size();
-        let expected = checked_product(row_blocks, packed.dtype().type_size(), "expert row size")?;
+        let raw_len = weights.elem_count();
+        let row_blocks = in_dim / dtype.block_size();
+        let expected = checked_product(row_blocks, dtype.type_size(), "expert row size")?;
         let expected = checked_product(expected, out_dim, "expert matrix size")?;
         let expected = checked_product(expected, num_experts, "packed expert storage size")?;
         if raw_len != expected {
             candle_core::bail!("packed expert storage has {raw_len} bytes, expected {expected}")
         }
-        let weights = Tensor::from_vec(raw, raw_len, device)?;
         let metal = device.as_metal_device()?;
         compact_moe_pipeline(metal, "dinf_compact_moe_routes")?;
         compact_moe_pipeline(metal, "dinf_compact_moe_routes_atomic")?;
         compact_moe_pipeline(metal, "dinf_build_moe_route_tiles")?;
-        compact_moe_pipeline(metal, compact_mm_kernel_name(packed.dtype())?)?;
-        if metal4_indexed_q4_enabled(metal, packed.dtype()) {
-            let rows = if metal4_indexed_half_input(packed.dtype()) {
+        compact_moe_pipeline(metal, compact_mm_kernel_name(dtype)?)?;
+        if metal4_indexed_q4_enabled(metal, dtype) {
+            let rows = if metal4_indexed_half_input(dtype) {
                 METAL4_INDEXED_HALF_INPUT_TILE_ROWS
             } else {
                 metal4_indexed_q4_tile_rows(0)
             };
-            metal4_indexed_q4_pipeline(metal, packed.dtype(), rows)?;
+            metal4_indexed_q4_pipeline(metal, dtype, rows)?;
             METAL4_INDEXED_Q4_LOGGED.get_or_init(|| {
                 tracing::info!("Metal 4 indexed Q4 MoE matmul enabled");
             });
         }
         Ok(Self {
             weights,
-            dtype: packed.dtype(),
+            dtype,
             num_experts,
             out_dim,
             in_dim,
             native_vector: false,
-            prefer_mv: packed.dtype() != GgmlDType::Q6K
-                && mv_kernel_name(packed.dtype()).is_ok()
-                && mv_rows_per_threadgroup(packed.dtype())
-                    .is_ok_and(|rows| out_dim.is_multiple_of(rows)),
+            prefer_mv: dtype != GgmlDType::Q6K
+                && mv_kernel_name(dtype).is_ok()
+                && mv_rows_per_threadgroup(dtype).is_ok_and(|rows| out_dim.is_multiple_of(rows)),
         })
     }
 

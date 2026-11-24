@@ -173,7 +173,7 @@ impl IndexedMoeMatMul {
             .checked_mul(packed.dtype().type_size())
             .context("packed expert storage size overflow")?;
         anyhow::ensure!(
-            packed.data()?.len() == expected_bytes,
+            packed.storage_size_in_bytes() == expected_bytes,
             "packed expert storage has an unexpected byte length"
         );
 
@@ -216,6 +216,40 @@ impl IndexedMoeMatMul {
         Ok(Self {
             backend,
             device: device.clone(),
+            num_experts,
+            out_dim,
+            in_dim,
+            #[cfg(feature = "cuda")]
+            cuda_grouped_wmma: false,
+        })
+    }
+
+    /// Use packed expert rows already on the Metal device (contiguous U8 in
+    /// GGUF layout, `[num_experts, out_dim, in_dim]` of `dtype`) in place.
+    #[cfg(target_os = "macos")]
+    pub(super) fn from_metal_bytes(
+        bytes: &Tensor,
+        dtype: GgmlDType,
+        num_experts: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<Self> {
+        let device = bytes.device().clone();
+        anyhow::ensure!(
+            device_backend(&device) == Some(IndexedMoeBackendKind::Metal)
+                && select_backend(Some(IndexedMoeBackendKind::Metal), dtype).is_some(),
+            "indexed MoE Metal does not support {dtype:?}"
+        );
+        let backend = IndexedMoeBackend::Metal(MetalIndexedMoeMatMul::from_bytes(
+            bytes.clone(),
+            dtype,
+            num_experts,
+            out_dim,
+            in_dim,
+        )?);
+        Ok(Self {
+            backend,
+            device,
             num_experts,
             out_dim,
             in_dim,

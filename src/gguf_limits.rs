@@ -58,7 +58,7 @@ enum GgufVersion {
 }
 
 impl GgufVersion {
-    fn read_len(self, file: &mut File, file_size: u64) -> Result<u64> {
+    fn read_len<R: Read + Seek>(self, file: &mut R, file_size: u64) -> Result<u64> {
         match self {
             Self::V1 => Ok(read_u32(file, file_size)? as u64),
             Self::V2 | Self::V3 => read_u64(file, file_size),
@@ -72,7 +72,7 @@ impl GgufVersion {
         }
     }
 
-    fn read_dimension(self, file: &mut File, file_size: u64) -> Result<u64> {
+    fn read_dimension<R: Read + Seek>(self, file: &mut R, file_size: u64) -> Result<u64> {
         match self {
             Self::V1 => Ok(read_u32(file, file_size)? as u64),
             Self::V2 | Self::V3 => read_u64(file, file_size),
@@ -128,11 +128,23 @@ impl ValueBudget {
 }
 
 pub(crate) fn validate_gguf_header_budget(file: &mut File) -> Result<GgufHeaderStats> {
+    // Thousands of small reads per header; see `gguf_header_io`.
+    let mut reader = crate::gguf_header_io::HeaderReader::new(file)?;
+    let file_size = reader.file_bytes();
+    let result = validate_header_budget(&mut reader, file_size);
+    let finished = reader.finish();
+    match (result, finished) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Ok(stats), Ok(())) => Ok(stats),
+    }
+}
+
+fn validate_header_budget<R: Read + Seek>(file: &mut R, file_size: u64) -> Result<GgufHeaderStats> {
     let original_position = file.stream_position()?;
     let mut values = ValueBudget(0);
     let result = (|| {
         file.seek(SeekFrom::Start(0))?;
-        let file_size = file.metadata()?.len();
         let version = match read_u32(file, file_size)? {
             GGUF_MAGIC | GGUF_SWAPPED_MAGIC => match read_u32(file, file_size)? {
                 1 => GgufVersion::V1,
@@ -384,7 +396,7 @@ fn ensure_header_position(position: u64) -> Result<()> {
     Ok(())
 }
 
-fn read_exact(file: &mut File, file_size: u64, bytes: &mut [u8]) -> Result<()> {
+fn read_exact<R: Read + Seek>(file: &mut R, file_size: u64, bytes: &mut [u8]) -> Result<()> {
     let position = file.stream_position()?;
     let end = position
         .checked_add(bytes.len() as u64)
@@ -397,31 +409,31 @@ fn read_exact(file: &mut File, file_size: u64, bytes: &mut [u8]) -> Result<()> {
     file.read_exact(bytes).context("truncated GGUF header")
 }
 
-fn read_u32(file: &mut File, file_size: u64) -> Result<u32> {
+fn read_u32<R: Read + Seek>(file: &mut R, file_size: u64) -> Result<u32> {
     let mut bytes = [0u8; 4];
     read_exact(file, file_size, &mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn read_u8(file: &mut File, file_size: u64) -> Result<u8> {
+fn read_u8<R: Read + Seek>(file: &mut R, file_size: u64) -> Result<u8> {
     let mut bytes = [0u8; 1];
     read_exact(file, file_size, &mut bytes)?;
     Ok(bytes[0])
 }
 
-fn read_u64(file: &mut File, file_size: u64) -> Result<u64> {
+fn read_u64<R: Read + Seek>(file: &mut R, file_size: u64) -> Result<u64> {
     let mut bytes = [0u8; 8];
     read_exact(file, file_size, &mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn read_u16(file: &mut File, file_size: u64) -> Result<u16> {
+fn read_u16<R: Read + Seek>(file: &mut R, file_size: u64) -> Result<u16> {
     let mut bytes = [0u8; 2];
     read_exact(file, file_size, &mut bytes)?;
     Ok(u16::from_le_bytes(bytes))
 }
 
-fn skip_bytes(file: &mut File, file_size: u64, length: u64) -> Result<()> {
+fn skip_bytes<R: Read + Seek>(file: &mut R, file_size: u64, length: u64) -> Result<()> {
     let position = file.stream_position()?;
     let end = position
         .checked_add(length)
@@ -500,9 +512,9 @@ struct DuplicateStringIndex {
 }
 
 impl DuplicateStringIndex {
-    fn record(
+    fn record<R: Read + Seek>(
         &mut self,
-        file: &mut File,
+        file: &mut R,
         file_size: u64,
         scan: StringScan,
         label: &str,
@@ -534,7 +546,11 @@ impl DuplicateStringIndex {
     }
 }
 
-fn read_string_scan(file: &mut File, version: GgufVersion, file_size: u64) -> Result<StringScan> {
+fn read_string_scan<R: Read + Seek>(
+    file: &mut R,
+    version: GgufVersion,
+    file_size: u64,
+) -> Result<StringScan> {
     let raw_len = version.read_len(file, file_size)?;
     let start = file.stream_position()?;
     let end = start
@@ -605,8 +621,8 @@ fn read_string_scan(file: &mut File, version: GgufVersion, file_size: u64) -> Re
     })
 }
 
-fn equal_file_ranges(
-    file: &mut File,
+fn equal_file_ranges<R: Read + Seek>(
+    file: &mut R,
     file_size: u64,
     first_start: u64,
     second_start: u64,
@@ -644,13 +660,13 @@ fn equal_file_ranges(
     }
 }
 
-fn skip_string(file: &mut File, version: GgufVersion, file_size: u64) -> Result<()> {
+fn skip_string<R: Read + Seek>(file: &mut R, version: GgufVersion, file_size: u64) -> Result<()> {
     let length = version.read_len(file, file_size)?;
     skip_bytes(file, file_size, length)
 }
 
-fn skip_scalar_u64(
-    file: &mut File,
+fn skip_scalar_u64<R: Read + Seek>(
+    file: &mut R,
     version: GgufVersion,
     file_size: u64,
     value_type: u32,
@@ -684,8 +700,8 @@ fn skip_scalar_u64(
     })
 }
 
-fn skip_value(
-    file: &mut File,
+fn skip_value<R: Read + Seek>(
+    file: &mut R,
     version: GgufVersion,
     file_size: u64,
     value_type: u32,
