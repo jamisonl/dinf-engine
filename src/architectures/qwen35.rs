@@ -2002,6 +2002,33 @@ fn qtensor_to_qmatmul(qt: Arc<QTensor>) -> Result<QMatMul> {
     QMatMul::from_arc(qt).map_err(Into::into)
 }
 
+/// Whether a pass of `seq_len` rows waits for the GPU between layers.
+///
+/// Candle's Metal pool keeps every buffer a pass allocates until a device
+/// wait, and the CPU queues layers far ahead of the GPU, so a long prompt
+/// chunk grows the pool well past one layer's temporaries: about 1.5 GB above
+/// the weights for a 512-token chunk of Qwen3.8 27B. A wait at each layer
+/// boundary empties the pool, which keeps the peak near the steady state for
+/// about 1% of prompt throughput. Shorter passes, one-token decode and draft
+/// verification skip it. `DINF_DISABLE_QWEN35_PREFILL_THROTTLE=1` turns it
+/// off.
+fn prefill_throttle(device: &Device, seq_len: usize) -> Option<usize> {
+    static EVERY: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        if std::env::var_os("DINF_DISABLE_QWEN35_PREFILL_THROTTLE").is_some_and(|v| v == "1") {
+            return None;
+        }
+        Some(
+            std::env::var("DINF_QWEN35_PREFILL_THROTTLE_LAYERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n: &usize| n > 0)
+                .unwrap_or(1),
+        )
+    });
+    every.filter(|_| device.is_metal() && seq_len >= 256)
+}
+
 fn take_qtensor(
     tensors: &mut std::collections::HashMap<String, Arc<QTensor>>,
     prefix: &str,
@@ -2181,6 +2208,12 @@ impl Qwen35Stage {
                 .collect();
             for key in keys_to_remove {
                 tensors.remove(&key);
+            }
+            // Dropped Metal sources stay in Candle's buffer pool until a
+            // device wait empties it. Wait every few layers so the replaced
+            // weights do not accumulate into a second copy of the model.
+            if device.is_metal() && (layer_idx + 1 - range.start) % 4 == 0 {
+                device.synchronize()?;
             }
         }
 
@@ -2606,7 +2639,14 @@ impl Qwen35Stage {
             && hidden_states.device().is_cuda()
             && !layer_profile_enabled();
         let mut normed: Option<Tensor> = None;
+        let throttle = prefill_throttle(hidden_states.device(), seq_len);
         for (i, block) in self.blocks.iter().enumerate() {
+            if let Some(every) = throttle
+                && i > 0
+                && i % every == 0
+            {
+                hidden_states.device().synchronize()?;
+            }
             let next_norm = self
                 .blocks
                 .get(i + 1)
@@ -2640,6 +2680,17 @@ impl Qwen35Stage {
                         all_logits,
                     )?;
                     cache[i] = dn_cache.map(LayerCache::DeltaNet);
+                    // A prompt scan may return its fixed state as a view of a
+                    // prompt-sized buffer. Copy it out now rather than after
+                    // the pass, so each layer's scan buffers are free for the
+                    // next layer instead of all being held until the end.
+                    // Verification keeps its rollback layout until commit.
+                    if seq_len > 1
+                        && !all_logits
+                        && let Some(layer_cache) = cache[i].as_mut()
+                    {
+                        super::compact_fixed_layer_cache(layer_cache)?;
+                    }
                     result
                 }
                 Qwen35Block::GatedAttention(attn_block) => {
@@ -2755,9 +2806,23 @@ fn build_deltanet_block(
         eps: md.rms_norm_eps,
     };
 
+    // Newer converters store each pair as one tensor: `attn_qkv_gate` is
+    // [qkv | gate] and `ssm_beta_alpha` is [beta | alpha]. Split them back
+    // into the pairs below, which regroup them for the device.
     let qkv_gate = {
-        let qkv = take_qtensor(tensors, prefix, "attn_qkv.weight")?;
-        let gate = take_qtensor(tensors, prefix, "attn_gate.weight")?;
+        let (qkv, gate) = match tensors.remove(&format!("{prefix}.attn_qkv_gate.weight")) {
+            Some(merged) => {
+                let [qkv, gate]: [Arc<QTensor>; 2] =
+                    crate::gguf_loader::split_output_rows(&merged, &[conv_dim, value_dim], device)?
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("attn_qkv_gate split count"))?;
+                (qkv, gate)
+            }
+            None => (
+                take_qtensor(tensors, prefix, "attn_qkv.weight")?,
+                take_qtensor(tensors, prefix, "attn_gate.weight")?,
+            ),
+        };
         #[cfg(target_os = "macos")]
         let grouped = Qwen35QMatMul::try_grouped(&[Arc::clone(&qkv), Arc::clone(&gate)], device)?;
         #[cfg(not(target_os = "macos"))]
@@ -2774,8 +2839,22 @@ fn build_deltanet_block(
     // pair's source tensors before materializing the second packed matrix,
     // bounding construction overlap to the larger group instead of their sum.
     let alpha_beta = {
-        let alpha = take_qtensor(tensors, prefix, "ssm_alpha.weight")?;
-        let beta = take_qtensor(tensors, prefix, "ssm_beta.weight")?;
+        let (alpha, beta) = match tensors.remove(&format!("{prefix}.ssm_beta_alpha.weight")) {
+            Some(merged) => {
+                let [beta, alpha]: [Arc<QTensor>; 2] = crate::gguf_loader::split_output_rows(
+                    &merged,
+                    &[num_v_heads, num_v_heads],
+                    device,
+                )?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("ssm_beta_alpha split count"))?;
+                (alpha, beta)
+            }
+            None => (
+                take_qtensor(tensors, prefix, "ssm_alpha.weight")?,
+                take_qtensor(tensors, prefix, "ssm_beta.weight")?,
+            ),
+        };
         #[cfg(target_os = "macos")]
         let grouped = Qwen35QMatMul::try_grouped(&[Arc::clone(&alpha), Arc::clone(&beta)], device)?;
         #[cfg(not(target_os = "macos"))]

@@ -95,7 +95,7 @@ struct Tiles {
     down: &'static [Geometry],
 }
 
-const PAIR_TILES: [Geometry; 3] = [
+const PAIR_TILES: [Geometry; 4] = [
     Geometry {
         sub: 16,
         subs: 1,
@@ -118,13 +118,22 @@ const PAIR_TILES: [Geometry; 3] = [
         sub: 64,
         subs: 1,
         tail: 32,
-        tails: 2,
+        tails: 1,
+        rows: 32,
+        k: 64,
+        simdgroups: 4,
+    },
+    Geometry {
+        sub: 64,
+        subs: 3,
+        tail: 0,
+        tails: 0,
         rows: 32,
         k: 64,
         simdgroups: 4,
     },
 ];
-const DOWN_TILES: [Geometry; 3] = [
+const DOWN_TILES: [Geometry; 4] = [
     Geometry {
         sub: 16,
         subs: 1,
@@ -147,7 +156,16 @@ const DOWN_TILES: [Geometry; 3] = [
         sub: 64,
         subs: 1,
         tail: 32,
-        tails: 2,
+        tails: 1,
+        rows: 64,
+        k: 64,
+        simdgroups: 4,
+    },
+    Geometry {
+        sub: 64,
+        subs: 3,
+        tail: 0,
+        tails: 0,
         rows: 64,
         k: 64,
         simdgroups: 4,

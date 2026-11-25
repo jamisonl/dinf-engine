@@ -13,12 +13,14 @@ use candle_core::Tensor;
 
 use crate::{
     KvTokenBudget, PipelineStage, PipelineStageSessionState, TextArithmeticPolicy,
-    TextRequestContext, architectures,
+    TextRequestContext,
+    architectures::{self, ImageSpanKey},
 };
 
 pub(crate) struct PromptEntry {
     scope: String,
     tokens: Vec<u32>,
+    image_keys: Vec<ImageSpanKey>,
     draft: bool,
     shared_prefix: bool,
     state: PipelineStageSessionState,
@@ -87,6 +89,29 @@ impl PromptCache {
             self.ttl
         }
     }
+}
+
+/// Returns true iff every image span in `query` starting before `cached_len`
+/// ends at or before `cached_len` and matches `cached` in exact order and digest.
+fn prefix_image_keys_match(
+    query: &[ImageSpanKey],
+    cached: &[ImageSpanKey],
+    cached_len: usize,
+) -> bool {
+    let mut matched = 0usize;
+    for key in query {
+        if key.start >= cached_len {
+            break;
+        }
+        if key.start.saturating_add(key.len) > cached_len {
+            return false;
+        }
+        if cached.get(matched) != Some(key) {
+            return false;
+        }
+        matched += 1;
+    }
+    matched == cached.len()
 }
 
 impl PipelineStage {
@@ -276,8 +301,16 @@ impl PipelineStage {
     }
 
     fn can_fork_prompt_state(&self, state: &PipelineStageSessionState) -> bool {
+        self.can_fork_prompt_state_with_embedded(state, false)
+    }
+
+    fn can_fork_prompt_state_with_embedded(
+        &self,
+        state: &PipelineStageSessionState,
+        allow_embedded: bool,
+    ) -> bool {
         Arc::ptr_eq(&state.kv_token_budget, &self.kv_token_budget)
-            && !state.has_embedded_prompt
+            && (allow_embedded || !state.has_embedded_prompt)
             && state.mrope_decode_delta.is_none()
             && state.next_position > 0
             && state.next_position == state.kv_cache_tokens
@@ -354,6 +387,7 @@ impl PipelineStage {
             .filter(|(_, entry)| {
                 entry.pending.is_none()
                     && entry.scope == scope
+                    && entry.image_keys.is_empty()
                     && entry.draft == draft
                     && tokens.starts_with(&entry.tokens)
                     && TextArithmeticPolicy::compatible(
@@ -362,7 +396,7 @@ impl PipelineStage {
                         entry.tokens.len(),
                     )
                     && (entry.logits.is_some() || tokens.len() > entry.tokens.len())
-                    && self.can_fork_prompt_state(&entry.state)
+                    && self.can_fork_prompt_state_with_embedded(&entry.state, false)
             })
             .max_by_key(|(_, entry)| entry.tokens.len())
             .map(|(index, _)| index);
@@ -370,6 +404,9 @@ impl PipelineStage {
             // A miss costs a full prefill. Report how close the best published
             // snapshot in this scope came, so a diverging prompt can be told
             // apart from an evicted or expired one.
+            if let Some(restored) = self.try_restore_from_disk(scope, tokens, &[], draft)? {
+                return Ok(Some(restored));
+            }
             let published = self.prompt_cache.entries.iter().filter(|entry| {
                 entry.pending.is_none() && entry.scope == scope && entry.draft == draft
             });
@@ -417,14 +454,84 @@ impl PipelineStage {
     }
 
     /// Reuse the longest cached plain-text prefix strictly before the first
-    /// image of a multimodal prompt, regardless of whether the prior turn had
-    /// speculative drafting enabled. The forked state drops any draft cache
-    /// because multimodal sessions always run scalar target decode.
+    /// image of a multimodal prompt. When `draft` is true, require a cached
+    /// entry with a position-aligned speculative draft cache so post-image
+    /// text decode can keep drafting; when `draft` is false, any matching
+    /// prefix is eligible and any forked draft cache is dropped.
     pub(crate) fn reuse_prompt_prefix(
         &mut self,
         scope: &str,
         tokens: &[u32],
+        draft: bool,
     ) -> Result<Option<(PipelineStageSessionState, usize)>> {
+        self.prune_prompt_cache();
+        if !self.prompt_scope_allowed(scope) || tokens.is_empty() {
+            return Ok(None);
+        }
+        let Ok(context) = TextRequestContext::new(tokens.len()) else {
+            return Ok(None);
+        };
+        if self.desired_text_arithmetic(context).is_some() {
+            return Ok(None);
+        }
+        let index =
+            self.prompt_cache
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry.pending.is_none()
+                        && entry.scope == scope
+                        && entry.image_keys.is_empty()
+                        && entry.state.text_arithmetic.is_none()
+                        && tokens.starts_with(&entry.tokens)
+                        && self.can_fork_prompt_state_with_embedded(&entry.state, false)
+                        && (!draft
+                            || (entry.draft
+                                && entry.state.speculative_cache.as_ref().is_some_and(|cache| {
+                                    cache.next_position() == entry.tokens.len()
+                                })))
+                })
+                .max_by_key(|(_, entry)| (entry.tokens.len(), !entry.draft))
+                .map(|(index, _)| index);
+        let Some(index) = index else {
+            if let Some((state, _logits, reused)) =
+                self.try_restore_from_disk(scope, tokens, &[], draft)?
+            {
+                return Ok(Some((state, reused)));
+            }
+            return Ok(None);
+        };
+        let entry = &self.prompt_cache.entries[index];
+        let mut state = self.fork_prompt_state(&entry.state)?;
+        if !draft {
+            state.speculative_cache = None;
+        }
+        let reused = entry.tokens.len();
+        let mut entry = self
+            .prompt_cache
+            .entries
+            .remove(index)
+            .expect("entry exists");
+        entry.last_used = Instant::now();
+        self.prompt_cache.entries.push_back(entry);
+        tracing::info!(
+            reused_prompt_tokens = reused,
+            draft_decoding = draft,
+            "Continuous prompt cache hit (multimodal text prefix)"
+        );
+        Ok(Some((state, reused)))
+    }
+
+    /// Reuse the longest cached prefix (plain-text or image-keyed) matching a
+    /// 1D-causal multimodal prompt's token IDs and exact image span digests.
+    pub(crate) fn reuse_multimodal_prompt(
+        &mut self,
+        scope: &str,
+        tokens: &[u32],
+        image_keys: &[ImageSpanKey],
+        draft: bool,
+    ) -> Result<Option<(PipelineStageSessionState, Option<Tensor>, usize)>> {
         self.prune_prompt_cache();
         if !self.prompt_scope_allowed(scope) || tokens.is_empty() {
             return Ok(None);
@@ -445,17 +552,74 @@ impl PipelineStage {
                     && entry.scope == scope
                     && entry.state.text_arithmetic.is_none()
                     && tokens.starts_with(&entry.tokens)
-                    && self.can_fork_prompt_state(&entry.state)
+                    && prefix_image_keys_match(image_keys, &entry.image_keys, entry.tokens.len())
+                    && (entry.logits.is_some() || tokens.len() > entry.tokens.len())
+                    && self.can_fork_prompt_state_with_embedded(
+                        &entry.state,
+                        !entry.image_keys.is_empty(),
+                    )
+                    && (!draft
+                        || (entry.draft
+                            && entry
+                                .state
+                                .speculative_cache
+                                .as_ref()
+                                .is_some_and(|cache| cache.next_position() == entry.tokens.len())))
             })
             .max_by_key(|(_, entry)| (entry.tokens.len(), !entry.draft))
             .map(|(index, _)| index);
         let Some(index) = index else {
+            if let Some(restored) = self.try_restore_from_disk(scope, tokens, image_keys, draft)? {
+                return Ok(Some(restored));
+            }
+            if tokens.len() >= 1024 {
+                let (snapshots, shared_tokens, snapshot_tokens, image_match) = self
+                    .prompt_cache
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.pending.is_none() && entry.scope == scope)
+                    .fold(
+                        (0usize, 0usize, 0usize, false),
+                        |(count, best_shared, best_len, best_img), entry| {
+                            let common = entry
+                                .tokens
+                                .iter()
+                                .zip(tokens)
+                                .take_while(|(a, b)| a == b)
+                                .count();
+                            let img_ok = prefix_image_keys_match(
+                                image_keys,
+                                &entry.image_keys,
+                                entry.tokens.len(),
+                            );
+                            if count == 0 || common > best_shared {
+                                (count + 1, common, entry.tokens.len(), img_ok)
+                            } else {
+                                (count + 1, best_shared, best_len, best_img)
+                            }
+                        },
+                    );
+                tracing::info!(
+                    prompt_tokens = tokens.len(),
+                    prompt_images = image_keys.len(),
+                    draft_decoding = draft,
+                    snapshots,
+                    shared_tokens,
+                    snapshot_tokens,
+                    image_match,
+                    "Continuous prompt cache miss (multimodal)"
+                );
+            }
             return Ok(None);
         };
         let entry = &self.prompt_cache.entries[index];
         let mut state = self.fork_prompt_state(&entry.state)?;
-        state.speculative_cache = None;
+        if !draft {
+            state.speculative_cache = None;
+        }
+        let logits = entry.logits.clone();
         let reused = entry.tokens.len();
+        let reused_images = entry.image_keys.len();
         let mut entry = self
             .prompt_cache
             .entries
@@ -465,10 +629,11 @@ impl PipelineStage {
         self.prompt_cache.entries.push_back(entry);
         tracing::info!(
             reused_prompt_tokens = reused,
-            draft_decoding = false,
-            "Continuous prompt cache hit (multimodal text prefix)"
+            reused_images,
+            draft_decoding = draft,
+            "Continuous prompt cache hit (multimodal)"
         );
-        Ok(Some((state, reused)))
+        Ok(Some((state, logits, reused)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -481,11 +646,26 @@ impl PipelineStage {
         logits: &Tensor,
         shared_prefix: bool,
     ) -> Result<Option<Arc<()>>> {
+        self.capture_prompt_with_images(scope, tokens, &[], draft, state, logits, shared_prefix)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_prompt_with_images(
+        &mut self,
+        scope: &str,
+        tokens: &[u32],
+        image_keys: &[ImageSpanKey],
+        draft: bool,
+        state: &PipelineStageSessionState,
+        logits: &Tensor,
+        shared_prefix: bool,
+    ) -> Result<Option<Arc<()>>> {
         self.prune_prompt_cache();
+        let allow_embedded = !image_keys.is_empty();
         if !self.prompt_scope_allowed(scope)
             || self.prompt_cache.max_entries == 0
             || self.prompt_cache.max_bytes == 0
-            || !self.can_fork_prompt_state(state)
+            || !self.can_fork_prompt_state_with_embedded(state, allow_embedded)
             || state.next_position != tokens.len()
             || (draft
                 && state
@@ -528,11 +708,14 @@ impl PipelineStage {
             }
         }
         if bytes > self.prompt_cache.max_bytes {
-            tracing::debug!(
-                bytes,
-                max_bytes = self.prompt_cache.max_bytes,
-                "Prompt snapshot exceeds cache byte limit"
-            );
+            if tokens.len() >= 1024 {
+                tracing::info!(
+                    prompt_tokens = tokens.len(),
+                    bytes,
+                    max_bytes = self.prompt_cache.max_bytes,
+                    "Prompt snapshot rejected: exceeds cache byte limit"
+                );
+            }
             return Ok(None);
         }
         while self.prompt_cache.entries.len() >= self.prompt_cache.max_entries
@@ -548,6 +731,14 @@ impl PipelineStage {
                     || !tokens.starts_with(&entry.tokens)
             });
             let Some(victim) = victim else {
+                if tokens.len() >= 1024 {
+                    tracing::info!(
+                        prompt_tokens = tokens.len(),
+                        bytes,
+                        max_bytes = self.prompt_cache.max_bytes,
+                        "Prompt snapshot rejected: no evictable victim"
+                    );
+                }
                 return Ok(None);
             };
             self.prompt_cache.entries.remove(victim);
@@ -567,6 +758,15 @@ impl PipelineStage {
                 .saturating_add(extra_allocation_slots)
                 > max / 2
         }) {
+            if tokens.len() >= 1024 {
+                tracing::info!(
+                    prompt_tokens = tokens.len(),
+                    allocated = self.total_kv_cache_allocation_tokens(),
+                    kv_cache_tokens = state.kv_cache_tokens,
+                    max_total_kv_tokens = self.max_total_kv_tokens.unwrap_or(0),
+                    "Prompt snapshot rejected: exceeds half of KV token budget"
+                );
+            }
             return Ok(None);
         }
         let snapshot = self.fork_prompt_state(state)?;
@@ -576,12 +776,14 @@ impl PipelineStage {
         if !self.prompt_scope_allowed(scope) {
             return Ok(None);
         }
+        self.maybe_persist_snapshot_to_disk(scope, draft, tokens, image_keys, &snapshot, &logits);
         let ticket = Arc::new(());
         self.kv_token_budget
             .replace_allocated(0, extra_allocation_slots);
         self.prompt_cache.entries.push_back(PromptEntry {
             scope: scope.to_owned(),
             tokens: tokens.to_vec(),
+            image_keys: image_keys.to_vec(),
             draft,
             shared_prefix,
             state: snapshot,
@@ -593,6 +795,97 @@ impl PipelineStage {
             budget: self.kv_token_budget.clone(),
         });
         Ok(Some(ticket))
+    }
+
+    fn disk_cache_model_key(&self) -> String {
+        format!(
+            "{}_l{}_h{}_v{}_d{}",
+            self.family(),
+            self.cache.len(),
+            self.hidden_dim,
+            self.vocab_size,
+            usize::from(self.speculative.is_some()),
+        )
+    }
+
+    fn maybe_persist_snapshot_to_disk(
+        &self,
+        scope: &str,
+        draft: bool,
+        tokens: &[u32],
+        image_keys: &[ImageSpanKey],
+        snapshot: &PipelineStageSessionState,
+        logits: &Tensor,
+    ) {
+        if tokens.len() < crate::disk_kv_cache::min_tokens() {
+            return;
+        }
+        let Some(dir) = crate::disk_kv_cache::cache_dir(&self.disk_cache_model_key()) else {
+            return;
+        };
+        if let Err(error) = crate::disk_kv_cache::save_snapshot_async(
+            dir,
+            crate::disk_kv_cache::max_disk_bytes(),
+            scope.to_owned(),
+            draft,
+            tokens.to_vec(),
+            image_keys.to_vec(),
+            &snapshot.cache,
+            snapshot.speculative_cache.as_ref(),
+            logits,
+            snapshot.next_position,
+            snapshot.kv_cache_tokens,
+            snapshot.kv_cache_lane_capacity_tokens,
+            snapshot.fixed_cache_allocation_tokens,
+            snapshot.has_embedded_prompt,
+        ) {
+            tracing::warn!(%error, "Could not schedule disk KV snapshot save");
+        }
+    }
+
+    fn try_restore_from_disk(
+        &mut self,
+        scope: &str,
+        tokens: &[u32],
+        image_keys: &[ImageSpanKey],
+        draft: bool,
+    ) -> Result<Option<(PipelineStageSessionState, Option<Tensor>, usize)>> {
+        if tokens.len() < crate::disk_kv_cache::min_tokens() {
+            return Ok(None);
+        }
+        let Some(dir) = crate::disk_kv_cache::cache_dir(&self.disk_cache_model_key()) else {
+            return Ok(None);
+        };
+        let Some(restored) = crate::disk_kv_cache::load_best_snapshot(
+            &dir,
+            scope,
+            tokens,
+            image_keys,
+            draft,
+            &self.device,
+        )?
+        else {
+            return Ok(None);
+        };
+        let reused = restored.tokens.len();
+        let mut state = self.new_session_state();
+        let kv_alloc = restored
+            .kv_cache_lane_capacity_tokens
+            .max(restored.kv_cache_tokens);
+        self.kv_token_budget.replace(0, restored.kv_cache_tokens);
+        self.kv_token_budget.replace_allocated(
+            0,
+            kv_alloc.saturating_add(restored.fixed_cache_allocation_tokens),
+        );
+        state.cache = restored.cache;
+        state.speculative_cache = restored.speculative_cache;
+        state.next_position = restored.next_position;
+        state.kv_cache_tokens = restored.kv_cache_tokens;
+        state.kv_cache_lane_capacity_tokens = restored.kv_cache_lane_capacity_tokens;
+        state.kv_cache_allocation_tokens = kv_alloc;
+        state.fixed_cache_allocation_tokens = restored.fixed_cache_allocation_tokens;
+        state.has_embedded_prompt = restored.has_embedded_prompt;
+        Ok(Some((state, Some(restored.logits), reused)))
     }
 
     /// Transfer a fenced input boundary for an explicit caller cancellation in
@@ -662,6 +955,7 @@ impl PipelineStage {
         self.prompt_cache.entries.push_back(PromptEntry {
             scope: scope.to_owned(),
             tokens: tokens.to_vec(),
+            image_keys: Vec::new(),
             draft,
             shared_prefix: false,
             state: snapshot,

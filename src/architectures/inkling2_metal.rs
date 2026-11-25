@@ -2503,7 +2503,7 @@ struct Attention {
 
 /// Largest query count the fused attention handles. Every query of a chunk
 /// reads the same keys, which stay in the GPU caches.
-pub(super) const FUSED_ATTENTION_MAX_TOKENS: usize = 512;
+pub(super) const FUSED_ATTENTION_MAX_TOKENS: usize = 2048;
 
 impl CustomOp3 for Attention {
     fn name(&self) -> &'static str {
@@ -2749,8 +2749,22 @@ fn row_view(tensor: &Tensor, what: &str) -> Result<(Buffer, usize, usize)> {
     Ok((buffer.clone(), offset, stride))
 }
 
-const SCRATCH_POOL_MAX_BYTES: usize = 2 * 1024 * 1024;
-const SCRATCH_POOL_MAX_PER_BUCKET: usize = 256;
+const SCRATCH_POOL_MAX_BYTES: usize = 8 * 1024 * 1024;
+const SCRATCH_POOL_SMALL_BUCKET_BYTES: usize = 64 * 1024;
+const SCRATCH_POOL_LARGE_BUCKET_BYTES: usize = 2 * 1024 * 1024;
+const SCRATCH_POOL_SMALL_MAX_PER_BUCKET: usize = 512;
+const SCRATCH_POOL_DEFAULT_MAX_PER_BUCKET: usize = 256;
+const SCRATCH_POOL_LARGE_MAX_PER_BUCKET: usize = 16;
+
+fn scratch_pool_bucket_cap(bucket: usize) -> usize {
+    if bucket <= SCRATCH_POOL_SMALL_BUCKET_BYTES {
+        SCRATCH_POOL_SMALL_MAX_PER_BUCKET
+    } else if bucket > SCRATCH_POOL_LARGE_BUCKET_BYTES {
+        SCRATCH_POOL_LARGE_MAX_PER_BUCKET
+    } else {
+        SCRATCH_POOL_DEFAULT_MAX_PER_BUCKET
+    }
+}
 
 /// Persistent Metal scratch buffer pool that survives `wait_until_completed()`
 /// (unlike Candle's `BufferMap`, which purges all cached buffers on every sync).
@@ -2777,7 +2791,8 @@ pub(crate) fn alloc_scratch_buffer(
                 }
             }
         }
-        let options = Options(Options::StorageModeShared.0 | Options::HazardTrackingModeUntracked.0);
+        let options =
+            Options(Options::StorageModeShared.0 | Options::HazardTrackingModeUntracked.0);
         let buf = std::sync::Arc::new(
             device
                 .device()
@@ -2786,15 +2801,12 @@ pub(crate) fn alloc_scratch_buffer(
         );
         let mut map = pool.lock().unwrap_or_else(|e| e.into_inner());
         let list = map.entry(key).or_default();
-        if list.len() < SCRATCH_POOL_MAX_PER_BUCKET {
+        if list.len() < scratch_pool_bucket_cap(bucket) {
             list.push(buf.clone());
         }
         return Ok(buf);
     }
-    device
-        .new_buffer_builder()
-        .with_size(bytes.max(1))
-        .build()
+    device.new_buffer_builder().with_size(bytes.max(1)).build()
 }
 
 fn new_output(
@@ -4181,7 +4193,10 @@ pub(super) fn q4_0_matvec_1(
     encode(
         &device,
         "inkling_q4_0_matvec_1",
-        &[(w_storage.buffer(), w_layout.start_offset()), (&x_buf, x_off)],
+        &[
+            (w_storage.buffer(), w_layout.start_offset()),
+            (&x_buf, x_off),
+        ],
         &[(&y, 0)],
         &params,
         (out_dim.div_ceil(8), 1, 1),
@@ -4397,7 +4412,10 @@ pub(super) fn q8_0_matvec_with_softcap(
     encode(
         &device,
         "inkling_q8_0_matvec_1",
-        &[(w_storage.buffer(), w_layout.start_offset()), (&x_buf, x_off)],
+        &[
+            (w_storage.buffer(), w_layout.start_offset()),
+            (&x_buf, x_off),
+        ],
         &[(&y, 0)],
         &params,
         (out.div_ceil(8), 1, 1),

@@ -13,7 +13,7 @@ use candle_core::DType;
 use candle_core::IndexOp;
 
 use super::architectures::{
-    AttentionSpan, ImageEmbeddingSpan, MropePositionIds, StageInput, StageOutput,
+    AttentionSpan, ImageEmbeddingSpan, ImageSpanKey, MropePositionIds, StageInput, StageOutput,
 };
 use super::sampling::{SamplingHistory, SamplingParams, SamplingRng};
 use super::{PipelineStage, PipelineStageSessionState, StagePosition, TextRequestContext};
@@ -185,6 +185,9 @@ pub struct GenerationSession {
     prompt_tokens: Vec<u32>,
     prompt_embeddings: Option<candle_core::Tensor>,
     prompt_image_spans: Vec<ImageEmbeddingSpan>,
+    /// Content-addressed image span keys for 1D-causal multimodal prompt caching
+    /// (populated only when every span carries a SHA-256 digest and M-RoPE is absent).
+    prompt_image_keys: Option<Vec<ImageSpanKey>>,
     has_prompt_images: bool,
     prompt_bidirectional_spans: Vec<AttentionSpan>,
     prompt_positions: Option<MropePositionIds>,
@@ -210,6 +213,9 @@ pub struct GenerationSession {
     // invalidates it before work, including validation and device failures.
     completed_input_cursor: Option<usize>,
     input_prefix_trusted: bool,
+    // Vocabulary size for which `prompt_tokens` has already been validated,
+    // avoiding an O(N_prompt) rescan on every decode step.
+    validated_prompt_vocab: Option<usize>,
 }
 
 impl GenerationSession {
@@ -338,8 +344,20 @@ impl GenerationSession {
         stop_ids: Vec<u32>,
     ) -> Result<Self> {
         validate_image_spans(stage, prompt_tokens.len(), &image_spans)?;
+        let mut keys = Vec::with_capacity(image_spans.len());
+        let mut all_digests = !image_spans.is_empty();
+        for span in &image_spans {
+            match span.span_key()? {
+                Some(key) => keys.push(key),
+                None => {
+                    all_digests = false;
+                    break;
+                }
+            }
+        }
         let mut session = Self::new(stage, prompt_tokens, params, stop_ids);
         session.prompt_image_spans = image_spans;
+        session.prompt_image_keys = all_digests.then_some(keys);
         session.has_prompt_images = true;
         Ok(session)
     }
@@ -432,6 +450,7 @@ impl GenerationSession {
             prompt_tokens,
             prompt_embeddings: None,
             prompt_image_spans: Vec::new(),
+            prompt_image_keys: None,
             has_prompt_images: false,
             prompt_bidirectional_spans: Vec::new(),
             prompt_positions: None,
@@ -453,6 +472,7 @@ impl GenerationSession {
             reused_prompt_tokens: 0,
             completed_input_cursor: None,
             input_prefix_trusted: effective_skip == 0,
+            validated_prompt_vocab: None,
         }
     }
 
@@ -483,7 +503,10 @@ impl GenerationSession {
         // forward pass would otherwise leave callers with a partial session
         // that must be discarded before retrying.
         self.validate_sampling_params(stage)?;
-        stage.validate_token_ids(&self.prompt_tokens)?;
+        if self.validated_prompt_vocab != Some(stage.vocab_size()) {
+            stage.validate_token_ids(&self.prompt_tokens)?;
+            self.validated_prompt_vocab = Some(stage.vocab_size());
+        }
         stage.validate_context_budget(self.prompt_tokens.len(), self.params.max_tokens)?;
         anyhow::ensure!(
             max_prefill_tokens > 0,
@@ -551,7 +574,8 @@ impl GenerationSession {
 
         // Scalar probes still capture target features and inject them into
         // the draft cache. Its position must stay aligned before drafting.
-        let output = if speculative_eligible && matches!(&input, StageInput::Tokens(_)) {
+        // Image prompts and M-RoPE decode rows feed it too.
+        let output = if speculative_eligible {
             stage.speculative_prefill_with_session(&mut self.cache, input, seq_len, start_pos)?
         } else if first_step {
             stage.prefill_with_session(&mut self.cache, input, seq_len, start_pos)?
@@ -626,22 +650,45 @@ impl GenerationSession {
             && let Some(scope) = self.prompt_cache_scope.as_deref()
         {
             if self.has_prompt_images {
-                let first_image_start = self
-                    .prompt_image_spans
-                    .first()
-                    .map_or(0, |span| span.start);
-                let pre_image_reusable = first_image_start > 0
-                    && self
-                        .prompt_positions
-                        .as_ref()
-                        .is_none_or(|positions| positions.is_identity_prefix(first_image_start));
-                if pre_image_reusable
-                    && let Some((cache, reused)) = stage
-                        .reuse_prompt_prefix(scope, &self.prompt_tokens[..first_image_start])?
+                if let Some(image_keys) = self.prompt_image_keys.as_deref()
+                    && self.prompt_positions.is_none()
+                    && self.mrope_decode_delta.is_none()
                 {
-                    self.cache = cache;
-                    self.effective_skip = reused;
-                    self.reused_prompt_tokens = reused;
+                    if let Some((cache, logits, reused)) = stage.reuse_multimodal_prompt(
+                        scope,
+                        &self.prompt_tokens,
+                        image_keys,
+                        self.speculative_eligible(stage),
+                    )? {
+                        self.cache = cache;
+                        self.effective_skip = reused;
+                        self.reused_prompt_tokens = reused;
+                        self.prune_consumed_image_spans(reused);
+                        if reused == self.prompt_tokens.len() {
+                            let logits =
+                                logits.context("exact prompt cache hit requires logits")?;
+                            let token = self.sample_logits(&logits)?;
+                            return Ok(Some(self.accept_token(token)));
+                        }
+                    }
+                } else {
+                    let first_image_start =
+                        self.prompt_image_spans.first().map_or(0, |span| span.start);
+                    let pre_image_reusable = first_image_start > 0
+                        && self.prompt_positions.as_ref().is_none_or(|positions| {
+                            positions.is_identity_prefix(first_image_start)
+                        });
+                    if pre_image_reusable
+                        && let Some((cache, reused)) = stage.reuse_prompt_prefix(
+                            scope,
+                            &self.prompt_tokens[..first_image_start],
+                            self.speculative_eligible(stage),
+                        )?
+                    {
+                        self.cache = cache;
+                        self.effective_skip = reused;
+                        self.reused_prompt_tokens = reused;
+                    }
                 }
             } else if let Some((mut cache, logits, reused)) =
                 stage.reuse_prompt(scope, &self.prompt_tokens, !self.speculative_disabled)?
@@ -676,11 +723,9 @@ impl GenerationSession {
                 end = end.min(boundary);
             }
             if !self.prompt_image_spans.is_empty() {
-                let Some(aligned_end) = self.align_chunk_end_for_image_spans(
-                    start,
-                    end,
-                    remaining < max_tokens,
-                )? else {
+                let Some(aligned_end) =
+                    self.align_chunk_end_for_image_spans(start, end, remaining < max_tokens)?
+                else {
                     break;
                 };
                 end = aligned_end;
@@ -727,21 +772,37 @@ impl GenerationSession {
             let StageOutput::Logits(logits) = output else {
                 anyhow::bail!("solo stage returned activations")
             };
+            let can_capture_text = !self.has_prompt_images && !self.cache.has_embedded_prompt;
+            let can_capture_multimodal =
+                (complete || shared) && self.has_prompt_images && self.prompt_image_keys.is_some();
             if (complete || shared)
-                && !self.has_prompt_images
-                && !self.cache.has_embedded_prompt
+                && (can_capture_text || can_capture_multimodal)
                 && self.mrope_decode_delta.is_none()
                 && let Some(scope) = self.prompt_cache_scope.as_deref()
-                && let Some(ticket) = stage.capture_prompt(
+            {
+                let captured_images: Vec<crate::architectures::ImageSpanKey> =
+                    if can_capture_multimodal {
+                        self.prompt_image_keys
+                            .as_deref()
+                            .unwrap_or(&[])
+                            .iter()
+                            .filter(|key| key.start.saturating_add(key.len) <= end)
+                            .cloned()
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                if let Some(ticket) = stage.capture_prompt_with_images(
                     scope,
                     &self.prompt_tokens[..end],
+                    &captured_images,
                     !self.speculative_disabled,
                     &self.cache,
                     &logits,
                     shared,
-                )?
-            {
-                self.prompt_cache_tickets.push(ticket);
+                )? {
+                    self.prompt_cache_tickets.push(ticket);
+                }
             }
             self.effective_skip = end;
             self.prune_consumed_image_spans(end);
@@ -914,9 +975,6 @@ impl GenerationSession {
             && (self.params.seed.is_none() && self.params.temperature > 0.0
                 || stage.options().speculative.allow_approximate)
             && stage.session_speculative_ready(&self.cache)
-            && self.mrope_decode_delta.is_none()
-            && self.prompt_embeddings.is_none()
-            && !self.has_prompt_images
             && !self.finished
     }
 
@@ -1262,7 +1320,10 @@ impl GenerationSession {
     pub fn can_speculative_batch(&self, stage: &PipelineStage) -> bool {
         // The qualified shared path accepts exactly eight verification rows.
         let rows = 8;
+        // The shared check verifies token rows at text positions.
         stage.supports_speculative_batch()
+            && self.mrope_decode_delta.is_none()
+            && !self.cache.has_embedded_prompt
             && self.speculative_eligible(stage)
             && self.next_input_token.is_some()
             && self.pending_tokens.is_empty()
@@ -3232,6 +3293,7 @@ mod tests {
                 start: 6,
                 embeddings: image_rows.clone(),
                 bidirectional: false,
+                digest: None,
             }],
             params.clone(),
             vec![],
@@ -3306,6 +3368,7 @@ mod tests {
                 start: 5,
                 embeddings: image_rows,
                 bidirectional: true,
+                digest: None,
             }],
             params,
             vec![],
@@ -3358,6 +3421,7 @@ mod tests {
                 start: 4,
                 embeddings: image_rows,
                 bidirectional: false,
+                digest: None,
             }],
             positions,
             params,
@@ -3373,6 +3437,262 @@ mod tests {
         session.step(&mut stage)?;
         assert_eq!(session.generated().len(), 2);
         session.discard_cache(&mut stage);
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_image_prompt_reuses_draft_prefix_and_runs_speculative_decode() -> anyhow::Result<()> {
+        let (mut stage, _) = crate::session_state_tests::speculative_boundary_stage(32, Some(32))?;
+        let scope = "user:multimodal-draft";
+        let prefix = vec![0u32, 0, 1, 1];
+        let params = SamplingParams {
+            temperature: 0.7,
+            seed: None,
+            max_tokens: 4,
+            ..Default::default()
+        };
+
+        // Warm a draft-enabled text-only prefix into the prompt cache.
+        let mut warm = GenerationSession::new(&stage, prefix.clone(), params.clone(), vec![]);
+        warm.set_speculative_decoding_enabled(&stage, true);
+        warm.enable_prompt_cache(scope.into());
+        while !warm.is_finished() {
+            warm.step(&mut stage)?;
+        }
+        assert!(warm.speculative_stats().passes > 0);
+        warm.publish_prompt_cache(&mut stage);
+        warm.discard_cache(&mut stage);
+
+        // Multimodal session with plain 1D causal positions (e.g. Inkling 2):
+        // reuses the pre-image draft prefix, injects image + trailing text into
+        // the draft cache, and runs speculative decode after prefill.
+        let image_rows = candle_core::Tensor::from_vec(
+            vec![0.25f32; 2 * stage.hidden_dim()],
+            (2, stage.hidden_dim()),
+            stage.device(),
+        )?;
+        let mut tokens = prefix.clone();
+        tokens.extend_from_slice(&[0, 0, 1, 1]);
+        let mut session = GenerationSession::new_with_image_spans(
+            &stage,
+            tokens.clone(),
+            vec![ImageEmbeddingSpan {
+                start: 4,
+                embeddings: image_rows.clone(),
+                bidirectional: false,
+                digest: None,
+            }],
+            params.clone(),
+            vec![],
+        )?;
+        session.set_speculative_decoding_enabled(&stage, true);
+        session.enable_prompt_cache(scope.into());
+
+        // First chunk reuses the 4-token text prefix with draft cache intact,
+        // then prefills the 2-token image span into both target and draft.
+        assert!(session.step_with_prefill_budget(&mut stage, 2)?.is_none());
+        assert_eq!(session.reused_prompt_tokens(), 4);
+        assert_eq!(session.next_position(&stage), 6);
+        assert!(stage.session_speculative_ready(&session.cache));
+        assert_eq!(
+            session
+                .cache
+                .speculative_cache
+                .as_ref()
+                .map(|cache| cache.next_position()),
+            Some(6)
+        );
+
+        // Finish prefill and decode: DFlash/DSpark must run speculative passes.
+        while !session.is_finished() {
+            let _ = session.step_with_prefill_budget(&mut stage, 2)?;
+        }
+        assert!(
+            session.speculative_stats().passes > 0,
+            "expected speculative passes after multimodal prefill"
+        );
+        assert!(session.speculative_stats().committed_tokens > 0);
+        // Multimodal session still must not publish to the text-only prompt cache.
+        assert_eq!(session.terminal_cache_tokens(&stage), None);
+        session.publish_prompt_cache(&mut stage);
+        assert_eq!(stage.prompt_cache_match_tokens(scope, &tokens), (0, 4));
+        session.discard_cache(&mut stage);
+
+        // Positioned M-RoPE multimodal sessions (e.g. Qwen3.5) reuse the
+        // pre-image text prefix and resume speculative decoding after the
+        // image, verifying at text positions shifted by the decode delta.
+        let positions = MropePositionIds::new(
+            vec![0, 1, 2, 3, 4, 4, 5, 6],
+            vec![0, 1, 2, 3, 4, 4, 5, 6],
+            vec![0, 1, 2, 3, 4, 5, 5, 6],
+        )?;
+        let mut mrope = GenerationSession::new_with_positioned_image_spans(
+            &stage,
+            tokens,
+            vec![ImageEmbeddingSpan {
+                start: 4,
+                embeddings: image_rows.clone(),
+                bidirectional: false,
+                digest: None,
+            }],
+            positions,
+            params.clone(),
+            vec![],
+        )?;
+        mrope.set_speculative_decoding_enabled(&stage, true);
+        mrope.enable_prompt_cache(scope.into());
+        while !mrope.is_finished() {
+            let _ = mrope.step_with_prefill_budget(&mut stage, 2)?;
+        }
+        assert_eq!(mrope.reused_prompt_tokens(), 4);
+        assert!(mrope.speculative_stats().passes > 0);
+        mrope.discard_cache(&mut stage);
+        stage.clear_prompt_cache();
+        assert_eq!(stage.total_kv_cache_allocation_tokens(), 0);
+
+        // If only a non-draft text prefix is cached, a draft-enabled multimodal
+        // session skips it rather than dropping its speculative cache.
+        let mut scalar_warm = GenerationSession::new(&stage, prefix, params.clone(), vec![]);
+        scalar_warm.set_speculative_decoding_enabled(&stage, false);
+        scalar_warm.enable_prompt_cache(scope.into());
+        while !scalar_warm.is_finished() {
+            scalar_warm.step(&mut stage)?;
+        }
+        assert_eq!(scalar_warm.speculative_stats().passes, 0);
+        scalar_warm.publish_prompt_cache(&mut stage);
+        scalar_warm.discard_cache(&mut stage);
+
+        let mut cold_draft = GenerationSession::new_with_image_spans(
+            &stage,
+            vec![0u32, 0, 1, 1, 0, 0, 1, 1],
+            vec![ImageEmbeddingSpan {
+                start: 4,
+                embeddings: image_rows,
+                bidirectional: false,
+                digest: None,
+            }],
+            params,
+            vec![],
+        )?;
+        cold_draft.set_speculative_decoding_enabled(&stage, true);
+        cold_draft.enable_prompt_cache(scope.into());
+        while !cold_draft.is_finished() {
+            let _ = cold_draft.step_with_prefill_budget(&mut stage, 4)?;
+        }
+        assert_eq!(cold_draft.reused_prompt_tokens(), 0);
+        assert!(cold_draft.speculative_stats().passes > 0);
+        cold_draft.discard_cache(&mut stage);
+        stage.clear_prompt_cache();
+        assert_eq!(stage.total_kv_cache_allocation_tokens(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn multimodal_prompt_cache_reuses_images_and_rejects_mismatched_digest() -> anyhow::Result<()> {
+        let (mut stage, _) = crate::session_state_tests::speculative_boundary_stage(64, Some(64))?;
+        let scope = "multimodal-digest-cache";
+        let params = SamplingParams {
+            temperature: 0.7,
+            max_tokens: 4,
+            ..Default::default()
+        };
+        let img1 = candle_core::Tensor::zeros(
+            (2, 64),
+            candle_core::DType::F32,
+            &candle_core::Device::Cpu,
+        )?;
+        let img2 =
+            candle_core::Tensor::ones((2, 64), candle_core::DType::F32, &candle_core::Device::Cpu)?;
+        let digest1 = [0x11u8; 32];
+        let digest2 = [0x22u8; 32];
+        let digest_other = [0x99u8; 32];
+
+        // Turn 1: [0,0,1,1, IMG1(2), 1,1] (8 tokens), publishes image-keyed snapshot.
+        let mut turn1 = GenerationSession::new_with_image_spans(
+            &stage,
+            vec![0u32, 0, 1, 1, 0, 0, 1, 1],
+            vec![ImageEmbeddingSpan {
+                start: 4,
+                embeddings: img1.clone(),
+                bidirectional: false,
+                digest: Some(digest1),
+            }],
+            params.clone(),
+            vec![],
+        )?;
+        turn1.set_speculative_decoding_enabled(&stage, true);
+        turn1.enable_prompt_cache(scope.into());
+        while !turn1.is_finished() {
+            let _ = turn1.step_with_prefill_budget(&mut stage, 4)?;
+        }
+        assert_eq!(turn1.reused_prompt_tokens(), 0);
+        assert!(turn1.speculative_stats().passes > 0);
+        turn1.publish_prompt_cache(&mut stage);
+        turn1.discard_cache(&mut stage);
+
+        // Turn 2: appends IMG2 + suffix after Turn 1's 8 tokens -> reuses all 8 tokens!
+        let mut turn2 = GenerationSession::new_with_image_spans(
+            &stage,
+            vec![0u32, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1],
+            vec![
+                ImageEmbeddingSpan {
+                    start: 4,
+                    embeddings: img1.clone(),
+                    bidirectional: false,
+                    digest: Some(digest1),
+                },
+                ImageEmbeddingSpan {
+                    start: 8,
+                    embeddings: img2.clone(),
+                    bidirectional: false,
+                    digest: Some(digest2),
+                },
+            ],
+            params.clone(),
+            vec![],
+        )?;
+        turn2.set_speculative_decoding_enabled(&stage, true);
+        turn2.enable_prompt_cache(scope.into());
+        while !turn2.is_finished() {
+            let _ = turn2.step_with_prefill_budget(&mut stage, 4)?;
+        }
+        assert_eq!(turn2.reused_prompt_tokens(), 8);
+        assert!(turn2.speculative_stats().passes > 0);
+        turn2.discard_cache(&mut stage);
+
+        // Mismatched image digest at start=4 must NOT reuse Turn 1's KV state.
+        let mut mismatch = GenerationSession::new_with_image_spans(
+            &stage,
+            vec![0u32, 0, 1, 1, 0, 0, 1, 1, 1],
+            vec![ImageEmbeddingSpan {
+                start: 4,
+                embeddings: img1,
+                bidirectional: false,
+                digest: Some(digest_other),
+            }],
+            params.clone(),
+            vec![],
+        )?;
+        mismatch.set_speculative_decoding_enabled(&stage, true);
+        mismatch.enable_prompt_cache(scope.into());
+        while !mismatch.is_finished() {
+            let _ = mismatch.step_with_prefill_budget(&mut stage, 4)?;
+        }
+        assert_eq!(mismatch.reused_prompt_tokens(), 0);
+        mismatch.discard_cache(&mut stage);
+
+        // Plain-text prompt with identical token IDs must NOT reuse Turn 1's multimodal KV state.
+        let mut plain =
+            GenerationSession::new(&stage, vec![0u32, 0, 1, 1, 0, 0, 1, 1, 1], params, vec![]);
+        plain.set_speculative_decoding_enabled(&stage, true);
+        plain.enable_prompt_cache(scope.into());
+        while !plain.is_finished() {
+            let _ = plain.step_with_prefill_budget(&mut stage, 4)?;
+        }
+        assert_eq!(plain.reused_prompt_tokens(), 0);
+        plain.discard_cache(&mut stage);
+        stage.clear_prompt_cache();
+        assert_eq!(stage.total_kv_cache_allocation_tokens(), 0);
         Ok(())
     }
 }

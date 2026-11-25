@@ -59,14 +59,14 @@ use crate::turboquant::TurboQuantConfig;
 
 /// Tokens per internal pass. Longer requests run as consecutive chunks so
 /// bias tables, masks and expert routes stay bounded.
-const MAX_CHUNK_TOKENS: usize = 512;
+const MAX_CHUNK_TOKENS: usize = 2048;
 /// Upper bound on `heads * queries * keys` for one attention score block.
 const MAX_SCORE_ELEMENTS: usize = 1 << 24;
 /// Rows up to which quantized projections use the decode kernel's rows.
 #[cfg(target_os = "macos")]
 const DECODE_ROWS_MAX_TOKENS: usize = 8;
 /// Expert route rows per dispatch, as in the other MoE stages.
-const MAX_ROUTE_ROWS: usize = 4096;
+const MAX_ROUTE_ROWS: usize = 16384;
 /// Epsilon of the unweighted norms inside the attention residuals.
 const RESIDUAL_NORM_EPS: f64 = 1e-6;
 /// Epsilon added to head norms before clipping.
@@ -309,6 +309,57 @@ impl Inkling2Cache {
         Ok(Self {
             visits,
             position: self.position,
+            pending: None,
+        })
+    }
+
+    /// Exports live K/V and convolution tensors for disk persistence.
+    pub(crate) fn export_tensors(
+        &self,
+    ) -> Result<(usize, Vec<(Option<(Tensor, Tensor)>, [Option<Tensor>; 4])>)> {
+        let visits = self
+            .visits
+            .iter()
+            .map(|visit| {
+                let kv = visit.kv.as_ref().map(live_kv).transpose()?;
+                Ok((kv, visit.conv.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((self.position, visits))
+    }
+
+    /// Reconstructs an [`Inkling2Cache`] from exported K/V and convolution tensors.
+    pub(crate) fn import_tensors(
+        position: usize,
+        visits: Vec<(Option<(Tensor, Tensor)>, [Option<Tensor>; 4])>,
+    ) -> Result<Self> {
+        let visits = visits
+            .into_iter()
+            .map(|(kv, conv)| {
+                let kv = kv
+                    .map(|(k, v)| {
+                        Ok::<_, anyhow::Error>(KvCache::PreallocatedF16(
+                            PreallocatedKvCache::from_f16(
+                                copy_persistent_tensor(&k)?,
+                                copy_persistent_tensor(&v)?,
+                            )?,
+                        ))
+                    })
+                    .transpose()?;
+                let mut persistent_conv = [None, None, None, None];
+                for (slot, state) in persistent_conv.iter_mut().zip(conv) {
+                    *slot = state.as_ref().map(copy_persistent_tensor).transpose()?;
+                }
+                Ok(VisitState {
+                    kv,
+                    conv: persistent_conv,
+                    rollback: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            visits,
+            position,
             pending: None,
         })
     }
@@ -806,8 +857,7 @@ impl MessageGate {
             let joined = super::inkling2_metal::rms_pair_half(&x, &message, self.eps as f32)?;
             if let Some(down) =
                 super::inkling2_tensor_metal::try_f16_rows_times_transposed(&joined, down_h)?
-                && let Some(fg) =
-                    super::inkling2_tensor_metal::try_f16_rows_times_nt(&down, fg_h)?
+                && let Some(fg) = super::inkling2_tensor_metal::try_f16_rows_times_nt(&down, fg_h)?
             {
                 let gated = super::inkling2_metal::gate_combine_norm(
                     &fg,
@@ -1099,9 +1149,7 @@ impl Projection {
                 .iter()
                 .map(|(projection, x)| match projection {
                     Self::Bf16(weight)
-                        if x.rank() == 2
-                            && x.device().is_metal()
-                            && x.dim(0).ok() == Some(1) =>
+                        if x.rank() == 2 && x.device().is_metal() && x.dim(0).ok() == Some(1) =>
                     {
                         Some((*x, weight))
                     }

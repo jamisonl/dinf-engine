@@ -1432,7 +1432,12 @@ pub(crate) fn forward_down_post_conv_1(
         },
     );
     let out_t = Tensor::from((
-        Storage::Metal(MetalStorage::new(out_buf, device.clone(), out_dim, DType::F32)),
+        Storage::Metal(MetalStorage::new(
+            out_buf,
+            device.clone(),
+            out_dim,
+            DType::F32,
+        )),
         Shape::from((1, out_dim)),
     ));
     let state_t = Tensor::from((
@@ -1572,8 +1577,7 @@ fn run(
             let active_plan = match plan {
                 Some(p) if p.routes == routes => p,
                 _ => {
-                    let total_u32s =
-                        RawRoutePlan::HEADER_U32S + routes * (2 + GROUPED_SLOT_ROUTES);
+                    let total_u32s = RawRoutePlan::HEADER_U32S + routes * (2 + GROUPED_SLOT_ROUTES);
                     let buf = device
                         .new_buffer_builder()
                         .with_size_for(total_u32s, DType::U32)

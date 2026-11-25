@@ -1824,16 +1824,24 @@ impl MetalTensorQMatMul {
         if !in_dim.is_multiple_of(packed.dtype().block_size()) {
             return Ok(None);
         }
-        let raw = packed.data()?.into_owned();
         let expected = out_dim * in_dim / packed.dtype().block_size() * packed.dtype().type_size();
-        if raw.len() != expected {
-            candle_core::bail!(
-                "packed tensor storage has {} bytes, expected {expected}",
-                raw.len()
-            )
-        }
-        let raw_len = raw.len();
-        let weights = Tensor::from_vec(raw, raw_len, device)?;
+        let weights = match crate::gguf_loader::tensor_source::with_bytes(&packed, |raw| {
+            (raw.len() == expected)
+                .then(|| Tensor::from_raw_buffer(raw, DType::U8, &[raw.len()], device))
+        }) {
+            Some(Some(weights)) => weights?,
+            _ => {
+                let raw = packed.data()?.into_owned();
+                if raw.len() != expected {
+                    candle_core::bail!(
+                        "packed tensor storage has {} bytes, expected {expected}",
+                        raw.len()
+                    )
+                }
+                let raw_len = raw.len();
+                Tensor::from_vec(raw, raw_len, device)?
+            }
+        };
         let dtype = packed.dtype();
         Ok(Some(Self {
             weights,
@@ -1943,19 +1951,24 @@ impl MetalTensorQMatMul {
                 .ok_or_else(|| candle_core::Error::Msg("grouped weight size overflow".into()))?;
         }
         let in_dim = in_dim.unwrap();
-        let mut raw = Vec::with_capacity(expected_bytes);
-        for tensor in packed {
-            let bytes = tensor.data()?;
-            raw.extend_from_slice(bytes.as_ref());
-        }
-        if raw.len() != expected_bytes {
-            candle_core::bail!(
-                "grouped packed tensor storage has {} bytes, expected {expected_bytes}",
-                raw.len()
-            )
-        }
-        let raw_len = raw.len();
-        let weights = Tensor::from_vec(raw, raw_len, device)?;
+        let weights = match grouped_from_tensor_source(packed, expected_bytes, device)? {
+            Some(weights) => weights,
+            None => {
+                let mut raw = Vec::with_capacity(expected_bytes);
+                for tensor in packed {
+                    let bytes = tensor.data()?;
+                    raw.extend_from_slice(bytes.as_ref());
+                }
+                if raw.len() != expected_bytes {
+                    candle_core::bail!(
+                        "grouped packed tensor storage has {} bytes, expected {expected_bytes}",
+                        raw.len()
+                    )
+                }
+                let raw_len = raw.len();
+                Tensor::from_vec(raw, raw_len, device)?
+            }
+        };
         Ok(Some(Self {
             weights,
             dtype,
@@ -2709,6 +2722,51 @@ impl CustomOp2 for TensorQMatMul {
             .with_size_for(output_elements, DType::F32)
             .with_label("dinf-metal4-tensor-qmatmul")
             .build()?;
+        // Pre-M5 GPUs verify draft blocks fastest with the few-row kernels:
+        // each weight is read once for all rows. They write `[rows, out_dim]`,
+        // not the group-major layout of `output_groups`.
+        if self.profile == MetalTensorProfile::PreM5
+            && self.output_groups.is_none()
+            && !self.decode_rows
+            && !self.relu_squared_epilogue
+            && super::few_row_mma_metal::dispatch(
+                self.dtype,
+                self.in_dim,
+                self.out_dim,
+                batch * tokens,
+                weights,
+                input,
+                input_layout,
+                &output,
+            )?
+        {
+            return Ok((
+                MetalStorage::new(output, device.clone(), output_elements, DType::F32),
+                output_shape,
+            ));
+        }
+        // Prompt batches on pre-M5 GPUs: the steel-layout tiled kernel,
+        // which skips bounds checks on whole tiles.
+        if self.profile == MetalTensorProfile::PreM5
+            && self.output_groups.is_none()
+            && !self.decode_rows
+            && !self.relu_squared_epilogue
+            && super::few_row_mma_metal::dispatch_mm(
+                self.dtype,
+                self.in_dim,
+                self.out_dim,
+                batch * tokens,
+                weights,
+                input,
+                input_layout,
+                &output,
+            )?
+        {
+            return Ok((
+                MetalStorage::new(output, device.clone(), output_elements, DType::F32),
+                output_shape,
+            ));
+        }
         let tensor_dispatched = !self.decode_rows
             && dispatch_tensor_qmatmul(
                 self.dtype,
@@ -2753,6 +2811,41 @@ impl CustomOp2 for TensorQMatMul {
             output_shape,
         ))
     }
+}
+
+/// Concatenate grouped weights from the stage loader's file (see
+/// [`crate::gguf_loader::tensor_source`]). The pieces are joined in an
+/// anonymous mapping, which returns to the OS when dropped, so the upload
+/// leaves no freed heap behind. `None` when any piece was not recorded or has
+/// an unexpected size.
+fn grouped_from_tensor_source(
+    packed: &[Arc<QTensor>],
+    expected_bytes: usize,
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    use crate::gguf_loader::tensor_source;
+    if expected_bytes == 0 || !packed.iter().all(tensor_source::contains) {
+        return Ok(None);
+    }
+    let mut joined =
+        memmap2::MmapMut::map_anon(expected_bytes).map_err(candle_core::Error::wrap)?;
+    let mut offset = 0usize;
+    for tensor in packed {
+        let copied = tensor_source::with_bytes(tensor, |raw| {
+            let end = offset.checked_add(raw.len())?;
+            joined.get_mut(offset..end)?.copy_from_slice(raw);
+            Some(end)
+        })
+        .flatten();
+        match copied {
+            Some(end) => offset = end,
+            None => return Ok(None),
+        }
+    }
+    if offset != expected_bytes {
+        return Ok(None);
+    }
+    Tensor::from_raw_buffer(&joined, DType::U8, &[expected_bytes], device).map(Some)
 }
 
 thread_local! {

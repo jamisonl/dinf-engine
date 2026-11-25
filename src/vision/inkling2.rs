@@ -223,28 +223,30 @@ impl Inkling2VisionEncoder {
         // VRAM (~637 MB instead of ~1.27 GB) and run them on Tensor Cores via
         // cuBLAS gemm_ex with F32 accumulation and output.
         let keep_bf16 = cfg!(feature = "cuda") && device.is_cuda();
-        let mut shaped_with_bf16 = |name: &str, shape: &[usize], allow_bf16: bool| -> Result<Tensor> {
-            let qt = content
-                .tensor(&mut file, name, &Device::Cpu)
-                .with_context(|| format!("vision projector is missing {name}"))?;
-            anyhow::ensure!(
-                qt.shape().dims() == shape,
-                "vision tensor {name} has shape {:?}, expected {shape:?}",
-                qt.shape().dims()
-            );
-            if allow_bf16 && keep_bf16 && qt.dtype() == candle_core::quantized::GgmlDType::BF16 {
-                return Ok(Tensor::from_raw_buffer(
-                    &qt.data()?,
-                    DType::BF16,
-                    shape,
-                    device,
-                )?);
-            }
-            Ok(qt
-                .dequantize(&Device::Cpu)?
-                .to_dtype(DType::F32)?
-                .to_device(device)?)
-        };
+        let mut shaped_with_bf16 =
+            |name: &str, shape: &[usize], allow_bf16: bool| -> Result<Tensor> {
+                let qt = content
+                    .tensor(&mut file, name, &Device::Cpu)
+                    .with_context(|| format!("vision projector is missing {name}"))?;
+                anyhow::ensure!(
+                    qt.shape().dims() == shape,
+                    "vision tensor {name} has shape {:?}, expected {shape:?}",
+                    qt.shape().dims()
+                );
+                if allow_bf16 && keep_bf16 && qt.dtype() == candle_core::quantized::GgmlDType::BF16
+                {
+                    return Ok(Tensor::from_raw_buffer(
+                        &qt.data()?,
+                        DType::BF16,
+                        shape,
+                        device,
+                    )?);
+                }
+                Ok(qt
+                    .dequantize(&Device::Cpu)?
+                    .to_dtype(DType::F32)?
+                    .to_device(device)?)
+            };
         let patch_embedding = Dense {
             weight: shaped_with_bf16("v.patch_embd.weight", &[hidden, 3, patch, patch], true)?
                 .reshape((hidden, 3 * patch * patch))?

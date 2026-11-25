@@ -267,22 +267,10 @@ impl SamplingHistory {
                 mask.len(),
                 logits.len()
             );
-            let candidates = logits
-                .into_iter()
-                .enumerate()
-                .filter(|(id, _)| mask.is_allowed(*id as u32))
-                .collect::<Vec<_>>();
-            anyhow::ensure!(!candidates.is_empty(), "tool grammar permits no token");
             let token = if params.temperature <= 0.0 {
-                let mut best = candidates[0];
-                for candidate in &candidates[1..] {
-                    if candidate.1 > best.1 {
-                        best = *candidate;
-                    }
-                }
-                u32::try_from(best.0)?
+                checked_first_allowed_argmax(&logits, &mask)?
             } else {
-                sample_positive_candidates(candidates, params, rng)?
+                sample_positive_masked(&logits, &mask, params, rng)?
             };
             crate::tool_constraints::commit(&mut matcher, token)?;
             return Ok(token);
@@ -528,6 +516,200 @@ pub fn sample_token_with_penalties_with_rng(
     SamplingHistory::new(prev_tokens, params).sample_penalized_validated(logits, params, rng)
 }
 
+/// Return the first maximum among mask-allowed tokens in a finite host-side
+/// logits buffer without allocating a full-vocabulary candidate list.
+fn checked_first_allowed_argmax(logits: &[f32], mask: &toktrie::SimpleVob) -> Result<u32> {
+    let mut best: Option<(usize, f32)> = None;
+    for (id, &logit) in logits.iter().enumerate() {
+        if !mask.is_allowed(id as u32) {
+            continue;
+        }
+        match best {
+            Some((_, best_logit)) if logit <= best_logit => {}
+            _ => best = Some((id, logit)),
+        }
+    }
+    let (best_id, _) = best.ok_or_else(|| anyhow::anyhow!("tool grammar permits no token"))?;
+    u32::try_from(best_id).map_err(|_| anyhow::anyhow!("argmax token index exceeds u32"))
+}
+
+/// Sample a positive-temperature token from mask-allowed logits without
+/// allocating or sorting the full vocabulary on large masks.
+fn sample_positive_masked(
+    logits: &[f32],
+    mask: &toktrie::SimpleVob,
+    params: &SamplingParams,
+    rng: &mut SamplingRng,
+) -> Result<u32> {
+    // Bounded top-k selection: avoid allocating a full-vocabulary candidate
+    // Vec when k is much smaller than the vocabulary.
+    if params.top_k > 0 && params.top_k <= logits.len() / 4 {
+        let k = params.top_k;
+        let mut top: Vec<(usize, f32)> = Vec::with_capacity(k * 2);
+        let mut threshold = f32::NEG_INFINITY;
+        for (id, &logit) in logits.iter().enumerate() {
+            if !mask.is_allowed(id as u32) {
+                continue;
+            }
+            if top.len() < k {
+                top.push((id, logit));
+                if top.len() == k {
+                    threshold = top.iter().map(|&(_, l)| l).fold(f32::INFINITY, f32::min);
+                }
+            } else if logit > threshold {
+                top.push((id, logit));
+                if top.len() == k * 2 {
+                    top.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+                    top.truncate(k);
+                    threshold = top[k - 1].1;
+                }
+            }
+        }
+        anyhow::ensure!(!top.is_empty(), "tool grammar permits no token");
+        if top.len() > k {
+            top.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+            top.truncate(k);
+        }
+        return sample_positive_candidates(top, params, rng);
+    }
+
+    // Fast head-filtered path when top_k is disabled on large vocabularies:
+    // matches `sample_positive_from_logits_vec` while respecting `mask`.
+    if params.top_k == 0 && logits.len() > 2048 && params.temperature > 1e-6 {
+        let mut max_logit = f32::NEG_INFINITY;
+        let mut allowed_count = 0usize;
+        for (id, &logit) in logits.iter().enumerate() {
+            if !mask.is_allowed(id as u32) {
+                continue;
+            }
+            allowed_count += 1;
+            if logit > max_logit {
+                max_logit = logit;
+            }
+        }
+        anyhow::ensure!(allowed_count > 0, "tool grammar permits no token");
+
+        if allowed_count > 2048 {
+            let inv_t = 1.0 / params.temperature;
+            let max_logit_f64 = f64::from(max_logit);
+            let head_cutoff = max_logit_f64 - 20.0 * params.temperature;
+            let zero_cutoff = max_logit_f64 - 40.0 * params.temperature;
+            let head_limit = allowed_count / 4;
+            let mut head: Vec<(usize, f32)> = Vec::with_capacity(256);
+            let mut tail_sum = 0.0f64;
+            let mut head_overflow = false;
+            for (id, &logit) in logits.iter().enumerate() {
+                if !mask.is_allowed(id as u32) {
+                    continue;
+                }
+                let logit_f64 = f64::from(logit);
+                if logit_f64 >= head_cutoff {
+                    if head.len() >= head_limit {
+                        head_overflow = true;
+                        break;
+                    }
+                    head.push((id, logit));
+                } else if logit_f64 >= zero_cutoff {
+                    tail_sum += ((logit_f64 - max_logit_f64) * inv_t).exp();
+                }
+            }
+            if !head_overflow && !head.is_empty() {
+                head.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+                let mut probs: Vec<f64> = head
+                    .iter()
+                    .map(|(_, logit)| ((f64::from(*logit) - max_logit_f64) * inv_t).exp())
+                    .collect();
+                let head_sum: f64 = probs.iter().sum();
+                let total_sum = head_sum + tail_sum;
+                if total_sum > 0.0 {
+                    if params.top_p < 1.0 {
+                        if head_sum / total_sum >= params.top_p {
+                            for p in &mut probs {
+                                *p /= total_sum;
+                            }
+                            let mut cumulative = 0.0f64;
+                            let mut cutoff_idx = probs.len();
+                            for (i, &prob) in probs.iter().enumerate() {
+                                cumulative += prob;
+                                if cumulative >= params.top_p {
+                                    cutoff_idx = i + 1;
+                                    break;
+                                }
+                            }
+                            probs.truncate(cutoff_idx);
+                            head.truncate(cutoff_idx);
+                            let kept_sum: f64 = probs.iter().sum();
+                            if kept_sum > 0.0 {
+                                for p in &mut probs {
+                                    *p /= kept_sum;
+                                }
+                            }
+                            let r = f64::from(rng.next_f32());
+                            let mut cumulative = 0.0f64;
+                            for ((token_id, _), &p) in head.iter().zip(&probs) {
+                                cumulative += p;
+                                if r < cumulative {
+                                    return Ok(*token_id as u32);
+                                }
+                            }
+                            if let Some(((id, _), _)) =
+                                head.iter().zip(&probs).rfind(|(_, p)| **p > 0.0)
+                            {
+                                return Ok(*id as u32);
+                            }
+                        }
+                    } else {
+                        let r = f64::from(rng.next_f32());
+                        let target = r * total_sum;
+                        if target < head_sum || tail_sum == 0.0 {
+                            let mut cumulative = 0.0f64;
+                            for ((token_id, _), &p) in head.iter().zip(&probs) {
+                                cumulative += p;
+                                if target < cumulative {
+                                    return Ok(*token_id as u32);
+                                }
+                            }
+                            if let Some(((id, _), _)) =
+                                head.iter().zip(&probs).rfind(|(_, p)| **p > 0.0)
+                            {
+                                return Ok(*id as u32);
+                            }
+                        }
+                        // Rare tail draw: consume no extra RNG and finish over the sorted allowed tail.
+                        let mut tail: Vec<(usize, f32)> = logits
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .filter(|&(id, logit)| {
+                                mask.is_allowed(id as u32) && f64::from(logit) < head_cutoff
+                            })
+                            .collect();
+                        tail.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+                        let mut cumulative = head_sum;
+                        for (token_id, logit) in &tail {
+                            let p = ((f64::from(*logit) - max_logit_f64) * inv_t).exp();
+                            cumulative += p;
+                            if target < cumulative {
+                                return Ok(*token_id as u32);
+                            }
+                        }
+                        return Ok(tail.first().map_or(head[0].0, |(id, _)| *id) as u32);
+                    }
+                }
+            }
+        }
+    }
+
+    let candidates: Vec<(usize, f32)> = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(id, _)| mask.is_allowed(id as u32))
+        .collect();
+    anyhow::ensure!(!candidates.is_empty(), "tool grammar permits no token");
+    sample_positive_candidates(candidates, params, rng)
+}
+
 /// Return the first maximum from a finite host-side logits buffer.
 ///
 /// Candle and the fused Metal greedy reduction both resolve equal maxima to
@@ -677,11 +859,7 @@ fn positive_target_distribution(
     }
     let inv_t = 1.0 / params.temperature;
     // Fast head-filtered path for large vocabularies when top_k == 0 and top_p < 1.0.
-    if params.top_k == 0
-        && params.top_p < 1.0
-        && logits.len() > 2048
-        && params.temperature > 1e-6
-    {
+    if params.top_k == 0 && params.top_p < 1.0 && logits.len() > 2048 && params.temperature > 1e-6 {
         let head_cutoff = max_logit - (20.0 * params.temperature) as f32;
         let zero_cutoff = max_logit - (40.0 * params.temperature) as f32;
         let mut head: Vec<(usize, f32)> = Vec::with_capacity(256);
@@ -1799,5 +1977,192 @@ mod tests {
                 "token {id}: empirical={empirical:.4}, exact={p:.4}"
             );
         }
+    }
+
+    fn reference_masked_sample(
+        logits: &[f32],
+        mask: &toktrie::SimpleVob,
+        params: &SamplingParams,
+        rng: &mut SamplingRng,
+    ) -> Result<u32> {
+        let candidates: Vec<(usize, f32)> = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(id, _)| mask.is_allowed(id as u32))
+            .collect();
+        anyhow::ensure!(!candidates.is_empty(), "tool grammar permits no token");
+        if params.temperature <= 0.0 {
+            let mut best = candidates[0];
+            for &candidate in &candidates[1..] {
+                if candidate.1 > best.1 {
+                    best = candidate;
+                }
+            }
+            return Ok(u32::try_from(best.0)?);
+        }
+        sample_positive_candidates(candidates, params, rng)
+    }
+
+    #[test]
+    fn masked_greedy_matches_reference_tie_breaking_and_empty_mask() -> Result<()> {
+        // Empty mask returns exact error.
+        let empty = toktrie::SimpleVob::alloc(4);
+        let err = checked_first_allowed_argmax(&[1.0, 2.0, 3.0, 4.0], &empty)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tool grammar permits no token"), "{err}");
+
+        // Disallowed higher logit at index 0; tied allowed maxima at indices 2 and 4 -> picks 2.
+        let mut mask = toktrie::SimpleVob::alloc(6);
+        for id in [1u32, 2, 4, 5] {
+            mask.allow_token(id);
+        }
+        let logits = [100.0f32, -5.0, 3.5, 99.0, 3.5, 1.0];
+        assert_eq!(checked_first_allowed_argmax(&logits, &mask)?, 2);
+
+        // All-negative allowed logits down to -f32::MAX.
+        let mut neg_mask = toktrie::SimpleVob::alloc(3);
+        neg_mask.allow_token(1);
+        neg_mask.allow_token(2);
+        assert_eq!(
+            checked_first_allowed_argmax(&[10.0, -f32::MAX, -f32::MAX], &neg_mask)?,
+            1
+        );
+
+        // Large vocab comparison against reference.
+        let vocab = 8192usize;
+        let mut large_mask = toktrie::SimpleVob::alloc(vocab);
+        let mut large_logits = Vec::with_capacity(vocab);
+        for i in 0..vocab {
+            if i % 3 != 0 {
+                large_mask.allow_token(i as u32);
+            }
+            large_logits.push(((i * 97) % 500) as f32 - 250.0);
+        }
+        // Put a huge disallowed logit to ensure it is ignored.
+        large_logits[0] = 10_000.0;
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let mut rng = SamplingRng::seeded(1);
+        let expected = reference_masked_sample(&large_logits, &large_mask, &params, &mut rng)?;
+        let actual = checked_first_allowed_argmax(&large_logits, &large_mask)?;
+        assert_eq!(actual, expected);
+        assert!(large_mask.is_allowed(actual));
+        Ok(())
+    }
+
+    #[test]
+    fn masked_positive_sampling_matches_reference_across_paths() -> Result<()> {
+        let vocab = 8192usize;
+        let mut mask = toktrie::SimpleVob::alloc(vocab);
+        let mut logits = Vec::with_capacity(vocab);
+        for i in 0..vocab {
+            // Allow ~75% of tokens (> 2048 so fast head-filtered path engages).
+            if i % 4 != 0 {
+                mask.allow_token(i as u32);
+            }
+            // Distinct logits with a realistic peaked head and long tail.
+            let base = if i < 64 {
+                12.0 - (i as f32) * 0.25
+            } else {
+                -20.0 - ((i - 64) as f32) * 0.002
+            };
+            logits.push(base);
+        }
+        // Huge disallowed logits must never be selected or skew softmax max_logit.
+        logits[0] = 1_000.0;
+        logits[4] = 900.0;
+
+        let configs = [
+            // Fast head-filtered path with nucleus cutoff
+            SamplingParams {
+                temperature: 0.8,
+                top_k: 0,
+                top_p: 0.9,
+                ..Default::default()
+            },
+            // Fast head-filtered path with top_p = 1.0
+            SamplingParams {
+                temperature: 0.8,
+                top_k: 0,
+                top_p: 1.0,
+                ..Default::default()
+            },
+            // Bounded top-k path (k = 40)
+            SamplingParams {
+                temperature: 0.8,
+                top_k: 40,
+                top_p: 0.95,
+                ..Default::default()
+            },
+            // Bounded top-k = 1
+            SamplingParams {
+                temperature: 0.7,
+                top_k: 1,
+                top_p: 1.0,
+                ..Default::default()
+            },
+            // Tiny positive temperature (fallback path)
+            SamplingParams {
+                temperature: f64::MIN_POSITIVE,
+                top_k: 0,
+                top_p: 1.0,
+                ..Default::default()
+            },
+        ];
+
+        for params in &configs {
+            let mut ref_rng = SamplingRng::seeded(2026);
+            let mut opt_rng = SamplingRng::seeded(2026);
+            for step in 0..32 {
+                let expected = reference_masked_sample(&logits, &mask, params, &mut ref_rng)?;
+                let actual = sample_positive_masked(&logits, &mask, params, &mut opt_rng)?;
+                assert_eq!(
+                    actual, expected,
+                    "mismatch at step {step} for top_k={} top_p={} temp={}",
+                    params.top_k, params.top_p, params.temperature
+                );
+                assert!(mask.is_allowed(actual));
+            }
+            assert_eq!(opt_rng.state, ref_rng.state);
+        }
+
+        // Flat logits trigger head_overflow fallback cleanly and preserve RNG state.
+        let flat_logits = vec![1.0f32; vocab];
+        let flat_params = SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 0.9,
+            ..Default::default()
+        };
+        let mut ref_rng = SamplingRng::seeded(99);
+        let mut opt_rng = SamplingRng::seeded(99);
+        let expected = reference_masked_sample(&flat_logits, &mask, &flat_params, &mut ref_rng)?;
+        let actual = sample_positive_masked(&flat_logits, &mask, &flat_params, &mut opt_rng)?;
+        assert_eq!(actual, expected);
+        assert_eq!(opt_rng.state, ref_rng.state);
+
+        // Empty mask errors without advancing RNG across both top_k == 0 and top_k > 0.
+        let empty = toktrie::SimpleVob::alloc(vocab);
+        for top_k in [0usize, 40] {
+            let params = SamplingParams {
+                temperature: 0.8,
+                top_k,
+                top_p: 0.9,
+                ..Default::default()
+            };
+            let mut rng = SamplingRng::seeded(77);
+            let before = rng.state;
+            let err = sample_positive_masked(&logits, &empty, &params, &mut rng)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("tool grammar permits no token"), "{err}");
+            assert_eq!(rng.state, before);
+        }
+
+        Ok(())
     }
 }

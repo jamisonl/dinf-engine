@@ -2732,7 +2732,9 @@ pub(super) fn attention(
     let splits = if keys <= SINGLE_SPLIT_KEYS {
         1
     } else {
-        keys.div_ceil(KEYS_PER_SPLIT).min(wanted).clamp(1, MAX_SPLITS)
+        keys.div_ceil(KEYS_PER_SPLIT)
+            .min(wanted)
+            .clamp(1, MAX_SPLITS)
     };
     let chunk = keys.div_ceil(splits);
     let splits = keys.div_ceil(chunk);

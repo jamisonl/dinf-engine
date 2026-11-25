@@ -60,6 +60,40 @@ impl DFlash2Cache {
         })
     }
 
+    /// Exports live K/V tensors for disk persistence.
+    pub(crate) fn export_tensors(&self) -> (usize, Vec<Option<(Tensor, Tensor)>>) {
+        let layers = self
+            .layers
+            .iter()
+            .map(|layer| layer.as_ref().map(|kv| (kv.k.clone(), kv.v.clone())))
+            .collect();
+        (self.next_position, layers)
+    }
+
+    /// Reconstructs a [`DFlash2Cache`] from exported K/V tensors.
+    pub(crate) fn import_tensors(
+        next_position: usize,
+        layers: Vec<Option<(Tensor, Tensor)>>,
+    ) -> Result<Self> {
+        let layers = layers
+            .into_iter()
+            .map(|layer| {
+                layer
+                    .map(|(k, v)| {
+                        Ok::<_, anyhow::Error>(DraftKvCache {
+                            k: super::copy_persistent_tensor(&k)?,
+                            v: super::copy_persistent_tensor(&v)?,
+                        })
+                    })
+                    .transpose()
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            layers,
+            next_position,
+        })
+    }
+
     pub(crate) fn live_bytes(&self) -> usize {
         self.layers.iter().flatten().fold(0usize, |bytes, kv| {
             bytes

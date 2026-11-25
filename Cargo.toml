@@ -33,6 +33,8 @@ candle-nn = "0.11"
 chrono = "0.4"
 half = { version = "2", features = ["num-traits"] }
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+fs4 = "1"
+memmap2 = "0.9"
 llguidance = { version = "=1.9.1", default-features = false, features = ["lark"] }
 toktrie = "=1.9.1"
 tracing = "0.1"

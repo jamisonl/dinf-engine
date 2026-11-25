@@ -33,7 +33,7 @@ mod api;
 /// prefill. Matches llama.cpp's default micro-batch: large enough to keep the
 /// quantized matmul tiles full, small enough that one pass's temporary
 /// buffers stay bounded (Metal releases them only at a device wait).
-pub(crate) const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 512;
+pub(crate) const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 2048;
 
 /// Prompt length of the request [`PipelineStage::warmup`] serves on CUDA:
 /// past the 64-token point where prompt kernels such as Inkling 2's
@@ -45,6 +45,11 @@ const CUDA_WARMUP_PROMPT_TOKENS: usize = 128;
 pub mod architectures;
 /// Continuous-batching and speculative-decoding session helpers.
 pub mod continuous;
+mod disk_kv_cache;
+pub use disk_kv_cache::{
+    automatic_disk_kv_cache_limit_bytes, default_disk_kv_cache_limit_bytes, set_disk_kv_cache_dir,
+    set_disk_kv_cache_limit_bytes,
+};
 /// Graph-captured single-token decode steps on CUDA.
 #[cfg(feature = "cuda")]
 pub mod cuda_graph;
@@ -629,6 +634,30 @@ impl Drop for PipelineStage {
     }
 }
 
+/// End a stage load: drop the loader's file sources and return freed heap
+/// pages to the OS. Loading passes large buffers through the heap; the
+/// allocator keeps those pages after they are freed, so without this they
+/// count against the process footprint for the life of the process.
+fn release_freed_heap() {
+    gguf_loader::tensor_source::clear();
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a null zone asks every malloc zone to release free pages;
+        // a goal of 0 releases as much as possible.
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim only returns free heap pages to the OS.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 impl PipelineStage {
     /// Load a pipeline stage from a GGUF file for a given layer range.
     ///
@@ -641,7 +670,14 @@ impl PipelineStage {
         device: &Device,
         kv_quant_bits: Option<u8>,
     ) -> Result<Self> {
-        Self::from_gguf_source(Some(gguf_path), None, range, device, kv_quant_bits)
+        let stage = Self::from_gguf_source(Some(gguf_path), None, range, device, kv_quant_bits);
+        release_freed_heap();
+        // Weights replaced during construction wait in Candle's Metal buffer
+        // pool until a device wait empties it.
+        if stage.is_ok() && device.is_metal() {
+            device.synchronize()?;
+        }
+        stage
     }
 
     /// Load only from the retained, canonically verified native descriptor.
@@ -652,7 +688,14 @@ impl PipelineStage {
         device: &Device,
         kv_quant_bits: Option<u8>,
     ) -> Result<Self> {
-        Self::from_gguf_source(None, Some(source), range, device, kv_quant_bits)
+        let stage = Self::from_gguf_source(None, Some(source), range, device, kv_quant_bits);
+        release_freed_heap();
+        // Weights replaced during construction wait in Candle's Metal buffer
+        // pool until a device wait empties it.
+        if stage.is_ok() && device.is_metal() {
+            device.synchronize()?;
+        }
+        stage
     }
 
     fn from_gguf_source(
@@ -996,9 +1039,9 @@ impl PipelineStage {
     }
 
     pub(crate) fn session_speculative_ready(&self, state: &PipelineStageSessionState) -> bool {
+        // Embedded (image) and M-RoPE prompts qualify: their prefill feeds
+        // every row to the draft, and verification applies the decode delta.
         self.speculative.is_some()
-            && !state.has_embedded_prompt
-            && state.mrope_decode_delta.is_none()
             && state
                 .speculative_cache
                 .as_ref()
@@ -2283,10 +2326,19 @@ impl PipelineStage {
         inputs.extend_from_slice(&proposed);
         let target_started = Instant::now();
         let checkpoint = self.checkpoint_session_state(state)?;
+        // After an image, text positions carry the prompt's M-RoPE delta, as
+        // in scalar decode.
+        let verify_input = match state.mrope_decode_delta {
+            Some(delta) => StageInput::positioned_activations(
+                self.embed_tokens(&inputs)?,
+                MropePositionIds::text_with_delta(start_pos, delta, inputs.len())?,
+            ),
+            None => StageInput::Tokens(inputs.clone()),
+        };
         let verify = || {
             self.forward_with_session_pass(
                 state,
-                StageInput::Tokens(inputs.clone()),
+                verify_input.clone(),
                 inputs.len(),
                 start_pos,
                 ForwardPass::Standard {
@@ -5943,10 +5995,20 @@ mod session_state_tests {
                 start_pos + seq_len <= self.context_length,
                 "test rotary context exhausted"
             );
-            let StageInput::Tokens(tokens) = input else {
-                anyhow::bail!("boundary test requires tokens");
+            let inputs: Vec<f32> = match input {
+                StageInput::Tokens(tokens) => {
+                    anyhow::ensure!(tokens.len() == seq_len, "test token count differs");
+                    tokens.into_iter().map(|token| token as f32).collect()
+                }
+                StageInput::Activations { tensor, .. } => {
+                    anyhow::ensure!(
+                        tensor.dims() == [seq_len, self.capture_width],
+                        "test activation shape differs"
+                    );
+                    let rows = tensor.to_vec2::<f32>()?;
+                    rows.into_iter().map(|row| row[0]).collect()
+                }
             };
-            anyhow::ensure!(tokens.len() == seq_len, "test token count differs");
             self.forwards
                 .lock()
                 .unwrap()
@@ -5959,8 +6021,8 @@ mod session_state_tests {
                 Some(_) => anyhow::bail!("unexpected boundary cache"),
             };
             let mut rows = Vec::with_capacity(seq_len * 3);
-            for token in tokens {
-                values.push(token as f32);
+            for value in inputs {
+                values.push(value);
                 // An old prompt token affects every target row. Losing it
                 // before verification changes the next token immediately.
                 if values.contains(&2.0) {
@@ -6010,6 +6072,18 @@ mod session_state_tests {
                 .map(|_| Tensor::zeros((seq_len, self.capture_width), DType::F32, &Device::Cpu))
                 .collect::<candle_core::Result<Vec<_>>>()?;
             Ok((output, captures))
+        }
+
+        fn embed_tokens(&self, tokens: &[u32]) -> Result<Tensor> {
+            let mut data = vec![0.0f32; tokens.len() * self.capture_width];
+            for (row, &token) in tokens.iter().enumerate() {
+                data[row * self.capture_width] = token as f32;
+            }
+            Ok(Tensor::from_vec(
+                data,
+                (tokens.len(), self.capture_width),
+                &Device::Cpu,
+            )?)
         }
 
         fn family(&self) -> &str {

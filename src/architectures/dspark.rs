@@ -132,6 +132,47 @@ impl DSparkCache {
         })
     }
 
+    /// Exports live K/V and `f_rnn` tensors for disk persistence.
+    pub(crate) fn export_tensors(
+        &self,
+    ) -> Result<(usize, Vec<Option<(Tensor, Tensor)>>, Option<Tensor>)> {
+        let layers = self
+            .layers
+            .iter()
+            .map(|kv| kv.as_ref().map(live).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        Ok((self.next_position, layers, self.f_rnn.clone()))
+    }
+
+    /// Reconstructs a [`DSparkCache`] from exported K/V and `f_rnn` tensors.
+    pub(crate) fn import_tensors(
+        next_position: usize,
+        layers: Vec<Option<(Tensor, Tensor)>>,
+        f_rnn: Option<Tensor>,
+    ) -> Result<Self> {
+        let layers = layers
+            .into_iter()
+            .map(|kv| {
+                kv.map(|(k, v)| {
+                    Ok::<_, anyhow::Error>(KvCache::PreallocatedF16(PreallocatedKvCache::from_f16(
+                        super::copy_persistent_tensor(&k)?,
+                        super::copy_persistent_tensor(&v)?,
+                    )?))
+                })
+                .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let f_rnn = f_rnn
+            .as_ref()
+            .map(super::copy_persistent_tensor)
+            .transpose()?;
+        Ok(Self {
+            layers,
+            f_rnn,
+            next_position,
+        })
+    }
+
     pub(crate) fn live_bytes(&self) -> usize {
         let bytes = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
         self.layers
@@ -247,8 +288,16 @@ struct DraftLayer {
 
 #[cfg(target_os = "macos")]
 enum DraftHead {
-    Q4_0 { bytes: Tensor, vocab: usize, hidden: usize },
-    Q8_0 { bytes: Tensor, vocab: usize, hidden: usize },
+    Q4_0 {
+        bytes: Tensor,
+        vocab: usize,
+        hidden: usize,
+    },
+    Q8_0 {
+        bytes: Tensor,
+        vocab: usize,
+        hidden: usize,
+    },
 }
 
 /// Sampling parameters passed to DSpark when generating a block for exact
@@ -1006,40 +1055,39 @@ impl DSparkDraft {
                     let q_folded = q_folded.expect("folded queries");
                     let mut scratch = kv.as_ref().map(share);
                     let (k_all, v_all) = kv_cache_update_native(&mut scratch, k, v, None)?;
-                    let attention = if self.head_dim == 128
-                        && self.heads.is_multiple_of(self.kv_heads)
-                    {
-                        super::dspark_metal::attend_128(
+                    let attention =
+                        if self.head_dim == 128 && self.heads.is_multiple_of(self.kv_heads) {
+                            super::dspark_metal::attend_128(
+                                &q_folded,
+                                &k_all,
+                                &v_all,
+                                block_size,
+                                self.heads,
+                                self.kv_heads,
+                                scale as f32,
+                            )?
+                        } else if let Some(out) = super::try_fused_f16_sdpa_native(
                             &q_folded,
                             &k_all,
                             &v_all,
-                            block_size,
-                            self.heads,
-                            self.kv_heads,
+                            false,
                             scale as f32,
-                        )?
-                    } else if let Some(out) = super::try_fused_f16_sdpa_native(
-                        &q_folded,
-                        &k_all,
-                        &v_all,
-                        false,
-                        scale as f32,
-                    )? {
-                        super::dspark_metal::attn_unfold(
-                            &out,
-                            block_size,
-                            self.heads,
-                            self.head_dim,
-                        )?
-                    } else {
-                        let q = q_folded
-                            .reshape((1, self.heads, block_size, self.head_dim))?
-                            .to_dtype(DType::F32)?;
-                        self.attend(&q, &k_all, &v_all, scale)?
-                            .transpose(1, 2)?
-                            .contiguous()?
-                            .reshape((block_size, self.heads * self.head_dim))?
-                    };
+                        )? {
+                            super::dspark_metal::attn_unfold(
+                                &out,
+                                block_size,
+                                self.heads,
+                                self.head_dim,
+                            )?
+                        } else {
+                            let q = q_folded
+                                .reshape((1, self.heads, block_size, self.head_dim))?
+                                .to_dtype(DType::F32)?;
+                            self.attend(&q, &k_all, &v_all, scale)?
+                                .transpose(1, 2)?
+                                .contiguous()?
+                                .reshape((block_size, self.heads * self.head_dim))?
+                        };
                     x = m.output.forward(&attention, Some(&x), false)?;
                     let h = layer.ffn_norm.forward(&x)?;
                     let activated = m.gate_up.forward(&h, None, true)?;
@@ -1080,8 +1128,8 @@ impl DSparkDraft {
                         .reshape((block_size, self.heads * self.head_dim))?;
                     x = (x + output.forward_rows(&attention)?)?;
                     let h = layer.ffn_norm.forward(&x)?;
-                    let activated = (candle_nn::ops::silu(&gate.forward_rows(&h)?)?
-                        * up.forward_rows(&h)?)?;
+                    let activated =
+                        (candle_nn::ops::silu(&gate.forward_rows(&h)?)? * up.forward_rows(&h)?)?;
                     x = (x + down.forward_rows(&activated)?)?;
                 }
             }
@@ -1432,16 +1480,26 @@ mod tests {
         let (heads, kv_heads, rows, dim) = (24, 2, 8, 128);
         let scale = 1.0f32 / (dim as f32).sqrt();
         for &(total_keys, evict) in &[(17usize, 0usize), (313usize, 29usize)] {
-            let q_cpu = Tensor::from_vec(rand_vec(heads * rows * dim, 1.0), (1, heads, rows, dim), &Device::Cpu)?
-                .to_dtype(DType::F16)?;
-            let k_cpu = Tensor::from_vec(rand_vec(kv_heads * total_keys * dim, 1.0), (1, kv_heads, total_keys, dim), &Device::Cpu)?
-                .to_dtype(DType::F16)?;
-            let v_cpu = Tensor::from_vec(rand_vec(kv_heads * total_keys * dim, 1.0), (1, kv_heads, total_keys, dim), &Device::Cpu)?
-                .to_dtype(DType::F16)?;
-            let mut kv_cache = PreallocatedKvCache::from_f16(
-                k_cpu.to_device(&metal)?,
-                v_cpu.to_device(&metal)?,
-            )?;
+            let q_cpu = Tensor::from_vec(
+                rand_vec(heads * rows * dim, 1.0),
+                (1, heads, rows, dim),
+                &Device::Cpu,
+            )?
+            .to_dtype(DType::F16)?;
+            let k_cpu = Tensor::from_vec(
+                rand_vec(kv_heads * total_keys * dim, 1.0),
+                (1, kv_heads, total_keys, dim),
+                &Device::Cpu,
+            )?
+            .to_dtype(DType::F16)?;
+            let v_cpu = Tensor::from_vec(
+                rand_vec(kv_heads * total_keys * dim, 1.0),
+                (1, kv_heads, total_keys, dim),
+                &Device::Cpu,
+            )?
+            .to_dtype(DType::F16)?;
+            let mut kv_cache =
+                PreallocatedKvCache::from_f16(k_cpu.to_device(&metal)?, v_cpu.to_device(&metal)?)?;
             if evict > 0 {
                 kv_cache.reserve(rows)?;
                 let mut wrapped = KvCache::PreallocatedF16(kv_cache);
@@ -1456,26 +1514,26 @@ mod tests {
                 .reshape((1, heads * rows, 1, dim))?
                 .to_device(&metal)?;
             let got = dspark_metal::attend_128(
-                &q_folded,
-                &k_live,
-                &v_live,
-                rows,
-                heads,
-                kv_heads,
-                scale,
+                &q_folded, &k_live, &v_live, rows, heads, kv_heads, scale,
             )?
             .to_device(&Device::Cpu)?
             .to_vec2::<f32>()?;
 
             let k_ref = repeat_kv(
-                k_cpu.narrow(2, evict, total_keys - evict)?.to_dtype(DType::F32)?,
+                k_cpu
+                    .narrow(2, evict, total_keys - evict)?
+                    .to_dtype(DType::F32)?,
                 heads / kv_heads,
             )?;
             let v_ref = repeat_kv(
-                v_cpu.narrow(2, evict, total_keys - evict)?.to_dtype(DType::F32)?,
+                v_cpu
+                    .narrow(2, evict, total_keys - evict)?
+                    .to_dtype(DType::F32)?,
                 heads / kv_heads,
             )?;
-            let scores = (q_cpu.to_dtype(DType::F32)?.matmul(&k_ref.transpose(2, 3)?.contiguous()?)?
+            let scores = (q_cpu
+                .to_dtype(DType::F32)?
+                .matmul(&k_ref.transpose(2, 3)?.contiguous()?)?
                 * scale as f64)?;
             let want = candle_nn::ops::softmax_last_dim(&scores)?
                 .matmul(&v_ref)?
@@ -1498,15 +1556,23 @@ mod tests {
         // 2. Multi-row Q8_0 matvec (R=2/NSG=2 for T=1..4 and R=1/NSG=4 for T=5..8, + SwiGLU).
         for &t in &[1usize, 4, 7, 8] {
             let (in_dim, out_dim) = (128usize, 64usize);
-            let w_f32 = Tensor::from_vec(rand_vec(out_dim * in_dim, 1.0), (out_dim, in_dim), &Device::Cpu)?;
+            let w_f32 = Tensor::from_vec(
+                rand_vec(out_dim * in_dim, 1.0),
+                (out_dim, in_dim),
+                &Device::Cpu,
+            )?;
             let qt = Arc::new(QTensor::quantize(&w_f32, GgmlDType::Q8_0)?);
             let w_deq = qt.dequantize(&Device::Cpu)?;
             let x_cpu = Tensor::from_vec(rand_vec(t * in_dim, 1.0), (t, in_dim), &Device::Cpu)?;
             let res_cpu = Tensor::from_vec(rand_vec(t * out_dim, 1.0), (t, out_dim), &Device::Cpu)?;
-            let linear = MetalQ8Linear::from_qtensors(&[&qt], &metal)?
-                .expect("Q8_0 linear on Metal");
+            let linear =
+                MetalQ8Linear::from_qtensors(&[&qt], &metal)?.expect("Q8_0 linear on Metal");
             let got = linear
-                .forward(&x_cpu.to_device(&metal)?, Some(&res_cpu.to_device(&metal)?), false)?
+                .forward(
+                    &x_cpu.to_device(&metal)?,
+                    Some(&res_cpu.to_device(&metal)?),
+                    false,
+                )?
                 .to_device(&Device::Cpu)?
                 .to_vec2::<f32>()?;
             let want = (x_cpu.matmul(&w_deq.t()?)? + &res_cpu)?.to_vec2::<f32>()?;
@@ -1516,7 +1582,10 @@ mod tests {
                 .zip(want.iter().flatten())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
-            assert!(max_diff < 1e-3, "q8_0 matvec mismatch for t={t}: {max_diff}");
+            assert!(
+                max_diff < 1e-3,
+                "q8_0 matvec mismatch for t={t}: {max_diff}"
+            );
 
             let got_sw = linear
                 .forward(&x_cpu.to_device(&metal)?, None, true)?
@@ -1542,7 +1611,11 @@ mod tests {
         let (vocab, rank, steps) = (128usize, 256usize, 7usize);
         let markov_w1 = Tensor::from_vec(rand_vec(vocab * rank, 0.5), (vocab, rank), &metal)?
             .to_dtype(DType::BF16)?;
-        let joint_rec_t = Tensor::from_vec(rand_vec(3 * rank * 2 * rank, 0.2), (3 * rank, 2 * rank), &metal)?;
+        let joint_rec_t = Tensor::from_vec(
+            rand_vec(3 * rank * 2 * rank, 0.2),
+            (3 * rank, 2 * rank),
+            &metal,
+        )?;
         let context = Tensor::from_vec(rand_vec(steps * 3 * rank, 0.5), (steps, 3 * rank), &metal)?;
         // Make steps 0 and 1 sharply peaked, step 2 flat/uncertain so early stopping triggers.
         let mut base_vec = vec![0.0f32; steps * vocab];

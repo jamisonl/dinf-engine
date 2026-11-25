@@ -2316,13 +2316,13 @@ pub(super) fn markov_decode_steps(
     softcap: f32,
     cost_base: f32,
     cost_slope: f32,
-    markov_w1: &Tensor,      // [vocab_rows, rank] BF16
-    joint_rec_t: &Tensor,    // [3*rank, 2*rank] F32
-    context: &Tensor,        // [steps, 3*rank] F32
-    base: &Tensor,           // [steps, vocab] F32
-    fold_t: &Tensor,         // [vocab, rank] F16, Q8_0 U8, or Q4_0 U8
+    markov_w1: &Tensor,   // [vocab_rows, rank] BF16
+    joint_rec_t: &Tensor, // [3*rank, 2*rank] F32
+    context: &Tensor,     // [steps, 3*rank] F32
+    base: &Tensor,        // [steps, vocab] F32
+    fold_t: &Tensor,      // [vocab, rank] F16, Q8_0 U8, or Q4_0 U8
     fold_format: FoldFormat,
-    fold_bias: &Tensor,      // [1, vocab] F32
+    fold_bias: &Tensor, // [1, vocab] F32
 ) -> Result<(Vec<u32>, Vec<f32>)> {
     if rank > 256 || steps == 0 {
         candle_core::bail!("DSpark Metal Markov head expects 0 < steps and rank <= 256")

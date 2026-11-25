@@ -78,13 +78,15 @@ kernel void inkling_flash_attention(
     threadgroup float s_data[IBQ * IBK];
     threadgroup half p_data[IBQ * IBK];
     threadgroup float row_alpha[IBQ];
-    threadgroup uint any_rescale;
+    threadgroup uint any_rescale[2];
 
     const int rows = int(p.q_seq);
-    const int q_start = int(group.x / p.splits) * IBQ;
-    const uint split = group.x % p.splits;
-    const uint head = group.y;
-    const uint kv_head = head / p.gqa;
+    const uint gqa_idx = group.x % p.gqa;
+    const uint tile_split = group.x / p.gqa;
+    const int q_start = int(tile_split / p.splits) * IBQ;
+    const uint split = tile_split % p.splits;
+    const uint kv_head = group.y;
+    const uint head = kv_head * p.gqa + gqa_idx;
     const ulong first_row = ulong(head) * p.q_seq;
     device half *qh = q + ulong(head) * p.q_head;
     device half *kh = k + ulong(kv_head) * p.k_head;
@@ -142,7 +144,11 @@ kernel void inkling_flash_attention(
         row_max = float(row_bias[extent + 1]);
         row_sum = 1.0f;
     }
-    for (int kb = kb_begin; kb < kb_end; kb += IBK) {
+    if (tid == 0) {
+        any_rescale[0] = 0u;
+        any_rescale[1] = 0u;
+    }
+    for (int kb = kb_begin, rbuf = 0; kb < kb_end; kb += IBK, rbuf ^= 1) {
         INKLING_SCORES(kb);
         float values[ICOLS];
         bool valid[ICOLS];
@@ -162,15 +168,14 @@ kernel void inkling_flash_attention(
         }
         const float new_max = max(row_max, block_max);
         const float alpha = row_sum > 0.0f ? exp(row_max - new_max) : 0.0f;
-        if (tid == 0) {
-            any_rescale = 0u;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (part == 0) {
             row_alpha[row] = alpha;
             if (alpha != 1.0f) {
-                any_rescale = 1u;
+                any_rescale[rbuf] = 1u;
             }
+        }
+        if (tid == 0) {
+            any_rescale[rbuf ^ 1] = 0u;
         }
         float block_sum = 0.0f;
         for (int c = 0; c < ICOLS; ++c) {
@@ -184,7 +189,7 @@ kernel void inkling_flash_attention(
         row_sum = row_sum * alpha + block_sum;
         row_max = new_max;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (any_rescale != 0u) {
+        if (any_rescale[rbuf] != 0u) {
             for (ushort i = 0; i < output.get_capacity(); ++i) {
                 if (output.is_valid_element(i)) {
                     const auto at = output.get_multidimensional_index(i);
@@ -194,7 +199,6 @@ kernel void inkling_flash_attention(
         }
         auto v_slice = v_t.slice(0, kb);
         pv.run(p_t, v_slice, output);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float inv_sum = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
 
@@ -253,7 +257,7 @@ kernel void inkling_flash_attention_merge(
 const QUERY_TILE: usize = 32;
 const THREADS: usize = 256;
 /// Threadgroups worth filling the GPU with before keys are split.
-const TARGET_THREADGROUPS: usize = 256;
+const TARGET_THREADGROUPS: usize = 512;
 /// Fewest key blocks one split covers.
 const MIN_SPLIT_BLOCKS: usize = 4;
 
@@ -456,10 +460,11 @@ impl CustomOp3 for InklingFlash {
                 Some(bias_storage.buffer()),
                 bias_layout.start_offset() * self.bias.dtype().size_in_bytes(),
             );
+            let gqa = heads / kv_heads;
             e.dispatch_thread_groups(
                 objc2_metal::MTLSize {
-                    width: tiles * splits,
-                    height: heads,
+                    width: tiles * splits * gqa,
+                    height: kv_heads,
                     depth: 1,
                 },
                 objc2_metal::MTLSize {

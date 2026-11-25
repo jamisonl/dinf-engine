@@ -197,12 +197,66 @@ fn pipeline(device: &candle_core::MetalDevice, kind: Kind) -> Result<ComputePipe
     }
     let geometry = geometry(kind);
     let (name, left, right, out_t, acc_t, acc_zero, tr, cast_out) = match kind {
-        Kind::F32 => ("inkling_f32_matmul_t", "float", "float", "float", "float", "0.0f", true, false),
-        Kind::F32Nt => ("inkling_f32_matmul_nt", "float", "float", "float", "float", "0.0f", false, false),
-        Kind::F16 => ("inkling_f16_matmul_t", "half", "half", "half", "float", "0.0f", true, true),
-        Kind::F16F32 => ("inkling_f16_matmul_t_f32", "half", "half", "float", "float", "0.0f", true, false),
-        Kind::F16Nt => ("inkling_f16_matmul_nt", "half", "half", "half", "half", "0.0h", false, false),
-        Kind::Bf16 => ("inkling_bf16_matmul_t", "half", "bfloat", "float", "float", "0.0f", true, false),
+        Kind::F32 => (
+            "inkling_f32_matmul_t",
+            "float",
+            "float",
+            "float",
+            "float",
+            "0.0f",
+            true,
+            false,
+        ),
+        Kind::F32Nt => (
+            "inkling_f32_matmul_nt",
+            "float",
+            "float",
+            "float",
+            "float",
+            "0.0f",
+            false,
+            false,
+        ),
+        Kind::F16 => (
+            "inkling_f16_matmul_t",
+            "half",
+            "half",
+            "half",
+            "float",
+            "0.0f",
+            true,
+            true,
+        ),
+        Kind::F16F32 => (
+            "inkling_f16_matmul_t_f32",
+            "half",
+            "half",
+            "float",
+            "float",
+            "0.0f",
+            true,
+            false,
+        ),
+        Kind::F16Nt => (
+            "inkling_f16_matmul_nt",
+            "half",
+            "half",
+            "half",
+            "half",
+            "0.0h",
+            false,
+            false,
+        ),
+        Kind::Bf16 => (
+            "inkling_bf16_matmul_t",
+            "half",
+            "bfloat",
+            "float",
+            "float",
+            "0.0f",
+            true,
+            false,
+        ),
     };
     let source = MATMUL_MSL
         .replace("{NAME}", name)
@@ -296,10 +350,8 @@ fn run(
             .map_err(|_| candle_core::Error::Msg("tensor product is too large".into()))
     };
     let elements = batches * rows * out;
-    let output = super::inkling2_metal::alloc_scratch_buffer(
-        device,
-        elements * out_dtype.size_in_bytes(),
-    )?;
+    let output =
+        super::inkling2_metal::alloc_scratch_buffer(device, elements * out_dtype.size_in_bytes())?;
     {
         let guard = device.command_encoder()?;
         let encoder: &ComputeCommandEncoder = guard.as_ref();

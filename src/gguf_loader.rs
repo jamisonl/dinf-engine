@@ -2418,7 +2418,9 @@ pub fn load_stage_tensors(
     // expert banks and BF16 weights can go to the GPU as raw bytes.
     if architecture == "inkling2_loop"
         && shard_paths.len() == 1
-        && (device.is_metal() || device.is_cuda() || has_tensor_types_candle_lacks(&shard_paths[0])?)
+        && (device.is_metal()
+            || device.is_cuda()
+            || has_tensor_types_candle_lacks(&shard_paths[0])?)
     {
         return load_stage_tensors_mixed(&shard_paths[0], range, device);
     }
@@ -2473,6 +2475,10 @@ pub fn load_stage_tensors(
     }
 
     // Load tensors for this stage's layer range
+    let shard_maps = shard_files
+        .iter()
+        .map(|(file, _)| GgufTensorReader::new(file))
+        .collect::<Result<Vec<_>>>()?;
     let mut tensors = HashMap::new();
     let has_output_weight = tensor_owners.contains_key("output.weight");
     for (name, shard_idx) in &tensor_shard {
@@ -2482,7 +2488,7 @@ pub fn load_stage_tensors(
         if !range.is_head() && has_output_weight && is_token_embedding(name) {
             continue;
         }
-        let (ref mut file, ref content) = shard_files[*shard_idx];
+        let (_, ref content) = shard_files[*shard_idx];
         let load_device = if tensor_loads_on_cpu(
             &metadata.architecture,
             name,
@@ -2493,10 +2499,12 @@ pub fn load_stage_tensors(
         } else {
             device
         };
-        let tensor = content.tensor(file, name, load_device).with_context(|| {
-            format!("Failed to load tensor {name} from shard {}", shard_idx + 1)
-        })?;
-        tensors.insert(name.clone(), Arc::new(tensor));
+        let tensor = shard_maps[*shard_idx]
+            .tensor_arc(content, name, load_device)
+            .with_context(|| {
+                format!("Failed to load tensor {name} from shard {}", shard_idx + 1)
+            })?;
+        tensors.insert(name.clone(), tensor);
     }
 
     tracing::info!(
@@ -3495,6 +3503,304 @@ fn gguf_file_qtensor(
     )?)
 }
 
+/// Reads a GGUF file's tensors for a stage load.
+///
+/// `Content::tensor` reads each tensor into a fresh heap buffer before
+/// building the device tensor. On macOS the allocator keeps those freed
+/// buffers, so a 27B model left about 2 GB in the process footprint for its
+/// lifetime. This reader uses one scratch buffer outside the heap (see
+/// [`tensor_source`]) that is unmapped when the load ends.
+struct GgufTensorReader {
+    file: Arc<std::fs::File>,
+    len: u64,
+}
+
+impl GgufTensorReader {
+    fn new(file: &std::fs::File) -> Result<Self> {
+        Ok(Self {
+            file: Arc::new(file.try_clone().context("reopening GGUF file")?),
+            len: file.metadata()?.len(),
+        })
+    }
+
+    /// Load a tensor and, for device tensors, record where its bytes live in
+    /// the file so repacking can read them again (see [`tensor_source`]).
+    fn tensor_arc(
+        &self,
+        content: &candle_core::quantized::gguf_file::Content,
+        name: &str,
+        device: &Device,
+    ) -> Result<Arc<candle_core::quantized::QTensor>> {
+        let info = content
+            .tensor_infos
+            .get(name)
+            .with_context(|| format!("cannot find tensor info for {name}"))?;
+        let elems = info.shape.elem_count();
+        let block_size = info.ggml_dtype.block_size();
+        anyhow::ensure!(
+            elems.is_multiple_of(block_size),
+            "tensor {name} has {elems} elements, not a multiple of block size {block_size}"
+        );
+        let bytes = (elems / block_size)
+            .checked_mul(info.ggml_dtype.type_size())
+            .context("tensor size overflow")? as u64;
+        let start = content.tensor_data_offset.saturating_add(info.offset);
+        let end = start.checked_add(bytes).context("tensor end overflow")?;
+        anyhow::ensure!(
+            end <= self.len,
+            "tensor {name} needs bytes {start}..{end}, file has {}",
+            self.len
+        );
+        let tensor = tensor_source::read(&self.file, start..end, |raw| {
+            candle_core::quantized::ggml_file::qtensor_from_ggml(
+                info.ggml_dtype,
+                raw,
+                info.shape.dims().to_vec(),
+                device,
+            )
+        })
+        .with_context(|| format!("reading tensor {name}"))??;
+        let tensor = Arc::new(tensor);
+        if !device.is_cpu() {
+            tensor_source::register(&tensor, &self.file, start..end);
+        }
+        Ok(tensor)
+    }
+}
+
+/// Split a 2-D quantized weight into consecutive blocks of output rows, for
+/// GGUF files that store projections sharing an input as one tensor (for
+/// example Qwen3.5's `attn_qkv_gate` and `ssm_beta_alpha`). Rows are stored
+/// one after another, so each block is a byte range of the original.
+pub(crate) fn split_output_rows(
+    tensor: &Arc<candle_core::quantized::QTensor>,
+    rows: &[usize],
+    device: &Device,
+) -> Result<Vec<Arc<candle_core::quantized::QTensor>>> {
+    use candle_core::quantized::{QStorage, QTensor};
+    let (out_dim, in_dim) = tensor.shape().dims2()?;
+    let dtype = tensor.dtype();
+    anyhow::ensure!(
+        rows.iter().sum::<usize>() == out_dim,
+        "split rows {rows:?} do not cover {out_dim} output rows"
+    );
+    anyhow::ensure!(
+        in_dim.is_multiple_of(dtype.block_size()),
+        "input width {in_dim} is not a multiple of the {dtype:?} block size"
+    );
+    let row_bytes = in_dim / dtype.block_size() * dtype.type_size();
+    if let Some(pieces) = tensor_source::split_rows(tensor, rows, row_bytes, in_dim, device) {
+        return pieces;
+    }
+    let data = tensor.data()?;
+    anyhow::ensure!(
+        data.len() == out_dim * row_bytes,
+        "tensor storage has {} bytes, expected {}",
+        data.len(),
+        out_dim * row_bytes
+    );
+    let mut start = 0usize;
+    let mut pieces = Vec::with_capacity(rows.len());
+    for &count in rows {
+        let end = start + count * row_bytes;
+        let storage =
+            QStorage::from_data(std::borrow::Cow::Borrowed(&data[start..end]), device, dtype)?;
+        pieces.push(Arc::new(QTensor::new(storage, (count, in_dim))?));
+        start = end;
+    }
+    Ok(pieces)
+}
+
+/// File ranges of the device tensors loaded by the current stage load, and
+/// the load's scratch buffer.
+///
+/// Some architectures repack quantized weights after loading (for example,
+/// concatenating projections that share an input). Reading a Metal tensor
+/// back costs a GPU blit into a staging buffer plus a heap copy per weight,
+/// and the heap copies stay in the process footprint afterwards. Repackers
+/// read the original bytes from the file instead.
+///
+/// Reads go through one anonymous mapping, grown to the largest tensor and
+/// unmapped by [`clear`], so they leave nothing in the heap.
+///
+/// Entries hold a `Weak` to their tensor, so an address cannot be reused by
+/// another tensor while its entry exists. Both tables are per thread: a stage
+/// loads and builds on one thread, and [`clear`] runs when that load ends.
+pub(crate) mod tensor_source {
+    use candle_core::quantized::QTensor;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::ops::Range;
+    use std::sync::{Arc, Weak};
+
+    struct Entry {
+        tensor: Weak<QTensor>,
+        file: Arc<File>,
+        range: Range<u64>,
+    }
+
+    thread_local! {
+        static SOURCES: RefCell<HashMap<usize, Entry>> = RefCell::new(HashMap::new());
+        static SCRATCH: RefCell<Option<memmap2::MmapMut>> = const { RefCell::new(None) };
+    }
+
+    fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+        }
+        #[cfg(windows)]
+        {
+            let mut done = 0usize;
+            while done < buf.len() {
+                let n = std::os::windows::fs::FileExt::seek_read(
+                    file,
+                    &mut buf[done..],
+                    offset + done as u64,
+                )?;
+                if n == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                done += n;
+            }
+            Ok(())
+        }
+    }
+
+    /// Larger reads map the file instead of growing the scratch buffer. The
+    /// few tensors this size (embedding and output tables) would otherwise
+    /// hold that much anonymous memory until the load ends.
+    const SCRATCH_LIMIT: usize = 128 << 20;
+
+    /// Call `f` with bytes `range` of `file`: read into the scratch buffer,
+    /// or mapped for reads over [`SCRATCH_LIMIT`].
+    pub(super) fn read<R>(
+        file: &File,
+        range: Range<u64>,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> std::io::Result<R> {
+        let len = usize::try_from(range.end - range.start)
+            .map_err(|_| std::io::Error::other("tensor range exceeds usize"))?;
+        if len > SCRATCH_LIMIT {
+            return read_mapped(file, range.start, len, f);
+        }
+        // Take the buffer out so a nested read gets its own.
+        let mut scratch = SCRATCH
+            .with_borrow_mut(Option::take)
+            .filter(|scratch| scratch.len() >= len);
+        if scratch.is_none() {
+            scratch = Some(memmap2::MmapMut::map_anon(len.max(1))?);
+        }
+        let mut scratch = scratch.unwrap();
+        let result =
+            read_exact_at(file, &mut scratch[..len], range.start).map(|()| f(&scratch[..len]));
+        SCRATCH.with_borrow_mut(|slot| {
+            if slot.as_ref().is_none_or(|kept| kept.len() < scratch.len()) {
+                *slot = Some(scratch);
+            }
+        });
+        result
+    }
+
+    fn read_mapped<R>(
+        file: &File,
+        offset: u64,
+        len: usize,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> std::io::Result<R> {
+        // Map from the page containing `offset`; mappings start page aligned.
+        let lead = (offset % 65_536) as usize;
+        // SAFETY: model files are read-only cache entries verified when
+        // opened; nothing writes them while a stage loads. The caller checked
+        // the range against the file length.
+        let map = unsafe {
+            memmap2::MmapOptions::new()
+                .offset(offset - lead as u64)
+                .len(lead + len)
+                .map(file)?
+        };
+        #[cfg(unix)]
+        let _ = map.advise(memmap2::Advice::WillNeed);
+        Ok(f(&map[lead..]))
+    }
+
+    pub(super) fn register(tensor: &Arc<QTensor>, file: &Arc<File>, range: Range<u64>) {
+        SOURCES.with_borrow_mut(|sources| {
+            sources.insert(
+                Arc::as_ptr(tensor) as usize,
+                Entry {
+                    tensor: Arc::downgrade(tensor),
+                    file: Arc::clone(file),
+                    range,
+                },
+            );
+        });
+    }
+
+    fn lookup(tensor: &Arc<QTensor>) -> Option<(Arc<File>, Range<u64>)> {
+        SOURCES.with_borrow(|sources| {
+            let entry = sources.get(&(Arc::as_ptr(tensor) as usize))?;
+            let live = entry.tensor.upgrade()?;
+            Arc::ptr_eq(&live, tensor).then(|| (Arc::clone(&entry.file), entry.range.clone()))
+        })
+    }
+
+    /// Whether the current load recorded the file bytes of `tensor`.
+    pub(crate) fn contains(tensor: &Arc<QTensor>) -> bool {
+        lookup(tensor).is_some()
+    }
+
+    /// Call `f` with the file bytes of `tensor` when the current load
+    /// recorded them; `None` otherwise or when the read fails.
+    pub(crate) fn with_bytes<R>(tensor: &Arc<QTensor>, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let (file, range) = lookup(tensor)?;
+        read(&file, range, f).ok()
+    }
+
+    /// Split `tensor` into consecutive blocks of output rows, as
+    /// [`super::split_output_rows`] does, from the file. The pieces are
+    /// recorded too. `None` when `tensor` was not recorded.
+    pub(super) fn split_rows(
+        tensor: &Arc<QTensor>,
+        rows: &[usize],
+        row_bytes: usize,
+        in_dim: usize,
+        device: &candle_core::Device,
+    ) -> Option<anyhow::Result<Vec<Arc<QTensor>>>> {
+        let (file, range) = lookup(tensor)?;
+        let split = || -> anyhow::Result<Vec<Arc<QTensor>>> {
+            let mut start = range.start;
+            let mut pieces = Vec::with_capacity(rows.len());
+            for &count in rows {
+                let end = start + (count * row_bytes) as u64;
+                anyhow::ensure!(end <= range.end, "split exceeds the tensor's file range");
+                let piece = read(&file, start..end, |raw| {
+                    candle_core::quantized::ggml_file::qtensor_from_ggml(
+                        tensor.dtype(),
+                        raw,
+                        vec![count, in_dim],
+                        device,
+                    )
+                })??;
+                let piece = Arc::new(piece);
+                register(&piece, &file, start..end);
+                pieces.push(piece);
+                start = end;
+            }
+            Ok(pieces)
+        };
+        Some(split())
+    }
+
+    /// Forget every recorded tensor, close their files and unmap the scratch
+    /// buffer.
+    pub(crate) fn clear() {
+        SOURCES.with_borrow_mut(HashMap::clear);
+        SCRATCH.with_borrow_mut(|scratch| *scratch = None);
+    }
+}
+
 /// Single-file GGUF loading (original path).
 fn load_stage_tensors_single(
     gguf_path: &Path,
@@ -3505,6 +3811,7 @@ fn load_stage_tensors_single(
 
     let content = crate::gguf_header_io::read_candle_gguf(&mut file)
         .with_context(|| "Failed to parse GGUF file header")?;
+    let mapped = GgufTensorReader::new(&file)?;
 
     let mut shard_metadata = ShardMetadata::new(1);
     shard_metadata.record(0, &content.metadata, content.tensor_infos.len())?;
@@ -3540,10 +3847,10 @@ fn load_stage_tensors_single(
             } else {
                 device
             };
-            let tensor = content
-                .tensor(&mut file, name, load_device)
+            let tensor = mapped
+                .tensor_arc(&content, name, load_device)
                 .with_context(|| format!("Failed to load tensor: {name}"))?;
-            tensors.insert(name.clone(), Arc::new(tensor));
+            tensors.insert(name.clone(), tensor);
         }
     }
 
@@ -3786,7 +4093,12 @@ pub fn estimate_stage_memory_profile(
         && (device.is_metal() || device.is_cuda())
         && shard_paths.len() == 1
     {
-        return estimate_inkling2_accelerator_profile(&shard_paths[0], model_id, total_layers, device);
+        return estimate_inkling2_accelerator_profile(
+            &shard_paths[0],
+            model_id,
+            total_layers,
+            device,
+        );
     }
     let mut profile = StageMemoryProfile {
         model_id: model_id.to_string(),
@@ -4672,11 +4984,12 @@ impl Qwen35GroupedConstructionBytes {
             &mut self.mlp_gate
         } else if name.ends_with(".ffn_up.weight") {
             &mut self.mlp_up
-        } else if name.ends_with(".attn_qkv.weight") {
+        } else if name.ends_with(".attn_qkv.weight") || name.ends_with(".attn_qkv_gate.weight") {
+            // A merged `attn_qkv_gate` is split and regrouped like the pair.
             &mut self.deltanet_qkv
         } else if name.ends_with(".attn_gate.weight") {
             &mut self.deltanet_gate
-        } else if name.ends_with(".ssm_alpha.weight") {
+        } else if name.ends_with(".ssm_alpha.weight") || name.ends_with(".ssm_beta_alpha.weight") {
             &mut self.deltanet_alpha
         } else if name.ends_with(".ssm_beta.weight") {
             &mut self.deltanet_beta
@@ -5105,6 +5418,34 @@ mod tests {
         MAX_GGUF_TENSOR_ELEMENTS,
     };
     use std::io::{Seek, Write};
+
+    #[test]
+    fn split_output_rows_returns_each_row_block() -> Result<()> {
+        use candle_core::Tensor;
+        use candle_core::quantized::QTensor;
+        for dtype in [GgmlDType::Q8_0, GgmlDType::Q4K] {
+            let (rows, cols) = (7usize, 512usize);
+            let values: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 17.0)
+                .collect();
+            let source = Tensor::from_vec(values, (rows, cols), &Device::Cpu)?;
+            let merged = Arc::new(QTensor::quantize(&source, dtype)?);
+            let pieces = split_output_rows(&merged, &[2, 4, 1], &Device::Cpu)?;
+            let expected = merged.dequantize(&Device::Cpu)?;
+            let mut start = 0;
+            for (piece, count) in pieces.iter().zip([2usize, 4, 1]) {
+                assert_eq!(piece.shape().dims2()?, (count, cols));
+                assert_eq!(piece.dtype(), dtype);
+                assert_eq!(
+                    piece.dequantize(&Device::Cpu)?.to_vec2::<f32>()?,
+                    expected.narrow(0, start, count)?.to_vec2::<f32>()?
+                );
+                start += count;
+            }
+            assert!(split_output_rows(&merged, &[2, 4], &Device::Cpu).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn metal_q2_accounting_bounds_padding_and_readback() -> Result<()> {

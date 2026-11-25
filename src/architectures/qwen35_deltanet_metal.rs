@@ -751,8 +751,202 @@ kernel void qwen35_deltanet_prefill_onchip_128_f32(
             + (key0 + j) * value_dim + value] = s[j];
     }
 }
+
+// The kernel above, split in two so the sequential token loop carries only
+// the state update. The prep kernel computes every token's normalized q and
+// k and its beta and decay in parallel, with the same expressions in the same
+// order (the scan's outputs are bit-identical). The scan then loads each
+// token's inputs one token ahead.
+//
+// prep layout: [token][q | k] (2 * n_k_heads * 128 per token), then beta
+// [token][v head], then decay [token][v head].
+kernel void qwen35_deltanet_prefill_prep_128_f32(
+    device const float *conv        [[buffer(0)]],
+    device const float *alpha_raw   [[buffer(1)]],
+    device const float *beta_raw    [[buffer(2)]],
+    device const float *a           [[buffer(3)]],
+    device const float *dt_bias     [[buffer(4)]],
+    device float *prep              [[buffer(5)]],
+    constant uint &seq_len          [[buffer(6)]],
+    constant uint &n_k_heads        [[buffer(7)]],
+    constant uint &n_v_heads        [[buffer(8)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint key_dim = 128;
+    const uint token = group / n_k_heads;
+    const uint k_head = group % n_k_heads;
+    if (token >= seq_len) {
+        return;
+    }
+    const uint total_key_dim = n_k_heads * key_dim;
+    const uint conv_dim = total_key_dim * 2 + n_v_heads * 128;
+    const uint key0 = lane * 4;
+
+    const uint q_offset = token * conv_dim + k_head * key_dim + key0;
+    const float4 q = float4(*(device const packed_float4 *)(conv + q_offset));
+    const float4 k = float4(
+        *(device const packed_float4 *)(conv + q_offset + total_key_dim));
+    const float q_sum = simd_sum(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    const float k_sum = simd_sum(k.x * k.x + k.y * k.y + k.z * k.z + k.w * k.w);
+    const float q_scale = rsqrt(q_sum + 1.0e-12f) * rsqrt(float(key_dim));
+    const float k_scale = rsqrt(k_sum + 1.0e-12f);
+    const uint out = token * 2 * total_key_dim + k_head * key_dim + key0;
+    *(device packed_float4 *)(prep + out) =
+        packed_float4(q.x * q_scale, q.y * q_scale, q.z * q_scale, q.w * q_scale);
+    *(device packed_float4 *)(prep + out + total_key_dim) =
+        packed_float4(k.x * k_scale, k.y * k_scale, k.z * k_scale, k.w * k_scale);
+
+    // gates of the value heads that read this key head (head % n_k_heads)
+    const uint heads_per_key = n_v_heads / n_k_heads;
+    if (lane < heads_per_key) {
+        const uint head = k_head + lane * n_k_heads;
+        const uint gate_offset = token * n_v_heads + head;
+        const uint gates = seq_len * 2 * total_key_dim;
+        prep[gates + gate_offset] = 1.0f / (1.0f + exp(-beta_raw[gate_offset]));
+        const float dt = dinf_softplus(alpha_raw[gate_offset] + dt_bias[head]);
+        prep[gates + seq_len * n_v_heads + gate_offset] = exp(a[head] * dt);
+    }
+}
+
+kernel void qwen35_deltanet_prefill_onchip_prepped_128_f32(
+    device const float *state       [[buffer(0)]],
+    device const float *conv        [[buffer(1)]],
+    device const float *prep        [[buffer(2)]],
+    device float *output            [[buffer(3)]],
+    constant uint &seq_len          [[buffer(4)]],
+    constant uint &n_k_heads        [[buffer(5)]],
+    constant uint &n_v_heads        [[buffer(6)]],
+    constant uint &record_replay    [[buffer(7)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint threads [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint Threads = 128;
+    constexpr uint RowsPerGroup = Threads / 32;
+    constexpr uint GroupsPerHead = 128 / RowsPerGroup;
+    constexpr uint key_dim = 128;
+    constexpr uint value_dim = 128;
+
+    if (threads != Threads) {
+        return;
+    }
+
+    const uint head = group / GroupsPerHead;
+    const uint value = (group % GroupsPerHead) * RowsPerGroup + simdgroup;
+    if (head >= n_v_heads) {
+        return;
+    }
+
+    const uint total_key_dim = n_k_heads * key_dim;
+    const uint total_value_dim = n_v_heads * value_dim;
+    const uint conv_dim = total_key_dim * 2 + total_value_dim;
+    const uint state_elements = n_v_heads * key_dim * value_dim;
+    const uint state_output_offset = seq_len * total_value_dim;
+    const uint key_output_offset = state_output_offset + state_elements;
+    const uint delta_output_offset = key_output_offset
+        + seq_len * n_v_heads * key_dim;
+    const uint decay_output_offset = delta_output_offset
+        + seq_len * n_v_heads * value_dim;
+    const uint qk_head = head % n_k_heads;
+    const uint key0 = lane * 4;
+    const uint gates = seq_len * 2 * total_key_dim;
+
+    const uint state_head_offset = head * key_dim * value_dim;
+    float s[4];
+    for (uint j = 0; j < 4; ++j) {
+        s[j] = state[state_head_offset + (key0 + j) * value_dim + value];
+    }
+
+    float4 qn, kn;
+    float v, beta, decay;
+    auto load = [&](uint token) {
+        const uint qk = token * 2 * total_key_dim + qk_head * key_dim + key0;
+        qn = float4(*(device const packed_float4 *)(prep + qk));
+        kn = float4(*(device const packed_float4 *)(prep + qk + total_key_dim));
+        v = conv[token * conv_dim + 2 * total_key_dim + head * value_dim + value];
+        beta = prep[gates + token * n_v_heads + head];
+        decay = prep[gates + seq_len * n_v_heads + token * n_v_heads + head];
+    };
+    load(0);
+
+    for (uint token = 0; token < seq_len; ++token) {
+        const float kk[4] = {kn.x, kn.y, kn.z, kn.w};
+        const float qq[4] = {qn.x, qn.y, qn.z, qn.w};
+        const float tv = v;
+        const float tbeta = beta;
+        const float tdecay = decay;
+        if (token + 1 < seq_len) {
+            load(token + 1);
+        }
+        const uint gate_offset = token * n_v_heads + head;
+
+        if (record_replay != 0 && value == 0) {
+            for (uint j = 0; j < 4; ++j) {
+                output[key_output_offset + gate_offset * key_dim + key0 + j] = kk[j];
+            }
+            if (lane == 0) {
+                output[decay_output_offset + gate_offset] = tdecay;
+            }
+        }
+
+        float retrieved = 0.0f;
+        for (uint j = 0; j < 4; ++j) {
+            retrieved += tdecay * s[j] * kk[j];
+        }
+        retrieved = simd_sum(retrieved);
+        const float delta = tbeta * (tv - retrieved);
+        float y = 0.0f;
+        for (uint j = 0; j < 4; ++j) {
+            s[j] = tdecay * s[j] + kk[j] * delta;
+            y += s[j] * qq[j];
+        }
+        y = simd_sum(y);
+        if (lane == 0) {
+            output[token * total_value_dim + head * value_dim + value] = y;
+            if (record_replay != 0) {
+                output[delta_output_offset + gate_offset * value_dim + value] = delta;
+            }
+        }
+    }
+
+    for (uint j = 0; j < 4; ++j) {
+        output[state_output_offset + state_head_offset
+            + (key0 + j) * value_dim + value] = s[j];
+    }
+}
 "#,
 );
+
+static DELTANET_PREFILL_PREP_PIPELINE: PipelineCache = OnceLock::new();
+static DELTANET_PREPPED_SCAN_PIPELINE: PipelineCache = OnceLock::new();
+
+/// The prep and scan pipelines of the split on-chip prefill, when available.
+/// `DINF_DISABLE_QWEN35_PREFILL_PREP=1` keeps the single kernel.
+fn prepped_prefill_pipelines(
+    device: &candle_core::MetalDevice,
+) -> Option<(ComputePipeline, ComputePipeline)> {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    if *DISABLED.get_or_init(|| {
+        std::env::var_os("DINF_DISABLE_QWEN35_PREFILL_PREP").is_some_and(|v| v == "1")
+    }) {
+        return None;
+    }
+    let prep = named_pipeline_from_source(
+        device,
+        "qwen35_deltanet_prefill_prep_128_f32",
+        &DELTANET_PREFILL_PREP_PIPELINE,
+        ONCHIP_PREFILL_MSL,
+    )
+    .ok()?;
+    let scan = named_pipeline_from_source(
+        device,
+        "qwen35_deltanet_prefill_onchip_prepped_128_f32",
+        &DELTANET_PREPPED_SCAN_PIPELINE,
+        ONCHIP_PREFILL_MSL,
+    )
+    .ok()?;
+    (scan.max_total_threads_per_threadgroup() >= 128).then_some((prep, scan))
+}
 
 type PipelineCache = OnceLock<Mutex<HashMap<DeviceId, ComputePipeline>>>;
 
@@ -1092,6 +1286,72 @@ impl CustomOp3 for DeltaNetPrefill<'_> {
                 false,
             )
         };
+        // Split on-chip path: gates and normalized q/k first, then the scan.
+        let prep_offset = |layout: &Layout| layout.start_offset() * DType::F32.size_in_bytes();
+        let heads_per_key = self.n_v_heads / self.n_k_heads.max(1);
+        if onchip
+            && self.n_k_heads > 0
+            && self.n_v_heads.is_multiple_of(self.n_k_heads)
+            && heads_per_key <= 32
+            && let Some((prep_pipeline, scan_pipeline)) = prepped_prefill_pipelines(device)
+        {
+            let prep_elements = self.seq_len * (2 * total_key_dim + 2 * self.n_v_heads);
+            let prep = device
+                .new_buffer_builder()
+                .with_size_for(prep_elements, DType::F32)
+                .with_label("qwen35-deltanet-prefill-prep")
+                .build()?;
+            let encoder = device.command_encoder()?;
+            encoder.set_label("qwen35-deltanet-prefill");
+            let e: &candle_metal_kernels::metal::ComputeCommandEncoder = encoder.as_ref();
+            e.set_compute_pipeline_state(&prep_pipeline);
+            e.set_input_buffer(0, Some(conv.buffer()), prep_offset(conv_layout));
+            e.set_input_buffer(1, Some(alpha_raw.buffer()), prep_offset(alpha_layout));
+            e.set_input_buffer(2, Some(beta.buffer()), prep_offset(beta_layout));
+            e.set_input_buffer(3, Some(a.buffer()), prep_offset(a_layout));
+            e.set_input_buffer(4, Some(dt.buffer()), prep_offset(dt_layout));
+            e.set_output_buffer(5, Some(&prep), 0);
+            e.set_bytes(6, &(self.seq_len as u32));
+            e.set_bytes(7, &(self.n_k_heads as u32));
+            e.set_bytes(8, &(self.n_v_heads as u32));
+            e.dispatch_thread_groups(
+                objc2_metal::MTLSize {
+                    width: self.seq_len * self.n_k_heads,
+                    height: 1,
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            e.set_compute_pipeline_state(&scan_pipeline);
+            e.set_input_buffer(0, Some(state.buffer()), prep_offset(state_layout));
+            e.set_input_buffer(1, Some(conv.buffer()), prep_offset(conv_layout));
+            e.set_input_buffer(2, Some(&prep), 0);
+            e.set_output_buffer(3, Some(&output), 0);
+            e.set_bytes(4, &(self.seq_len as u32));
+            e.set_bytes(5, &(self.n_k_heads as u32));
+            e.set_bytes(6, &(self.n_v_heads as u32));
+            e.set_bytes(7, &(self.record_replay as u32));
+            e.dispatch_thread_groups(
+                objc2_metal::MTLSize {
+                    width: self.n_v_heads * 32,
+                    height: 1,
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            return Ok((
+                MetalStorage::new(output, device.clone(), output_elements, DType::F32),
+                Shape::from(output_elements),
+            ));
+        }
         let encoder = device.command_encoder()?;
         encoder.set_label("qwen35-deltanet-prefill");
         encoder.set_compute_pipeline_state(&pipeline);

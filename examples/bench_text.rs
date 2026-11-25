@@ -17,6 +17,9 @@
 //! DINF_ALLOW_APPROXIMATE_SPECULATIVE=1 is also set, which this example turns
 //! into `SpeculativeOptions::allow_approximate`.
 //!
+//! DINF_BENCH_MEM=1 prints the Metal allocation (`currentAllocatedSize`)
+//! after load, warm-up, each prefill and each decode.
+//!
 //! DINF_PROFILE_LAYERS=1 turns on layer profiling and prints the Qwen3.5
 //! layer profile for prefill and decode.
 //!
@@ -35,6 +38,39 @@ use dinf_engine::tokenizer::GgufTokenizer;
 use dinf_engine::{
     EngineOptions, LayerRange, PipelineStage, SpeculativeOptions, read_gguf_metadata,
 };
+
+fn report_memory(device: &Device, phase: &str) {
+    if std::env::var_os("DINF_BENCH_MEM").is_none() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(metal) = device.as_metal_device() {
+        let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        // SAFETY: proc_pid_rusage fills the caller's rusage_info_v2.
+        let footprint = unsafe {
+            let mut info: libc::rusage_info_v4 = std::mem::zeroed();
+            let ok = libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V4,
+                (&mut info as *mut libc::rusage_info_v4).cast(),
+            ) == 0;
+            ok.then_some((
+                info.ri_phys_footprint as usize,
+                info.ri_lifetime_max_phys_footprint as usize,
+            ))
+        };
+        let (footprint, max_footprint) = footprint.unwrap_or((0, 0));
+        eprintln!(
+            "mem {phase}: metal_allocated={:.0} MiB footprint={:.0} MiB max_footprint={:.0} MiB recommended_max={:.0} MiB",
+            mib(metal.device().current_allocated_size()),
+            mib(footprint),
+            mib(max_footprint),
+            mib(metal.device().recommended_max_working_set_size())
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (device, phase);
+}
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -120,6 +156,11 @@ fn main() -> Result<()> {
         seed.iter().copied().cycle().take(prompt_tokens).collect()
     };
     let prompt_tokens = prompt.len();
+    // DINF_BENCH_PRINT_PROMPT=1 prints the prompt text, to give another
+    // implementation the same input.
+    if std::env::var_os("DINF_BENCH_PRINT_PROMPT").is_some() {
+        eprintln!("--- prompt ---\n{}\n--- end ---", tokenizer.decode(&prompt));
+    }
 
     let load = Instant::now();
     let mut stage = PipelineStage::from_gguf(
@@ -155,6 +196,7 @@ fn main() -> Result<()> {
     }
     device.synchronize()?;
     eprintln!("load {:.1}s", load.elapsed().as_secs_f64());
+    report_memory(&device, "load");
 
     // DINF_BENCH_TEMPERATURE overrides the temperature either way.
     let temperature = match std::env::var("DINF_BENCH_TEMPERATURE") {
@@ -184,6 +226,8 @@ fn main() -> Result<()> {
         }
         warm.discard_cache(&mut stage);
     }
+    device.synchronize()?;
+    report_memory(&device, "warm-up");
 
     // DINF_PROFILE_REGIONS=1 times named regions of the production CUDA
     // decode path without changing which code runs.
@@ -212,6 +256,7 @@ fn main() -> Result<()> {
         {}
         device.synchronize()?;
         let prefill = start.elapsed().as_secs_f64();
+        report_memory(&device, "prefill");
         if regions {
             dinf_engine::architectures::profiling::set_region_profiling(false);
             eprintln!("prefill regions ({prompt_tokens} tokens):");
@@ -246,6 +291,7 @@ fn main() -> Result<()> {
         }
         device.synchronize()?;
         let decode = start.elapsed().as_secs_f64();
+        report_memory(&device, "decode");
         if gpu_timing.is_some() {
             let timing = dinf_engine::architectures::deepseek41::profile::gpu_timing_snapshot();
             eprintln!(

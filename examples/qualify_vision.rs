@@ -2,13 +2,19 @@
 //! Usage: MODEL.gguf MMPROJ.gguf cpu|metal [TOKENS=16]. Admit both models first.
 //! Covers fixed images, finite projections, greedy replay and request isolation.
 //! It has no independent image-description or projection-quality oracle.
+//!
+//! DINF_QUALIFY_VISION_DRAFT=DRAFT.gguf also attaches a DFlash draft and
+//! checks that image requests draft once the image is prefilled, through both
+//! the whole-prompt embedding path and the sparse image-span path.
 
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use candle_core::{DType, Device, Tensor};
 use dinf_engine::architectures::qwen35_vision::{Qwen35VisionEncoder, VisionGrid, VisionImage};
-use dinf_engine::architectures::{AttentionSpan, MropePositionIds, StageInput, StageOutput};
+use dinf_engine::architectures::{
+    AttentionSpan, ImageEmbeddingSpan, MropePositionIds, StageInput, StageOutput,
+};
 use dinf_engine::continuous::GenerationSession;
 use dinf_engine::sampling::SamplingParams;
 use dinf_engine::tokenizer::GgufTokenizer;
@@ -147,6 +153,8 @@ fn finite_values(tensor: &Tensor) -> Result<Vec<f32>> {
 }
 
 struct Prompt {
+    image_start: usize,
+    image_rows: usize,
     tokens: Vec<u32>,
     embeddings: Tensor,
     positions: Option<MropePositionIds>,
@@ -276,6 +284,8 @@ fn prepare(
     };
     ensure!(embeddings.dim(0)? == tokens.len(), "prompt shape differs");
     Ok(Prompt {
+        image_start: offset,
+        image_rows: rows,
         tokens,
         embeddings,
         positions,
@@ -343,6 +353,100 @@ fn prompt_logits(stage: &mut PipelineStage, prompt: &Prompt) -> Result<Vec<f32>>
     Ok(values)
 }
 
+/// Generate greedily from the image prompt with drafting on or off, through
+/// the whole-prompt (`sparse == false`) or sparse image-span path.
+fn run_draft(
+    stage: &mut PipelineStage,
+    prompt: &Prompt,
+    count: usize,
+    sparse: bool,
+    draft: bool,
+) -> Result<(Vec<u32>, serde_json::Value)> {
+    let params = SamplingParams {
+        temperature: 0.0,
+        max_tokens: count,
+        ..Default::default()
+    };
+    let mut session = if sparse {
+        let span = ImageEmbeddingSpan {
+            start: prompt.image_start,
+            embeddings: prompt
+                .embeddings
+                .narrow(0, prompt.image_start, prompt.image_rows)?,
+            bidirectional: !prompt.spans.is_empty(),
+            digest: None,
+        };
+        match &prompt.positions {
+            Some(positions) => GenerationSession::new_with_positioned_image_spans(
+                stage,
+                prompt.tokens.clone(),
+                vec![span],
+                positions.clone(),
+                params,
+                vec![],
+            )?,
+            None => GenerationSession::new_with_image_spans(
+                stage,
+                prompt.tokens.clone(),
+                vec![span],
+                params,
+                vec![],
+            )?,
+        }
+    } else {
+        prompt.session(stage, count)?
+    };
+    session.set_speculative_decoding_enabled(stage, draft);
+    while !session.is_finished() {
+        session.step(stage)?;
+    }
+    let stats = session.speculative_stats();
+    let report = json!({"passes":stats.passes,"drafted":stats.drafted_tokens,
+        "accepted":stats.accepted_tokens,"fell_back":stats.fell_back});
+    let tokens = finish(stage, prompt, &mut session, count)?;
+    clean(stage)?;
+    Ok((tokens, report))
+}
+
+fn check_draft(
+    stage: &mut PipelineStage,
+    prompt: &Prompt,
+    draft: &Path,
+    count: usize,
+) -> Result<serde_json::Value> {
+    let _ = draft;
+    let mut options = stage.options().clone();
+    // Greedy requests draft only when approximate verification is allowed.
+    options.speculative.allow_approximate = true;
+    options.speculative.fallback = false;
+    stage.set_options(options)?;
+    let mut report = serde_json::Map::new();
+    for sparse in [false, true] {
+        let (reference, _) = run_draft(stage, prompt, count, sparse, false)?;
+        let (drafted, stats) = run_draft(stage, prompt, count, sparse, true)?;
+        ensure!(
+            stats["passes"].as_u64().unwrap_or(0) > 0
+                && stats["accepted"].as_u64().unwrap_or(0) > 0,
+            "image request did not draft after the image (sparse={sparse}): {stats}"
+        );
+        let matching = reference
+            .iter()
+            .zip(&drafted)
+            .take_while(|(a, b)| a == b)
+            .count();
+        report.insert(
+            if sparse {
+                "sparse_spans"
+            } else {
+                "whole_prompt"
+            }
+            .into(),
+            json!({"stats":stats,"tokens_matching_scalar_prefix":matching,"tokens":count}),
+        );
+    }
+    Ok(report.into())
+}
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     ensure!(
@@ -366,6 +470,12 @@ fn main() -> Result<()> {
         &device,
         None,
     )?;
+    // A draft attaches before any inference. Greedy requests keep the scalar
+    // path until `check_draft` allows approximate verification.
+    let draft = std::env::var_os("DINF_QUALIFY_VISION_DRAFT").map(std::path::PathBuf::from);
+    if let Some(draft) = &draft {
+        stage.attach_speculative_draft(draft)?;
+    }
     let projector = Projector::load(Path::new(&args[1]), &stage)?;
     let image = fixture(false);
     let (first, grid) = projector.encode(&image, &device)?;
@@ -443,6 +553,10 @@ fn main() -> Result<()> {
         "interleaved cancellation changed tokens"
     );
     clean(&stage)?;
+    let draft_report = match &draft {
+        Some(draft) => Some(check_draft(&mut stage, &first, draft, count)?),
+        None => None,
+    };
     let projection_bytes: Vec<_> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     println!(
         "{}",
@@ -455,7 +569,7 @@ fn main() -> Result<()> {
         "projection_sha256":format!("{:x}", Sha256::digest(projection_bytes)),
         "image_sha256":format!("{:x}", Sha256::digest(image.as_raw())),
         "checks":["finite_projection","projection_replay","projector_image_sensitivity","decoder_image_sensitivity","prompt_logit_replay","paired_text_generation","replay","interleaved_cancel"],
-        "embedded_prefill":"atomic","independent_quality_oracle":false})
+        "embedded_prefill":"atomic","independent_quality_oracle":false,"draft":draft_report})
     );
     Ok(())
 }

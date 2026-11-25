@@ -35,6 +35,8 @@ pub(crate) mod dspark;
 #[cfg(target_os = "macos")]
 mod dspark_metal;
 #[cfg(target_os = "macos")]
+mod few_row_mma_metal;
+#[cfg(target_os = "macos")]
 mod flash_attention_metal;
 #[cfg(target_os = "macos")]
 mod fused_norm_metal;
@@ -320,6 +322,19 @@ pub struct AttentionSpan {
 /// Encoded image rows that replace a contiguous placeholder run in a prompt.
 ///
 /// Retaining only the image rows (instead of a full-prompt `[seq, hidden]`
+/// Exact content identity of one encoded image span in a prompt, used to key
+/// multimodal prompt-cache entries without matching different images that share
+/// the same placeholder token IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageSpanKey {
+    /// First token position covered by this image span.
+    pub start: usize,
+    /// Number of token positions covered by this image span.
+    pub len: usize,
+    /// SHA-256 digest of the source image bytes.
+    pub digest: [u8; 32],
+}
+
 /// embedding tensor) lets solo prefill chunk long multimodal conversations and
 /// reuse any cached text prefix before the first image.
 #[derive(Debug, Clone)]
@@ -330,6 +345,9 @@ pub struct ImageEmbeddingSpan {
     pub embeddings: Tensor,
     /// Whether tokens inside this span attend bidirectionally (Gemma 4).
     pub bidirectional: bool,
+    /// Optional SHA-256 digest of the source image bytes for multimodal prompt
+    /// cache keying. When `None`, the span cannot be published to the prompt cache.
+    pub digest: Option<[u8; 32]>,
 }
 
 impl ImageEmbeddingSpan {
@@ -344,6 +362,18 @@ impl ImageEmbeddingSpan {
         self.start
             .checked_add(self.len()?)
             .context("image embedding span position overflow")
+    }
+
+    /// Content-addressed key for multimodal prompt caching, if a digest was provided.
+    pub fn span_key(&self) -> Result<Option<ImageSpanKey>> {
+        match self.digest {
+            Some(digest) => Ok(Some(ImageSpanKey {
+                start: self.start,
+                len: self.len()?,
+                digest,
+            })),
+            None => Ok(None),
+        }
     }
 }
 
@@ -864,11 +894,7 @@ impl PreallocatedKvCache {
             let (batch, k_heads, _, k_head_dim) = self.k.dims4()?;
             let (_, v_heads, _, v_head_dim) = self.v.dims4()?;
             let required = self.len.saturating_add(incoming);
-            let capacity = if required <= self.capacity {
-                self.capacity
-            } else {
-                Self::next_capacity(self.capacity, required)?
-            };
+            let capacity = Self::compact_or_grow_capacity(self.capacity, required)?;
             let next_k = Tensor::zeros(
                 (batch, k_heads, capacity, k_head_dim),
                 candle_core::DType::F16,
@@ -922,6 +948,22 @@ impl PreallocatedKvCache {
         self.start += count;
         self.len -= count;
         Ok(())
+    }
+
+    /// Choose the backing capacity when `start + len + incoming > capacity`.
+    ///
+    /// Compacting into the existing capacity only pays off if it leaves enough
+    /// trailing headroom (at least 25% of `current`) before the next eviction
+    /// hits the end again. Otherwise—such as a sliding-window cache with
+    /// `len = 1023, capacity = 1024` receiving `incoming = 1`—grow capacity so
+    /// decode does not re-allocate and compact on every single token.
+    fn compact_or_grow_capacity(current: usize, required: usize) -> Result<usize> {
+        let headroom = current.saturating_sub(required);
+        if required <= current && headroom >= current / 4 {
+            Ok(current)
+        } else {
+            Self::next_capacity(current, required)
+        }
     }
 
     pub(crate) fn next_capacity(current: usize, required: usize) -> Result<usize> {
@@ -4259,6 +4301,35 @@ mod tests {
         let (_, _, row) = dense.reserve(64)?;
         assert_eq!((row, dense.capacity, dense.len), (32, 128, 32));
         assert!(dense.commit(97).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn preallocated_kv_sliding_window_grows_instead_of_compacting_every_token() -> Result<()> {
+        // Reproduce a forked or chunk-prefilled sliding-window cache at
+        // len=1023, capacity=1024 (window=1024) receiving scalar decode tokens.
+        let k = Tensor::zeros((1, 1, 1023, 1), DType::F16, &Device::Cpu)?;
+        let v = Tensor::zeros((1, 1, 1023, 1), DType::F16, &Device::Cpu)?;
+        let mut cache = PreallocatedKvCache::from_f16(k, v)?;
+        assert_eq!((cache.start, cache.len, cache.capacity), (0, 1023, 1024));
+
+        let mut reallocations = 0usize;
+        let mut last_id = cache.k.id();
+        for _ in 0..600 {
+            let (k_buf, _, _) = cache.reserve(1)?;
+            if k_buf.id() != last_id {
+                reallocations += 1;
+                last_id = k_buf.id();
+            }
+            cache.commit(1)?;
+            cache.evict_oldest(1)?;
+            assert_eq!(cache.len, 1023);
+        }
+
+        // Token 0 fits in slot 1023; token 1 grows 1024 -> 1536; then 513
+        // tokens fit before a single in-place compaction at capacity 1536.
+        assert_eq!(cache.capacity, 1536);
+        assert_eq!(reallocations, 2);
         Ok(())
     }
 
